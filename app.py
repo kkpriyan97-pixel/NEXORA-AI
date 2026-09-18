@@ -34,10 +34,39 @@ def event_records(client,event_id):
         if isinstance(d,list):out.extend(x for x in d if isinstance(x,dict))
     return out
 
+def _norm_text(v):
+    if v is None: return ""
+    if isinstance(v,(dict,list)): return json.dumps(v,ensure_ascii=False).lower()
+    return str(v).strip().lower()
+
+def is_flex_time_asset(x):
+    """
+    Keep the Flex Time universe from OlympTrade metadata without hardcoding
+    individual asset names/symbols. Explicit non-Flex products (for example
+    Quickler/5-second trading) are excluded; otherwise authenticated market
+    assets remain eligible. This preserves newly added Flex assets.
+    """
+    if not isinstance(x,dict): return False
+    fields=("trading_mode","trade_mode","mode","product","category",
+            "instrument_type","expiration_type","expiration_mode","type","name",
+            "title","display_name","displayName")
+    text=" ".join(_norm_text(x.get(k)) for k in fields)
+    explicit_flex=any(k in text for k in (
+        "flex time","flex_time","flex-time","fixed time","fixed_time"
+    ))
+    explicit_quickler=any(k in text for k in (
+        "quickler","5 second","5-second","5 seconds","5_seconds"
+    ))
+    # OlympTrade's asset list contains the normal Flex Time instruments
+    # alongside special products. Prefer explicit metadata when available.
+    if explicit_quickler and not explicit_flex:
+        return False
+    return True
+
 def build_assets(client,raw):
-    # get_available_assets() already merges authenticated profitability + cached
-    # instrument metadata. Do not require a second event-182 intersection: that
-    # was dropping the live universe to zero when the cache shape changed.
+    # Build the Flex Time universe from authenticated OlympTrade asset
+    # metadata. No hardcoded symbol/name mapping and no profitability
+    # intersection that can collapse the live universe.
     prof={}
     for x in raw or []:
         if not isinstance(x,dict): continue
@@ -46,7 +75,7 @@ def build_assets(client,raw):
         if p and isinstance(v,(int,float)): prof[p]=int(v)
     out=[]; seen=set()
     for x in raw or []:
-        if not isinstance(x,dict): continue
+        if not isinstance(x,dict) or not is_flex_time_asset(x): continue
         p=pair_name(x)
         if not p or p in seen: continue
         seen.add(p)
@@ -61,7 +90,8 @@ def build_assets(client,raw):
             "locked":x.get("locked") is True,
             "locked_trading":x.get("locked_trading") is True,
             "disabled":x.get("disabled") is True,
-            "mode":"OTC" if "_OTC" in p.upper() else "REAL"
+            "mode":"OTC" if "_OTC" in p.upper() else "REAL",
+            "trading_mode":"FLEX_TIME"
         })
     return out
 
