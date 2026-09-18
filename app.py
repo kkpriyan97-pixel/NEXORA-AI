@@ -107,17 +107,23 @@ def build_assets(client,raw):
         })
     return out
 
-async def telegram(text):
-    token=os.getenv("TELEGRAM_BOT_TOKEN","").strip();chat=os.getenv("TELEGRAM_CHAT_ID","").strip()
+async def telegram(text, chat_id=None):
+    token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+    chat=str(chat_id or os.getenv("TELEGRAM_CHAT_ID","")).strip()
     if not token or not chat:
         log.warning("TELEGRAM_NOT_CONFIGURED")
         return False
     try:
         async with httpx.AsyncClient(timeout=8) as h:
             r=await h.post(f"https://api.telegram.org/bot{token}/sendMessage",json={"chat_id":chat,"text":text})
-            r.raise_for_status();return True
+            if r.status_code >= 400:
+                try: detail=r.json()
+                except Exception: detail={"description":r.text[:200]}
+                log.warning("TELEGRAM_SEND_FAILED status=%s description=%s",r.status_code,detail.get("description"))
+                return False
+            return True
     except Exception as e:
-        log.warning("TELEGRAM_SEND_FAILED %s",e);return False
+        log.warning("TELEGRAM_SEND_FAILED type=%s message=%s",type(e).__name__,str(e)[:200]);return False
 
 async def on_tick(message):
     for t in message.get("d",[]) or []:
@@ -330,6 +336,15 @@ async def health(reader,writer):
         first=head.split(b"\r\n",1)[0].decode("latin1","ignore")
         parts=first.split(" ")
         path=parts[1] if len(parts)>1 else "/"
+        headers={}
+        for line in head.decode("latin1","ignore").split("\r\n")[1:]:
+            if ":" in line:
+                k,v=line.split(":",1);headers[k.strip().lower()]=v.strip()
+        webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
+        if path.startswith("/telegram/webhook") and webhook_secret and headers.get("x-telegram-bot-api-secret-token") != webhook_secret:
+            writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
         if path.startswith("/telegram/webhook") and body:
             try:
                 upd=json.loads(body.decode("utf-8"))
