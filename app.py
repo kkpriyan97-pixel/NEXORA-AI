@@ -184,6 +184,8 @@ async def market_worker():
         client=OlympTradeClient(access_token=token,log_raw_messages=False);CLIENT=client;client.register_callback(parameters.E_TICK_UPDATE,on_tick)
         try:
             STATE["status"]="connecting";await client.start();STATE["status"]="connected"
+            # Required: initialize the authenticated session before asset discovery.
+            await client.initialize_session()
             await asyncio.sleep(4)
             for m in client.get_cached_events(55):
                 d=m.get("d") if isinstance(m,dict) else None
