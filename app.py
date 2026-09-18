@@ -345,6 +345,10 @@ async def health(reader,writer):
             writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
             await writer.drain()
             return
+        if path.startswith("/telegram/webhook") and not body:
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNEXORA Telegram webhook is ready")
+            await writer.drain()
+            return
         if path.startswith("/telegram/webhook") and body:
             try:
                 upd=json.loads(body.decode("utf-8"))
@@ -370,9 +374,13 @@ async def configure_telegram_webhook():
         payload={"url":url}
         if secret: payload["secret_token"]=secret
         async with httpx.AsyncClient(timeout=10) as h:
+            await h.post(f"https://api.telegram.org/bot{token}/deleteWebhook",json={"drop_pending_updates":False})
             r=await h.post(f"https://api.telegram.org/bot{token}/setWebhook",json=payload)
             r.raise_for_status()
-            log.info("TELEGRAM_WEBHOOK_READY")
+            info=await h.get(f"https://api.telegram.org/bot{token}/getWebhookInfo")
+            try: data=info.json().get("result",{})
+            except Exception: data={}
+            log.info("TELEGRAM_WEBHOOK_READY url=%s pending=%s last_error=%s",data.get("url",""),data.get("pending_update_count",0),str(data.get("last_error_message",""))[:160])
     except Exception as e:
         log.warning("TELEGRAM_WEBHOOK_SETUP_FAILED %s",e)
 
