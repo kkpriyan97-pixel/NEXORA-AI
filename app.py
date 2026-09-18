@@ -1,5 +1,7 @@
 import asyncio,json,logging,os,time
 from typing import Any
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 import httpx
 from olymptrade_ws import OlympTradeClient
 from olymptrade_ws.olympconfig import parameters
@@ -172,6 +174,39 @@ async def market_worker():
             except Exception:pass
             CLIENT=None
 
+async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✅ NEXORA AI is online.\\n\\n"
+        "Candice Brain: LIVE\\n"
+        "Mode: DEMO / Read-only"
+    )
+
+async def telegram_worker():
+    token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+    if not token:
+        log.warning("TELEGRAM_NOT_CONFIGURED")
+        return
+    while True:
+        try:
+            app=Application.builder().token(token).build()
+            app.add_handler(CommandHandler("start",telegram_start))
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+            log.info("TELEGRAM_POLLING_STARTED")
+            while True:
+                await asyncio.sleep(30)
+        except Exception as e:
+            log.exception("TELEGRAM_WORKER_ERROR %s",e)
+            await asyncio.sleep(15)
+        finally:
+            try: await app.updater.stop()
+            except Exception: pass
+            try: await app.stop()
+            except Exception: pass
+            try: await app.shutdown()
+            except Exception: pass
+
 async def health(reader,writer):
     try:
         await reader.read(2048)
@@ -181,5 +216,5 @@ async def health(reader,writer):
 
 async def main():
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
-    await asyncio.gather(market_worker(),cycle_loop(),server.serve_forever())
+    await asyncio.gather(market_worker(),cycle_loop(),telegram_worker(),server.serve_forever())
 if __name__=="__main__":asyncio.run(main())
