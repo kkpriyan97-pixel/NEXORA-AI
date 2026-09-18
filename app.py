@@ -35,17 +35,34 @@ def event_records(client,event_id):
     return out
 
 def build_assets(client,raw):
+    # get_available_assets() already merges authenticated profitability + cached
+    # instrument metadata. Do not require a second event-182 intersection: that
+    # was dropping the live universe to zero when the cache shape changed.
     prof={}
-    for x in event_records(client,182):
-        p=pair_name(x);v=x.get("profitability")
-        if p and isinstance(v,(int,float)):prof[p]=(int(v),x)
-    out=[]
-    for x in raw:
+    for x in raw or []:
+        if not isinstance(x,dict): continue
         p=pair_name(x)
-        if not p or p not in prof:continue
-        title=display_name(x) or display_name(prof[p][1])
-        if not title:continue
-        out.append({"pair":p,"display_name":title,"title":title,"signal_asset_label":f"{title} ({p})","profitability":prof[p][0],"locked":x.get("locked") is True,"locked_trading":x.get("locked_trading") is True,"mode":"OTC" if "_OTC" in p.upper() else "REAL"})
+        v=x.get("profitability")
+        if p and isinstance(v,(int,float)): prof[p]=int(v)
+    out=[]; seen=set()
+    for x in raw or []:
+        if not isinstance(x,dict): continue
+        p=pair_name(x)
+        if not p or p in seen: continue
+        seen.add(p)
+        title=display_name(x) or p
+        v=prof.get(p,x.get("profitability",0))
+        try: profitability=int(v)
+        except Exception: profitability=0
+        out.append({
+            "pair":p,"display_name":title,"title":title,
+            "signal_asset_label":f"{title} ({p})",
+            "profitability":profitability,
+            "locked":x.get("locked") is True,
+            "locked_trading":x.get("locked_trading") is True,
+            "disabled":x.get("disabled") is True,
+            "mode":"OTC" if "_OTC" in p.upper() else "REAL"
+        })
     return out
 
 async def telegram(text):
@@ -122,26 +139,42 @@ async def result_watch(key):
     log.info("RESULT pair=%s result=%s exit=%s cooldown=%s",rec["pair"],rec["result"],rec["exit_price"],rec["result"]=="LOSS")
 
 async def cycle_loop():
+    # Exactly one decision cycle at a time. The final 40 seconds are a live
+    # evaluation window; the entry is captured only at the exact 5-minute boundary.
+    last_target=0
     while True:
-        now=time.time();next_boundary=(int(now)//300+1)*300
-        target=next_boundary
+        now=time.time(); target=(int(now)//300+1)*300
+        if target<=last_target: target=last_target+300
         start=target-40
         await asyncio.sleep(max(0,start-time.time()))
-        cycle_id=target//300
-        BRAIN.start_cycle(int(cycle_id));STATE["cycle"]=int(cycle_id)
-        # Keep the 40-second window live: re-rank immediately before signal.
-        candidate=await final_candidate()
-        if candidate:
-            p=candidate["pair"];entry=STATE["prices"].get(p,(None,None))[0]
-            if entry is not None and BRAIN.can_send_cycle_signal():
-                ts=time.time();s=BRAIN.mark_signal_sent(pair=p,display_name=candidate["display_name"],direction=candidate["direction"],expiry_minutes=candidate["expiry_minutes"],entry_price=entry,entry_ts=ts,entry_candle_ts=candidate["entry_candle_ts"],strategy=candidate["strategy"],reason=candidate["reason"],confidence=candidate["confidence"])
-                key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
-                target_dt=time.strftime("%H:%M:%S",time.localtime(target))
-                msg=f"━━━━━━━━━━━━━━━━━━━━\n🎯 CANDICE AI • LIVE MARKET\n━━━━━━━━━━━━━━━━━━━━\n\n📊 ASSET: {s.display_name} ({s.pair})\n➡️ DIRECTION: {s.direction}\n\n🕒 SIGNAL: {time.strftime('%H:%M:%S',time.localtime(ts))} UAE\n🎯 TARGET: {target_dt} UAE\n⏳ SIGNAL COUNTDOWN: 00:40\n\n⏱️ EXPIRY: {s.expiry_minutes} MIN\n💰 ENTRY: {s.entry_price}\n\n📈 15M TREND: {s.trend_15m}\n🕯️ 1M STRUCTURE: {s.structure_1m}\n🧠 STRATEGY: {s.strategy}\n🎯 CONFIDENCE: {s.confidence}%\n🟢 ACCOUNT: DEMO\n\n🧠 {s.reason}\n━━━━━━━━━━━━━━━━━━━━"
-                await telegram(msg);asyncio.create_task(result_watch(key));log.info("FINAL_SIGNAL cycle=%s pair=%s direction=%s confidence=%s",cycle_id,p,s.direction,s.confidence)
-        else:log.info("NO_VALID_FINAL_SETUP cycle=%s",cycle_id)
-        # refresh full market evidence for the next cycle
+        BRAIN.start_cycle(int(target//300)); STATE["cycle"]=int(target//300); last_target=target
+        candidate=None
+        while time.time()<target:
+            await refresh_candles()
+            candidate=await final_candidate()
+            await asyncio.sleep(2)
+        # Exact target: refresh price/candles once more, then use fresh tick price.
         await refresh_candles()
+        candidate=await final_candidate()
+        if candidate and BRAIN.can_send_cycle_signal():
+            p=candidate["pair"]; entry=STATE["prices"].get(p,(None,None))[0]
+            if entry is not None:
+                ts=target
+                s=BRAIN.mark_signal_sent(pair=p,display_name=candidate["display_name"],direction=candidate["direction"],expiry_minutes=candidate["expiry_minutes"],entry_price=entry,entry_ts=ts,entry_candle_ts=candidate["entry_candle_ts"],strategy=candidate["strategy"],reason=candidate["reason"],confidence=candidate["confidence"])
+                key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
+                msg=(f"━━━━━━━━━━━━━━━━━━━━\\n🎯 CANDICE AI • LIVE MARKET\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
+                     f"📊 ASSET: {s.display_name} ({s.pair})\\n➡️ DIRECTION: {s.direction}\\n\\n"
+                     f"🕒 SIGNAL: {time.strftime('%H:%M:%S',time.localtime(ts))} UAE\\n"
+                     f"🎯 TARGET: {time.strftime('%H:%M:%S',time.localtime(target))} UAE\\n"
+                     f"⏳ SIGNAL COUNTDOWN: 00:00\\n\\n⏱️ EXPIRY: {s.expiry_minutes} MIN\\n"
+                     f"💰 ENTRY: {s.entry_price}\\n\\n📈 15M TREND: {s.trend_15m}\\n"
+                     f"🕯️ 1M STRUCTURE: {s.structure_1m}\\n🧠 STRATEGY: {s.strategy}\\n"
+                     f"🎯 CONFIDENCE: {s.confidence}%\\n🟢 ACCOUNT: DEMO\\n\\n🧠 {s.reason}\\n━━━━━━━━━━━━━━━━━━━━")
+                await telegram(msg); asyncio.create_task(result_watch(key))
+                log.info("FINAL_SIGNAL cycle=%s pair=%s direction=%s confidence=%s",target//300,p,s.direction,s.confidence)
+        else:
+            log.info("NO_VALID_FINAL_SETUP cycle=%s",target//300)
+        await asyncio.sleep(0.5)
 
 async def market_worker():
     global CLIENT
@@ -160,6 +193,7 @@ async def market_worker():
                 if client.account_id:break
             raw=await client.market.get_available_assets(client.account_id);assets=build_assets(client,raw)
             STATE["assets"]=assets;STATE["status"]="live_read_only"
+            log.info("ASSET_UNIVERSE real=%d otc=%d total=%d",sum(a["mode"]=="REAL" for a in assets),sum(a["mode"]=="OTC" for a in assets),len(assets))
             log.info("ALL_ASSETS_READY count=%d",len(assets))
             for a in assets:
                 try:await client.market.subscribe_ticks(a["pair"])
