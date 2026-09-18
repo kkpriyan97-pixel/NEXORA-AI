@@ -11,9 +11,16 @@ from ai_engine import snapshot_from_asset
 from ai_router import analyze_with_fallback
 
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 log=logging.getLogger("candice")
 BRAIN=BrainState()
 STATE={"status":"starting","assets":[],"prices":{},"candles":{},"analyses":{},"read_only":True,"cycle":0,"last_cycle":None}
+CANDLE_FETCH_SEM=asyncio.Semaphore(2)
+CANDLE_FETCH_LAST={}
+CANDLE_FETCH_INTERVAL=60.0
+AI_REVIEW_CACHE={}
+AI_REVIEW_TTL=12.0
 CLIENT=None
 LOCK=asyncio.Lock()
 
@@ -122,23 +129,30 @@ async def on_tick(message):
             try:STATE["prices"][p]=(float(q),float(ts) if ts is not None else time.time())
             except Exception:pass
 
-async def refresh_candles():
-    client=CLIENT;assets=STATE["assets"]
+async def refresh_candles(force=False):
+    client=CLIENT;assets=list(STATE["assets"])
     if not client:return
-    sem=asyncio.Semaphore(8)
+    now=time.time()
+    due=[a for a in assets if force or now-CANDLE_FETCH_LAST.get(a["pair"],0)>=CANDLE_FETCH_INTERVAL]
     async def one(a):
-        async with sem:
+        p=a["pair"]
+        async with CANDLE_FETCH_SEM:
             try:
-                cs=await client.market.get_candles(a["pair"],size=60,count=60)
-                if cs:STATE["candles"][a["pair"]]=cs
-                p=STATE["prices"].get(a["pair"],(None,None))[0]
-                an=analyze_asset(a,STATE["candles"].get(a["pair"],[]),p)
-                if an:
-                    an["profitability"]=a["profitability"];STATE["analyses"][a["pair"]]=an
-                else:STATE["analyses"].pop(a["pair"],None)
-            except Exception as e:log.debug("CANDLE_REFRESH_FAILED %s %s",a["pair"],e)
-    await asyncio.gather(*(one(a) for a in assets))
-    log.info("LIVE_ANALYSIS_REFRESH assets=%d qualified=%d",len(assets),len(STATE["analyses"]))
+                await asyncio.sleep(0.35)
+                cs=await client.market.get_candles(p,size=60,count=60)
+                if cs:STATE["candles"][p]=cs
+                CANDLE_FETCH_LAST[p]=time.time()
+            except Exception as e:
+                log.warning("CANDLE_REFRESH_THROTTLED_OR_FAILED pair=%s %s",p,e)
+                CANDLE_FETCH_LAST[p]=time.time()
+    await asyncio.gather(*(one(a) for a in due))
+    for a in assets:
+        p=a["pair"];price=STATE["prices"].get(p,(None,None))[0]
+        an=analyze_asset(a,STATE["candles"].get(p,[]),price)
+        if an:
+            an["profitability"]=a["profitability"];STATE["analyses"][p]=an
+        else:STATE["analyses"].pop(p,None)
+    log.info("LIVE_ANALYSIS_REFRESH assets=%d fetched=%d qualified=%d",len(assets),len(due),len(STATE["analyses"]))
 
 async def final_candidate():
     BRAIN.prune_expired_cooldowns()
@@ -152,11 +166,19 @@ async def final_candidate():
         cs=STATE["candles"].get(x["pair"],[])
         price=STATE["prices"].get(x["pair"],(x.get("price"),None))[0]
         snap=snapshot_from_asset(next(a for a in eligible if a["pair"]==x["pair"]),cs,price,time.time())
-        try:
-            d=await analyze_with_fallback(snap)
-            if d and int(d.get("confidence",0))>=90:
-                x.update({"confidence":int(d["confidence"]),"reason":d.get("reason") or x["reason"],"ai_provider":d.get("provider")});reviewed.append(x)
-        except Exception as e:log.warning("AI_REVIEW_FAILED pair=%s %s",x["pair"],e)
+        cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
+        cached=AI_REVIEW_CACHE.get(cache_key)
+        if cached and time.time()-cached[0] < AI_REVIEW_TTL:
+            d=cached[1]
+        else:
+            d=None
+            try:
+                d=await analyze_with_fallback(snap)
+                AI_REVIEW_CACHE[cache_key]=(time.time(),d)
+            except Exception as e:
+                log.warning("AI_REVIEW_FAILED pair=%s %s",x["pair"],e)
+        if d and int(d.get("confidence",0))>=90:
+            x.update({"confidence":int(d["confidence"]),"reason":d.get("reason") or x["reason"],"ai_provider":d.get("provider")});reviewed.append(x)
     return rank_signal_candidates(reviewed)[0] if reviewed else None
 
 async def result_watch(key):
@@ -243,8 +265,7 @@ async def market_worker():
             for a in assets:
                 try:await client.market.subscribe_ticks(a["pair"])
                 except Exception as e:log.debug("TICK_SUBSCRIBE_FAILED %s %s",a["pair"],e)
-            await refresh_candles()
-            if not any(x.done() for x in []):pass
+            await refresh_candles(force=True)
             while True:await asyncio.sleep(30)
         except Exception as e:
             STATE["status"]="error";log.exception("MARKET_WORKER_ERROR %s",e);await asyncio.sleep(15)
