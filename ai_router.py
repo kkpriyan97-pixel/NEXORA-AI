@@ -32,12 +32,14 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
             "confidence 0-100, reason. This is DEMO read-only; never trade.\n"+
             json.dumps(request,ensure_ascii=False,separators=(",",":")))
     last=None
+    http_timeout=float(os.getenv("AI_HTTP_TIMEOUT","3.0"))
+    connect_timeout=min(2.0,http_timeout)
     for name in _providers():
         cfg=_cfg(name)
         if not cfg:continue
         base,model,key=cfg
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0,connect=4.0)) as h:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(http_timeout,connect=connect_timeout)) as h:
                 r=await h.post(base+"/chat/completions",headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},json={"model":model,"temperature":0,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":"Return only JSON with direction, confidence, reason."},{"role":"user","content":prompt}]})
                 r.raise_for_status()
                 body=r.json();content=body["choices"][0]["message"]["content"]
