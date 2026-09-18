@@ -253,19 +253,45 @@ async def market_worker():
         client=OlympTradeClient(access_token=token,log_raw_messages=False);CLIENT=client;client.register_callback(parameters.E_TICK_UPDATE,on_tick)
         try:
             STATE["status"]="connecting";await client.start();STATE["status"]="connected"
-            # Event 55 already contains the authenticated account list. Select DEMO
-            # before any helper can issue a second account-info request.
-            await asyncio.sleep(2)
-            for m in client.get_cached_events(55):
-                d=m.get("d") if isinstance(m,dict) else None
-                if isinstance(d,list):
-                    for a in d:
-                        if isinstance(a,dict) and a.get("group")=="demo":client.account_id=a.get("account_id");client.account_group="demo";break
-                if client.account_id:break
-            if not client.account_id:
+            # Session initialization is what causes broker event 55 to arrive.
+            # Start it without waiting for the library's slow account-info fallback.
+            init_task=asyncio.create_task(client.initialize_session())
+            demo_found=False
+            for _ in range(20):
+                await asyncio.sleep(0.25)
+                for m in client.get_cached_events(55):
+                    d=m.get("d") if isinstance(m,dict) else None
+                    if isinstance(d,list):
+                        for a in d:
+                            if isinstance(a,dict) and a.get("group")=="demo" and a.get("account_id") is not None:
+                                client.account_id=a.get("account_id")
+                                client.account_group="demo"
+                                demo_found=True
+                                break
+                    if demo_found: break
+                if demo_found: break
+            if demo_found:
+                log.info("DEMO_ACCOUNT_SELECTED account_id=%s",client.account_id)
+                if not init_task.done():
+                    init_task.cancel()
+                try: await init_task
+                except asyncio.CancelledError: pass
+            else:
+                try: await init_task
+                except Exception as e: log.warning("SESSION_INIT_AFTER_EVENT55_FAILED %s",e)
+                for m in client.get_cached_events(55):
+                    d=m.get("d") if isinstance(m,dict) else None
+                    if isinstance(d,list):
+                        for a in d:
+                            if isinstance(a,dict) and a.get("group")=="demo" and a.get("account_id") is not None:
+                                client.account_id=a.get("account_id")
+                                client.account_group="demo"
+                                demo_found=True
+                                break
+                    if demo_found: break
+            if not demo_found:
                 log.error("DEMO_ACCOUNT_NOT_FOUND_IN_EVENT_55")
                 raise RuntimeError("DEMO account id not available from broker event 55")
-            log.info("DEMO_ACCOUNT_SELECTED account_id=%s",client.account_id)
             raw=await client.market.get_available_assets(client.account_id)
             # Use the same authenticated profitability/availability stream that
             # produced the original working Flex comparison (historically seen
