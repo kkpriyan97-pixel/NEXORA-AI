@@ -178,12 +178,20 @@ async def final_candidate():
     raw=[STATE["analyses"][a["pair"]].copy() for a in eligible if a["pair"] in STATE["analyses"]]
     raw=rank_signal_candidates(raw)
     if not raw:return None
-    # AI reviews the strongest technical candidates; fallback provider is automatic.
+    # AI reviews the strongest technical candidates in parallel. Sequential reviews
+    # consumed the final 40-second window (3-4 seconds per provider call), so one
+    # candidate could reach the target while the remaining reviews were still running.
+    top=raw[:8]
+    now=time.time()
     reviewed=[]
-    for x in raw[:8]:
+
+    async def review_one(x):
         cs=STATE["candles"].get(x["pair"],[])
         price=STATE["prices"].get(x["pair"],(x.get("price"),None))[0]
-        snap=snapshot_from_asset(next(a for a in eligible if a["pair"]==x["pair"]),cs,price,time.time())
+        asset=next((a for a in eligible if a["pair"]==x["pair"]),None)
+        if not asset:
+            return None
+        snap=snapshot_from_asset(asset,cs,price,now)
         cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
         cached=AI_REVIEW_CACHE.get(cache_key)
         if cached and time.time()-cached[0] < AI_REVIEW_TTL:
@@ -192,11 +200,21 @@ async def final_candidate():
             d=None
             try:
                 d=await asyncio.wait_for(analyze_with_fallback(snap),timeout=AI_REVIEW_TIMEOUT)
-                AI_REVIEW_CACHE[cache_key]=(time.time(),d)
+                if d: AI_REVIEW_CACHE[cache_key]=(time.time(),d)
             except Exception as e:
-                log.warning("AI_REVIEW_FAILED pair=%s %s",x["pair"],e)
+                log.warning("AI_REVIEW_FAILED pair=%s type=%s message=%s",x["pair"],type(e).__name__,str(e)[:120])
         if d and int(d.get("confidence",0))>=90:
-            x.update({"confidence":int(d["confidence"]),"reason":d.get("reason") or x["reason"],"ai_provider":d.get("provider")});reviewed.append(x)
+            y=x.copy()
+            y.update({"confidence":int(d["confidence"]),"reason":d.get("reason") or x["reason"],"ai_provider":d.get("provider")})
+            return y
+        return None
+
+    results=await asyncio.gather(*(review_one(x) for x in top),return_exceptions=True)
+    for x,r in zip(top,results):
+        if isinstance(r,Exception):
+            log.warning("AI_REVIEW_TASK_FAILED pair=%s type=%s message=%s",x["pair"],type(r).__name__,str(r)[:120])
+        elif r:
+            reviewed.append(r)
     return rank_signal_candidates(reviewed)[0] if reviewed else None
 
 async def result_watch(key):
