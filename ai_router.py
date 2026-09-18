@@ -1,12 +1,14 @@
 """Multi-provider AI router. Primary first, immediate fallback on error/timeout."""
 from __future__ import annotations
-import json,os,logging,time
+import asyncio,json,os,logging,time
 from typing import Any
 import httpx
 from ai_engine import MarketSnapshot,build_ai_request,parse_ai_decision
 log=logging.getLogger("candice")
 PROVIDER_COOLDOWN={}
 PROVIDER_COOLDOWN_SECONDS=30.0
+PROVIDER_LOCKS={}
+ANALYSIS_SEMAPHORE=asyncio.Semaphore(3)
 
 def _providers():
     names=[]
@@ -28,6 +30,13 @@ def _cfg(name):
     if not key or not base or not model:return None
     return base,model,key
 
+def _provider_lock(name):
+    lock=PROVIDER_LOCKS.get(name)
+    if lock is None:
+        lock=asyncio.Lock()
+        PROVIDER_LOCKS[name]=lock
+    return lock
+
 async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
     request=build_ai_request(snapshot)
     prompt=("You are Candice Brain. Analyze only supplied live OHLC/market evidence. "
@@ -37,31 +46,37 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
     last=None
     http_timeout=float(os.getenv("AI_HTTP_TIMEOUT","3.0"))
     connect_timeout=min(2.0,http_timeout)
-    for name in _providers():
-        if time.time() < PROVIDER_COOLDOWN.get(name,0):
-            continue
-        cfg=_cfg(name)
-        if not cfg:continue
-        base,model,key=cfg
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(http_timeout,connect=connect_timeout)) as h:
-                r=await h.post(base+"/chat/completions",headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},json={"model":model,"temperature":0,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":"Return only JSON with direction, confidence, reason."},{"role":"user","content":prompt}]})
-                r.raise_for_status()
-                body=r.json();content=body["choices"][0]["message"]["content"]
-                d=parse_ai_decision(content,snapshot)
-                if d:return {"decision":"SIGNAL","direction":d.direction,"confidence":d.confidence,"reason":d.reason,"display_name":d.display_name,"pair":d.pair,"provider":name}
-        except httpx.HTTPStatusError as e:
-            last=e
-            detail=""
-            try: detail=e.response.text[:160]
-            except Exception: pass
-            log.warning("AI_PROVIDER_FAILED provider=%s status=%s detail=%s",name,e.response.status_code,detail)
-            if e.response.status_code == 429:
-                PROVIDER_COOLDOWN[name]=time.time()+PROVIDER_COOLDOWN_SECONDS
-            continue
-        except Exception as e:
-            last=e
-            log.warning("AI_PROVIDER_FAILED provider=%s type=%s message=%s",name,type(e).__name__,str(e)[:160])
-            continue
+    async with ANALYSIS_SEMAPHORE:
+        for name in _providers():
+            cfg=_cfg(name)
+            if not cfg:continue
+            lock=_provider_lock(name)
+            async with lock:
+                now=time.time()
+                cooldown_until=PROVIDER_COOLDOWN.get(name,0)
+                if now < cooldown_until:
+                    log.info("AI_PROVIDER_COOLDOWN provider=%s remaining=%.1fs",name,cooldown_until-now)
+                    continue
+                base,model,key=cfg
+                try:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(http_timeout,connect=connect_timeout)) as h:
+                        r=await h.post(base+"/chat/completions",headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},json={"model":model,"temperature":0,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":"Return only JSON with direction, confidence, reason."},{"role":"user","content":prompt}]})
+                        r.raise_for_status()
+                        body=r.json();content=body["choices"][0]["message"]["content"]
+                        d=parse_ai_decision(content,snapshot)
+                        if d:return {"decision":"SIGNAL","direction":d.direction,"confidence":d.confidence,"reason":d.reason,"display_name":d.display_name,"pair":d.pair,"provider":name}
+                except httpx.HTTPStatusError as e:
+                    last=e
+                    detail=""
+                    try: detail=e.response.text[:160]
+                    except Exception: pass
+                    log.warning("AI_PROVIDER_FAILED provider=%s status=%s detail=%s",name,e.response.status_code,detail)
+                    if e.response.status_code == 429:
+                        PROVIDER_COOLDOWN[name]=time.time()+PROVIDER_COOLDOWN_SECONDS
+                    continue
+                except Exception as e:
+                    last=e
+                    log.warning("AI_PROVIDER_FAILED provider=%s type=%s message=%s",name,type(e).__name__,str(e)[:160])
+                    continue
     if last: raise RuntimeError(f"All configured AI providers failed: {last}")
     return None
