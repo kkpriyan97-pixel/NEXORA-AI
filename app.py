@@ -140,7 +140,19 @@ async def refresh_candles(force=False):
             try:
                 await asyncio.sleep(0.35)
                 cs=await client.market.get_candles(p,size=60,count=60)
-                if cs:STATE["candles"][p]=cs
+                normalized=[]
+                if isinstance(cs,list):
+                    for item in cs:
+                        if isinstance(item,dict) and isinstance(item.get("candles"),list):
+                            normalized.extend(x for x in item["candles"] if isinstance(x,dict))
+                        elif isinstance(item,dict) and any(k in item for k in ("open","o","high","h","low","l","close","c")):
+                            normalized.append(item)
+                if normalized:
+                    try:
+                        normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
+                    except Exception:
+                        pass
+                    STATE["candles"][p]=normalized
                 CANDLE_FETCH_LAST[p]=time.time()
             except Exception as e:
                 log.warning("CANDLE_REFRESH_THROTTLED_OR_FAILED pair=%s %s",p,e)
@@ -282,30 +294,15 @@ async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def telegram_worker():
-    token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
-    if not token:
+    # Outbound-signal-only mode: no getUpdates polling, avoiding conflicts
+    # with another Telegram client/session using the same bot token.
+    if os.getenv("TELEGRAM_BOT_TOKEN","").strip():
+        log.info("TELEGRAM_OUTBOUND_ONLY_READY")
+    else:
         log.warning("TELEGRAM_NOT_CONFIGURED")
-        return
     while True:
-        try:
-            app=Application.builder().token(token).build()
-            app.add_handler(CommandHandler("start",telegram_start))
-            await app.initialize()
-            await app.start()
-            await app.updater.start_polling(drop_pending_updates=True)
-            log.info("TELEGRAM_POLLING_STARTED")
-            while True:
-                await asyncio.sleep(30)
-        except Exception as e:
-            log.exception("TELEGRAM_WORKER_ERROR %s",e)
-            await asyncio.sleep(15)
-        finally:
-            try: await app.updater.stop()
-            except Exception: pass
-            try: await app.stop()
-            except Exception: pass
-            try: await app.shutdown()
-            except Exception: pass
+        await asyncio.sleep(300)
+
 
 async def health(reader,writer):
     try:
@@ -316,5 +313,5 @@ async def health(reader,writer):
 
 async def main():
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
-    await asyncio.gather(market_worker(),cycle_loop(),telegram_worker(),server.serve_forever())
+    await asyncio.gather(market_worker(),cycle_loop(),server.serve_forever())
 if __name__=="__main__":asyncio.run(main())
