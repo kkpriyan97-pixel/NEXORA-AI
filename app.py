@@ -19,7 +19,9 @@ CANDLE_FETCH_SEM=asyncio.Semaphore(2)
 CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
 AI_REVIEW_CACHE={}
-AI_REVIEW_TTL=12.0
+AI_REVIEW_TTL=20.0
+AI_REVIEW_FAIL_TTL=20.0
+AI_PROVIDER_COOLDOWN={}
 AI_REVIEW_TIMEOUT=7.0
 CLIENT=None
 LOCK=asyncio.Lock()
@@ -181,7 +183,7 @@ async def final_candidate():
     # AI reviews the strongest technical candidates in parallel. Sequential reviews
     # consumed the final 40-second window (3-4 seconds per provider call), so one
     # candidate could reach the target while the remaining reviews were still running.
-    top=raw[:8]
+    top=raw[:3]
     now=time.time()
     reviewed=[]
 
@@ -194,13 +196,14 @@ async def final_candidate():
         snap=snapshot_from_asset(asset,cs,price,now)
         cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
         cached=AI_REVIEW_CACHE.get(cache_key)
-        if cached and time.time()-cached[0] < AI_REVIEW_TTL:
+        ttl=AI_REVIEW_TTL if cached and cached[1] else AI_REVIEW_FAIL_TTL
+        if cached and time.time()-cached[0] < ttl:
             d=cached[1]
         else:
             d=None
             try:
                 d=await asyncio.wait_for(analyze_with_fallback(snap),timeout=AI_REVIEW_TIMEOUT)
-                if d: AI_REVIEW_CACHE[cache_key]=(time.time(),d)
+                AI_REVIEW_CACHE[cache_key]=(time.time(),d)
             except Exception as e:
                 log.warning("AI_REVIEW_FAILED pair=%s type=%s message=%s",x["pair"],type(e).__name__,str(e)[:120])
         if d and int(d.get("confidence",0))>=90:
