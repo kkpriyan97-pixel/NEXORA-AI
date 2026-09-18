@@ -20,6 +20,7 @@ CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
 AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=12.0
+AI_REVIEW_TIMEOUT=4.0
 CLIENT=None
 LOCK=asyncio.Lock()
 
@@ -190,7 +191,7 @@ async def final_candidate():
         else:
             d=None
             try:
-                d=await analyze_with_fallback(snap)
+                d=await asyncio.wait_for(analyze_with_fallback(snap),timeout=AI_REVIEW_TIMEOUT)
                 AI_REVIEW_CACHE[cache_key]=(time.time(),d)
             except Exception as e:
                 log.warning("AI_REVIEW_FAILED pair=%s %s",x["pair"],e)
@@ -222,15 +223,22 @@ async def cycle_loop():
         if target<=last_target: target=last_target+300
         start=target-40
         await asyncio.sleep(max(0,start-time.time()))
+        log.info("CYCLE_WINDOW_START cycle=%s start_utc=%s target_utc=%s start_uae=%s target_uae=%s",int(target//300),time.strftime("%H:%M:%S",time.gmtime(start)),time.strftime("%H:%M:%S",time.gmtime(target)),time.strftime("%H:%M:%S",time.gmtime(start+4*3600)),time.strftime("%H:%M:%S",time.gmtime(target+4*3600)))
         BRAIN.start_cycle(int(target//300)); STATE["cycle"]=int(target//300); last_target=target
         candidate=None
         while time.time()<target:
             await refresh_candles()
-            candidate=await final_candidate()
-            await asyncio.sleep(2)
+            try:
+                candidate=await asyncio.wait_for(final_candidate(),timeout=max(1.0,target-time.time()))
+            except asyncio.TimeoutError:
+                log.warning("CYCLE_FINAL_EVALUATION_TIMEOUT cycle=%s remaining=%.2f",target//300,max(0,target-time.time())); candidate=None
+            await asyncio.sleep(min(2,max(0,target-time.time())))
         # Exact target: refresh price/candles once more, then use fresh tick price.
         await refresh_candles()
-        candidate=await final_candidate()
+        try:
+            candidate=await asyncio.wait_for(final_candidate(),timeout=3.0)
+        except asyncio.TimeoutError:
+            log.warning("CYCLE_TARGET_FINAL_CHECK_TIMEOUT cycle=%s",target//300); candidate=None
         if candidate and BRAIN.can_send_cycle_signal():
             p=candidate["pair"]; entry=STATE["prices"].get(p,(None,None))[0]
             if entry is not None:
