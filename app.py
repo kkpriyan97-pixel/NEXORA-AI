@@ -1,7 +1,6 @@
 import asyncio,json,logging,os,time
 from typing import Any
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
 import httpx
 from olymptrade_ws import OlympTradeClient
 from olymptrade_ws.olympconfig import parameters
@@ -254,15 +253,19 @@ async def market_worker():
         client=OlympTradeClient(access_token=token,log_raw_messages=False);CLIENT=client;client.register_callback(parameters.E_TICK_UPDATE,on_tick)
         try:
             STATE["status"]="connecting";await client.start();STATE["status"]="connected"
-            # Required: initialize the authenticated session before asset discovery.
-            await client.initialize_session()
-            await asyncio.sleep(4)
+            # Event 55 already contains the authenticated account list. Select DEMO
+            # before any helper can issue a second account-info request.
+            await asyncio.sleep(2)
             for m in client.get_cached_events(55):
                 d=m.get("d") if isinstance(m,dict) else None
                 if isinstance(d,list):
                     for a in d:
                         if isinstance(a,dict) and a.get("group")=="demo":client.account_id=a.get("account_id");client.account_group="demo";break
                 if client.account_id:break
+            if not client.account_id:
+                log.error("DEMO_ACCOUNT_NOT_FOUND_IN_EVENT_55")
+                raise RuntimeError("DEMO account id not available from broker event 55")
+            log.info("DEMO_ACCOUNT_SELECTED account_id=%s",client.account_id)
             raw=await client.market.get_available_assets(client.account_id)
             # Use the same authenticated profitability/availability stream that
             # produced the original working Flex comparison (historically seen
@@ -293,25 +296,47 @@ async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Mode: DEMO / Read-only"
     )
 
-async def telegram_worker():
-    # Outbound-signal-only mode: no getUpdates polling, avoiding conflicts
-    # with another Telegram client/session using the same bot token.
-    if os.getenv("TELEGRAM_BOT_TOKEN","").strip():
-        log.info("TELEGRAM_OUTBOUND_ONLY_READY")
-    else:
-        log.warning("TELEGRAM_NOT_CONFIGURED")
-    while True:
-        await asyncio.sleep(300)
-
 
 async def health(reader,writer):
     try:
-        await reader.read(2048)
-        body=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals)}).encode()
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"+body);await writer.drain()
+        raw=await reader.read(65536)
+        head,_,body=raw.partition(b"\r\n\r\n")
+        first=head.split(b"\r\n",1)[0].decode("latin1","ignore")
+        parts=first.split(" ")
+        path=parts[1] if len(parts)>1 else "/"
+        if path.startswith("/telegram/webhook") and body:
+            try:
+                upd=json.loads(body.decode("utf-8"))
+                msg=upd.get("message") or upd.get("edited_message") or {}
+                txt=str(msg.get("text") or "").strip()
+                chat_id=(msg.get("chat") or {}).get("id")
+                if txt.lower().startswith("/start") and chat_id is not None:
+                    await telegram("✅ NEXORA AI is online.\n\nCandice Brain: LIVE\nMode: DEMO / Read-only")
+                    log.info("TELEGRAM_START_RECEIVED")
+            except Exception as e:
+                log.warning("TELEGRAM_WEBHOOK_PARSE_FAILED %s",e)
+        body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals)}).encode()
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"+body_out);await writer.drain()
     finally:writer.close()
+
+async def configure_telegram_webhook():
+    token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+    if not token:
+        log.warning("TELEGRAM_NOT_CONFIGURED"); return
+    url=os.getenv("TELEGRAM_WEBHOOK_URL","https://priyanithan-zflv.onrender.com/telegram/webhook").strip()
+    secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
+    try:
+        payload={"url":url}
+        if secret: payload["secret_token"]=secret
+        async with httpx.AsyncClient(timeout=10) as h:
+            r=await h.post(f"https://api.telegram.org/bot{token}/setWebhook",json=payload)
+            r.raise_for_status()
+            log.info("TELEGRAM_WEBHOOK_READY")
+    except Exception as e:
+        log.warning("TELEGRAM_WEBHOOK_SETUP_FAILED %s",e)
 
 async def main():
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
+    await configure_telegram_webhook()
     await asyncio.gather(market_worker(),cycle_loop(),server.serve_forever())
 if __name__=="__main__":asyncio.run(main())
