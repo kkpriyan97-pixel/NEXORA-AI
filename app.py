@@ -20,7 +20,7 @@ CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
 AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=12.0
-AI_REVIEW_TIMEOUT=4.0
+AI_REVIEW_TIMEOUT=7.0
 CLIENT=None
 LOCK=asyncio.Lock()
 
@@ -254,9 +254,12 @@ async def cycle_loop():
         # Exact target: refresh price/candles once more, then use fresh tick price.
         await refresh_candles()
         try:
-            candidate=await asyncio.wait_for(final_candidate(),timeout=3.0)
+            last_candidate=candidate
+            candidate=await asyncio.wait_for(final_candidate(),timeout=1.0)
+            if candidate is None: candidate=last_candidate
         except asyncio.TimeoutError:
-            log.warning("CYCLE_TARGET_FINAL_CHECK_TIMEOUT cycle=%s",target//300); candidate=None
+            log.warning("CYCLE_TARGET_FINAL_CHECK_TIMEOUT cycle=%s",target//300)
+            candidate=last_candidate
         if candidate and BRAIN.can_send_cycle_signal():
             p=candidate["pair"]; entry=STATE["prices"].get(p,(None,None))[0]
             if entry is not None:
