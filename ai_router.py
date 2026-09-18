@@ -1,9 +1,10 @@
 """Multi-provider AI router. Primary first, immediate fallback on error/timeout."""
 from __future__ import annotations
-import json,os
+import json,os,logging
 from typing import Any
 import httpx
 from ai_engine import MarketSnapshot,build_ai_request,parse_ai_decision
+log=logging.getLogger("candice")
 
 def _providers():
     names=[]
@@ -45,8 +46,16 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                 body=r.json();content=body["choices"][0]["message"]["content"]
                 d=parse_ai_decision(content,snapshot)
                 if d:return {"decision":"SIGNAL","direction":d.direction,"confidence":d.confidence,"reason":d.reason,"display_name":d.display_name,"pair":d.pair,"provider":name}
+        except httpx.HTTPStatusError as e:
+            last=e
+            detail=""
+            try: detail=e.response.text[:160]
+            except Exception: pass
+            log.warning("AI_PROVIDER_FAILED provider=%s status=%s detail=%s",name,e.response.status_code,detail)
+            continue
         except Exception as e:
             last=e
+            log.warning("AI_PROVIDER_FAILED provider=%s type=%s message=%s",name,type(e).__name__,str(e)[:160])
             continue
     if last: raise RuntimeError(f"All configured AI providers failed: {last}")
     return None
