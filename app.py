@@ -64,21 +64,29 @@ def is_flex_time_asset(x):
     return True
 
 def build_assets(client,raw):
-    # Build the Flex Time universe from authenticated OlympTrade asset
-    # metadata. No hardcoded symbol/name mapping and no profitability
-    # intersection that can collapse the live universe.
+    # IMPORTANT: raw is the authenticated Flex-Time/availability feed chosen
+    # by market_worker. Do not widen it with the general instrument catalogue.
+    # The feed is dynamic: open/closed assets can change at any moment.
     prof={}
     for x in raw or []:
         if not isinstance(x,dict): continue
         p=pair_name(x)
         v=x.get("profitability")
         if p and isinstance(v,(int,float)): prof[p]=int(v)
+
     out=[]; seen=set()
     for x in raw or []:
         if not isinstance(x,dict) or not is_flex_time_asset(x): continue
         p=pair_name(x)
         if not p or p in seen: continue
+
+        # Only currently OPEN/tradable Flex assets enter the Brain.
+        # Never hard-code the historical 76 REAL + 37 OTC count; the platform
+        # is authoritative and this count is expected to change with time.
+        if x.get("disabled") is True or x.get("locked") is True or x.get("locked_trading") is True:
+            continue
         seen.add(p)
+
         title=display_name(x) or p
         v=prof.get(p,x.get("profitability",0))
         try: profitability=int(v)
@@ -87,9 +95,7 @@ def build_assets(client,raw):
             "pair":p,"display_name":title,"title":title,
             "signal_asset_label":f"{title} ({p})",
             "profitability":profitability,
-            "locked":x.get("locked") is True,
-            "locked_trading":x.get("locked_trading") is True,
-            "disabled":x.get("disabled") is True,
+            "locked":False,"locked_trading":False,"disabled":False,
             "mode":"OTC" if "_OTC" in p.upper() else "REAL",
             "trading_mode":"FLEX_TIME"
         })
@@ -223,10 +229,17 @@ async def market_worker():
                     for a in d:
                         if isinstance(a,dict) and a.get("group")=="demo":client.account_id=a.get("account_id");client.account_group="demo";break
                 if client.account_id:break
-            raw=await client.market.get_available_assets(client.account_id);assets=build_assets(client,raw)
+            raw=await client.market.get_available_assets(client.account_id)
+            # Use the same authenticated profitability/availability stream that
+            # produced the original working Flex comparison (historically seen
+            # as 76 REAL + 37 OTC). This is the source-of-truth universe.
+            flex_raw=event_records(client,182)
+            source=flex_raw if flex_raw else raw
+            assets=build_assets(client,source)
             STATE["assets"]=assets;STATE["status"]="live_read_only"
-            log.info("ASSET_UNIVERSE real=%d otc=%d total=%d",sum(a["mode"]=="REAL" for a in assets),sum(a["mode"]=="OTC" for a in assets),len(assets))
-            log.info("ALL_ASSETS_READY count=%d",len(assets))
+            real_n=sum(a["mode"]=="REAL" for a in assets); otc_n=sum(a["mode"]=="OTC" for a in assets)
+            log.info("FLEX_UNIVERSE_SOURCE event=182 source_count=%d open_real=%d open_otc=%d open_total=%d",len(source),real_n,otc_n,len(assets))
+            log.info("ALL_FLEX_OPEN_ASSETS_READY count=%d",len(assets))
             for a in assets:
                 try:await client.market.subscribe_ticks(a["pair"])
                 except Exception as e:log.debug("TICK_SUBSCRIBE_FAILED %s %s",a["pair"],e)
