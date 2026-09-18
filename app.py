@@ -356,8 +356,8 @@ async def health(reader,writer):
                 txt=str(msg.get("text") or "").strip()
                 chat_id=(msg.get("chat") or {}).get("id")
                 if txt.lower().startswith("/start") and chat_id is not None:
-                    await telegram("✅ NEXORA AI is online.\n\nCandice Brain: LIVE\nMode: DEMO / Read-only")
-                    log.info("TELEGRAM_START_RECEIVED")
+                    sent=await telegram("✅ NEXORA AI is online.\n\nCandice Brain: LIVE\nMode: DEMO / Read-only", chat_id=chat_id)
+                    log.info("TELEGRAM_START_RECEIVED chat_id=%s sent=%s",chat_id,sent)
             except Exception as e:
                 log.warning("TELEGRAM_WEBHOOK_PARSE_FAILED %s",e)
         body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals)}).encode()
