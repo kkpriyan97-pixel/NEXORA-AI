@@ -274,7 +274,7 @@ async def cycle_loop():
     while True:
         now=time.time(); target=(int(now)//300+1)*300
         if target<=last_target: target=last_target+300
-        start=target-40
+        start=target-30
         await asyncio.sleep(max(0,start-time.time()))
         log.info("CYCLE_WINDOW_START cycle=%s start_utc=%s target_utc=%s start_uae=%s target_uae=%s",int(target//300),time.strftime("%H:%M:%S",time.gmtime(start)),time.strftime("%H:%M:%S",time.gmtime(target)),time.strftime("%H:%M:%S",time.gmtime(start+4*3600)),time.strftime("%H:%M:%S",time.gmtime(target+4*3600)))
         BRAIN.start_cycle(int(target//300)); STATE["cycle"]=int(target//300); last_target=target
