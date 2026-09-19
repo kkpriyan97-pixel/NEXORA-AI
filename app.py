@@ -505,20 +505,23 @@ async def result_watch(key):
 
     rec=BRAIN.finish_signal(key,expiry_price)
     label=rec["display_name"]
-    icon={"WIN":"🟢","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
+    direction_icon="⬆️" if rec["direction"]=="UP" else "⬇️"
+    result_icon={"WIN":"✅","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
     await telegram(
-        f"━━━━━━━━━━━━━━━━━━━━\\n🎯 CANDICE AI RESULT\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
-        f"📊 ASSET: {label}\\n"
-        f"➡️ DIRECTION: {rec['direction']}\\n\\n"
-        f"💰 ENTRY: {rec['entry_price']}\\n"
-        f"💰 EXIT: {rec['exit_price']}\\n"
-        f"⏱️ EXPIRY: {rec['expiry_minutes']} MIN\\n\\n"
-        f"{icon} {rec['result']}\\n\\n"
-        f"🧠 STRATEGY: {rec['strategy']}\\n"
-        f"📈 15M TREND: {rec['trend_15m']}\\n"
-        f"🕯️ 1M STRUCTURE: {rec['structure_1m']}\\n\\n"
-        f"🧠 Brain learning recorded\\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
+        f"📊 TRADE RESULT\\n"
+        f"\\n"
+        f"📈 {label}\\n"
+        f"\\n"
+        f"{direction_icon} {rec['direction']}\\n"
+        f"\\n"
+        f"💰 Entry: {rec['entry_price']}\\n"
+        f"🏁 Expiry: {rec['exit_price']}\\n"
+        f"⏱️ Duration: {rec['expiry_minutes']} MIN\\n"
+        f"🔎 Verification: candle-closed\\n"
+        f"\\n"
+        f"{result_icon} {rec['result']}\\n"
+        f"\\n"
+        f"⚠️ RESULT ONLY — AUTO TRADE OFF"
     )
     log.info(
         "RESULT pair=%s result=%s entry=%s exit=%s source=%s cooldown=%s",
