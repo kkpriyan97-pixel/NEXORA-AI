@@ -197,8 +197,7 @@ async def on_tick(message):
         q=t.get("q")
         if q is None:
             q=t.get("price")
-        if q is None:
-            q=t.get("value")
+        if q is None:            q=t.get("value")
         if q is None:
             q=t.get("v")
         ts=t.get("t")
@@ -300,7 +299,7 @@ async def ensure_candidate_quotes(pairs):
         log.info("QUOTE_SNAPSHOT_REFRESH requested=%d received=%d",len(unique),fetched)
     return fetched
 
-async def _candle_epoch(c):
+def _candle_epoch(c):
     """Return candle timestamp in epoch seconds, accepting seconds or milliseconds."""
     try:
         v=float(c.get("time",c.get("t")))
@@ -327,7 +326,7 @@ def _candle_data_stale(pair,reference_ts=None):
     ts=_candle_epoch(closed[-1])
     return ts is None or (now-ts)>75.0
 
-def refresh_candles(force=False):
+async def refresh_candles(force=False):
     client=CLIENT;assets=list(STATE["assets"])
     if not client:return
     now=time.time()
@@ -397,8 +396,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
     ]
     raw=[STATE["analyses"][a["pair"]].copy() for a in eligible if a["pair"] in STATE["analyses"]]
     raw=[BRAIN.adaptive_candidate(x) for x in raw]
-    raw=rank_signal_candidates(raw)
-    if not raw:return None
+    raw=rank_signal_candidates(raw)    if not raw:return None
     # AI reviews the strongest technical candidates in parallel. Sequential reviews
     # consumed the final 40-second window (3-4 seconds per provider call), so one
     # candidate could reach the target while the remaining reviews were still running.
@@ -597,8 +595,7 @@ async def result_watch(key):
         f"\n"
         f"{result_icon} {rec['result']}\n"
         f"\n"
-        f"⚠️ RESULT ONLY — AUTO TRADE OFF"
-    )
+        f"⚠️ RESULT ONLY — AUTO TRADE OFF"    )
     log.info(
         "RESULT pair=%s result=%s entry=%s exit=%s source=%s cooldown=%s",
         rec["pair"],rec["result"],rec["entry_price"],rec["exit_price"],
@@ -798,135 +795,3 @@ async def audit_outbound_network():
         return ""
 
 async def market_worker():
-    global CLIENT
-    while True:
-        token=os.getenv("OLYMPTRADE_ACCESS_TOKEN","").strip()
-        if not token:STATE["status"]="waiting_for_token";await asyncio.sleep(30);continue
-        client=OlympTradeClient(access_token=token,log_raw_messages=False);CLIENT=client;client.register_callback(parameters.E_TICK_UPDATE,on_tick)
-        try:
-            STATE["status"]="connecting"
-            await audit_outbound_network()
-            await client.start()
-            STATE["status"]="connected"
-            # Session initialization is what causes broker event 55 to arrive.
-            # Start it without waiting for the library's slow account-info fallback.
-            init_task=asyncio.create_task(client.initialize_session())
-            demo_found=False
-            for _ in range(20):
-                await asyncio.sleep(0.25)
-                for m in client.get_cached_events(55):
-                    d=m.get("d") if isinstance(m,dict) else None
-                    if isinstance(d,list):
-                        for a in d:
-                            if isinstance(a,dict) and a.get("group")=="demo" and a.get("account_id") is not None:
-                                client.account_id=a.get("account_id")
-                                client.account_group="demo"
-                                demo_found=True
-                                break
-                    if demo_found: break
-                if demo_found: break
-            if demo_found:
-                log.info("DEMO_ACCOUNT_SELECTED account_id=%s",client.account_id)
-                if not init_task.done():
-                    init_task.cancel()
-                try: await init_task
-                except asyncio.CancelledError: pass
-            else:
-                try: await init_task
-                except Exception as e: log.warning("SESSION_INIT_AFTER_EVENT55_FAILED %s",e)
-                for m in client.get_cached_events(55):
-                    d=m.get("d") if isinstance(m,dict) else None
-                    if isinstance(d,list):
-                        for a in d:
-                            if isinstance(a,dict) and a.get("group")=="demo" and a.get("account_id") is not None:
-                                client.account_id=a.get("account_id")
-                                client.account_group="demo"
-                                demo_found=True
-                                break
-                    if demo_found: break
-            if not demo_found:
-                log.error("DEMO_ACCOUNT_NOT_FOUND_IN_EVENT_55")
-                raise RuntimeError("DEMO account id not available from broker event 55")
-            raw=await client.market.get_available_assets(client.account_id)
-            # IMPORTANT: the authenticated account-scoped asset response is the
-            # source of truth. Do NOT replace it with cached event 182/global
-            # Flex metadata: that stream can contain region/account-ineligible
-            # instruments (for example India-specific OTC products).
-            source=raw or []
-            assets=build_assets(client,source)
-            STATE["assets"]=assets;STATE["status"]="live_read_only"
-            real_n=sum(a["mode"]=="REAL" for a in assets); otc_n=sum(a["mode"]=="OTC" for a in assets)
-            log.info("ACCOUNT_ASSET_SOURCE account_id=%s source_count=%d open_real=%d open_otc=%d open_total=%d",
-                     client.account_id,len(source),real_n,otc_n,len(assets))
-            log.info("ALL_ACCOUNT_OPEN_ASSETS_READY count=%d",len(assets))
-            # Do not bulk-call MarketAPI.subscribe_ticks(). The current broker
-            # endpoint rejects its event-12/280 requests. Live event-1 ticks
-            # already arrive from the authenticated session; missing quotes are
-            # handled by the read-only snapshot fallback in final_candidate().
-            log.info("TICK_SUBSCRIPTION_MODE disabled_reason=broker_event_12_280_rejected")
-            await refresh_candles(force=True)
-            while True:await asyncio.sleep(30)
-        except Exception as e:
-            STATE["status"]="error";log.exception("MARKET_WORKER_ERROR %s",e);await asyncio.sleep(15)
-        finally:
-            try:await client.stop()
-            except Exception:pass
-            CLIENT=None
-
-async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ NEXORA AI is online.\\n\\n"
-        "Candice Brain: LIVE\\n"
-        "Mode: DEMO / Read-only"
-    )
-
-
-async def health(reader,writer):
-    try:
-        raw=await reader.read(65536)
-        head,_,body=raw.partition(b"\r\n\r\n")
-        first=head.split(b"\r\n",1)[0].decode("latin1","ignore")
-        parts=first.split(" ")
-        path=parts[1] if len(parts)>1 else "/"
-        headers={}
-        for line in head.decode("latin1","ignore").split("\r\n")[1:]:
-            if ":" in line:
-                k,v=line.split(":",1);headers[k.strip().lower()]=v.strip()
-        webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
-        if path.startswith("/health"):
-            body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"network":STATE.get("network",{})}).encode()
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
-            await writer.drain()
-            return
-        if path.startswith("/telegram/webhook") and webhook_secret and headers.get("x-telegram-bot-api-secret-token") != webhook_secret:
-            writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
-            await writer.drain()
-            return
-        if path.startswith("/telegram/webhook") and not body:
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNEXORA Telegram webhook is ready")
-            await writer.drain()
-            return
-        if path.startswith("/telegram/webhook") and body:
-            try:
-                upd=json.loads(body.decode("utf-8"))
-                msg=upd.get("message") or upd.get("edited_message") or {}
-                txt=str(msg.get("text") or "").strip()
-                chat_id=(msg.get("chat") or {}).get("id")
-                if chat_id is not None:
-                    STATE["telegram_chat_id"]=chat_id
-                    log.info("TELEGRAM_CHAT_ID_CAPTURED chat_id=%s",chat_id)
-                if txt.lower().startswith("/start") and chat_id is not None:
-                    sent=await telegram("✅ NEXORA AI is online.\n\nCandice Brain: LIVE\nMode: DEMO / Read-only", chat_id=chat_id)
-                    log.info("TELEGRAM_START_RECEIVED chat_id=%s sent=%s",chat_id,sent)
-            except Exception as e:
-                log.warning("TELEGRAM_WEBHOOK_PARSE_FAILED %s",e)
-        body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"network":STATE.get("network",{})}).encode()
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"+body_out);await writer.drain()
-    finally:writer.close()
-
-async def configure_telegram_webhook():
-    token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
-    if not token:
-        log.warning("TELEGRAM_NOT_CONFIGURED"); return
-    url=os.getenv("TELEGRAM_WEBHOOK_URL","https://priyanithan-zflv.onrender.com/telegram/webhook").strip()
-    secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
