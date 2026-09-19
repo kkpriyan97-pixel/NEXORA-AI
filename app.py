@@ -618,7 +618,10 @@ async def cycle_loop():
             direction=candidate["direction"],expiry_minutes=candidate["expiry_minutes"],
             entry_price=entry,entry_ts=target,
             entry_candle_ts=candidate["entry_candle_ts"],
-            strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence
+            strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence,
+            pattern=str(candidate.get("pattern") or ""),
+            trend_15m=str(candidate.get("trend_15m") or ""),
+            structure_1m=str(candidate.get("structure_1m") or "")
         )
         key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
         msg=(f"🚨 CANDICE AI SIGNAL\n\n"
@@ -637,9 +640,10 @@ async def cycle_loop():
              f"🤖 CANDICE BRAIN")
         log.info(
             "FINAL_SIGNAL cycle=%s pair=%s direction=%s confidence=%s price_source=%s "
-            "signal_utc=%s target_utc=%s lead_seconds=%.3f",
+            "trend=%s structure=%s pattern=%s signal_utc=%s target_utc=%s lead_seconds=%.3f",
             int(target//300),s.pair,s.direction,s.confidence,
             STATE["price_source"].get(s.pair,"unknown"),
+            s.trend_15m or "UNKNOWN",s.structure_1m or "UNKNOWN",s.pattern or "UNKNOWN",
             time.strftime("%H:%M:%S.%f",time.gmtime(ts))[:-3],
             time.strftime("%H:%M:%S.%f",time.gmtime(target))[:-3],
             target-time.time()
