@@ -421,7 +421,10 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
         asset=next((a for a in eligible if a["pair"]==x["pair"]),None)
         if not asset:
             return None
-        snap=snapshot_from_asset(asset,cs,price,now)
+        closed=_closed_candles(cs,now)
+        if len(closed)<45:
+            return None
+        snap=snapshot_from_asset(asset,closed,price,now)
         cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
         cached=AI_REVIEW_CACHE.get(cache_key)
         ttl=AI_REVIEW_TTL if cached and cached[1] else AI_REVIEW_FAIL_TTL
@@ -820,7 +823,10 @@ async def market_worker():
                 log.info("DEMO_ACCOUNT_SELECTED account_id=%s",client.account_id)
                 if not init_task.done():
                     init_task.cancel()
-                try: await init_task                except asyncio.CancelledError: pass
+                try:
+                    await init_task
+                except asyncio.CancelledError:
+                    pass
             else:
                 try: await init_task
                 except Exception as e: log.warning("SESSION_INIT_AFTER_EVENT55_FAILED %s",e)
