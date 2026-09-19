@@ -31,9 +31,13 @@ def _cfg(name):
     base=os.getenv(f"{name}_BASE_URL","").strip().rstrip("/")
     if not base:
         base={"OPENAI":"https://api.openai.com/v1","GEMINI":"https://generativelanguage.googleapis.com/v1beta/openai","GROQ":"https://api.groq.com/openai/v1","NVIDIA":"https://integrate.api.nvidia.com/v1","OPENROUTER":"https://openrouter.ai/api/v1","MISTRAL":"https://api.mistral.ai/v1"}.get(name,"")
-    model=os.getenv(f"{name}_MODEL","").strip() or os.getenv("AI_MODEL","").strip()
+    # Provider-specific models must override the global AI_MODEL. A global model
+    # such as gpt-5.6 is not valid for Gemini/Groq/etc.
+    model=os.getenv(f"{name}_MODEL","").strip()
     if not model:
         model={"GEMINI":"gemini-3.8-flash","GROQ":"openai/gpt-oss-20b","NVIDIA":"openai/gpt-oss-20b"}.get(name,"")
+    if not model:
+        model=os.getenv("AI_MODEL","").strip()
     if not key or not base or not model:return None
     return base,model,key
 
