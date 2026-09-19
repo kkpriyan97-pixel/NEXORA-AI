@@ -1,14 +1,15 @@
-"""Multi-provider AI router. Primary first, immediate fallback on error/timeout."""
+"""Multi-provider AI router. Primary first, fast fallback on error/timeout."""
 from __future__ import annotations
-import asyncio,json,os,logging,time
+import asyncio,json,os,logging,time,re
 from typing import Any
 import httpx
 from ai_engine import MarketSnapshot,build_ai_request,parse_ai_decision
 log=logging.getLogger("candice")
 PROVIDER_COOLDOWN={}
-PROVIDER_COOLDOWN_SECONDS=30.0
+PROVIDER_COOLDOWN_SECONDS=120.0
 PROVIDER_LOCKS={}
-ANALYSIS_SEMAPHORE=asyncio.Semaphore(3)
+ANALYSIS_SEMAPHORE=asyncio.Semaphore(1)
+_logged_ready=set()
 
 def _providers():
     names=[]
@@ -37,19 +38,51 @@ def _provider_lock(name):
         PROVIDER_LOCKS[name]=lock
     return lock
 
+def _content_json(content:Any)->dict[str,Any]:
+    if isinstance(content,dict):
+        return content
+    if isinstance(content,list):
+        parts=[]
+        for item in content:
+            if isinstance(item,dict) and item.get("text"):
+                parts.append(str(item["text"]))
+            elif isinstance(item,str):
+                parts.append(item)
+        content=" ".join(parts)
+    s=str(content or "").strip()
+    if not s:
+        return {}
+    s=re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$","",s,flags=re.I)
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        start=s.find("{")
+        end=s.rfind("}")
+        if start>=0 and end>start:
+            return json.loads(s[start:end+1])
+        raise
+
 async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
     request=build_ai_request(snapshot)
     prompt=("You are Candice Brain. Analyze only supplied live OHLC/market evidence. "
-            "Do not invent data. Return JSON only: direction UP/DOWN or empty, "
-            "confidence 0-100, reason. This is DEMO read-only; never trade.\n"+
+            "Do not invent data. Return a single JSON object only with direction UP or DOWN, "
+            "confidence 0-100, and reason. This is DEMO read-only; never trade.\n"+
             json.dumps(request,ensure_ascii=False,separators=(",",":")))
     last=None
-    http_timeout=float(os.getenv("AI_HTTP_TIMEOUT","3.0"))
-    connect_timeout=min(2.0,http_timeout)
+    http_timeout=min(1.8,max(0.8,float(os.getenv("AI_HTTP_TIMEOUT","1.5"))))
+    connect_timeout=min(1.0,http_timeout)
+
     async with ANALYSIS_SEMAPHORE:
         for name in _providers():
             cfg=_cfg(name)
-            if not cfg:continue
+            if not cfg:
+                if name not in _logged_ready:
+                    log.warning("AI_PROVIDER_NOT_CONFIGURED provider=%s",name)
+                    _logged_ready.add(name)
+                continue
+            if name not in _logged_ready:
+                log.info("AI_PROVIDER_READY provider=%s model=%s",name,cfg[1])
+                _logged_ready.add(name)
             lock=_provider_lock(name)
             async with lock:
                 now=time.time()
@@ -58,25 +91,50 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                     log.info("AI_PROVIDER_COOLDOWN provider=%s remaining=%.1fs",name,cooldown_until-now)
                     continue
                 base,model,key=cfg
+                payload={
+                    "model":model,
+                    "temperature":0,
+                    "messages":[
+                        {"role":"system","content":"Return only one JSON object with direction, confidence, reason."},
+                        {"role":"user","content":prompt}
+                    ]
+                }
                 try:
                     async with httpx.AsyncClient(timeout=httpx.Timeout(http_timeout,connect=connect_timeout)) as h:
-                        r=await h.post(base+"/chat/completions",headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},json={"model":model,"temperature":0,"response_format":{"type":"json_object"},"messages":[{"role":"system","content":"Return only JSON with direction, confidence, reason."},{"role":"user","content":prompt}]})
+                        r=await h.post(
+                            base+"/chat/completions",
+                            headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+                            json=payload
+                        )
                         r.raise_for_status()
-                        body=r.json();content=body["choices"][0]["message"]["content"]
-                        d=parse_ai_decision(content,snapshot)
-                        if d:return {"decision":"SIGNAL","direction":d.direction,"confidence":d.confidence,"reason":d.reason,"display_name":d.display_name,"pair":d.pair,"provider":name}
+                        body=r.json()
+                        content=body["choices"][0]["message"]["content"]
+                        data=_content_json(content)
+                        d=parse_ai_decision(data,snapshot)
+                        if d:
+                            return {
+                                "decision":"SIGNAL",
+                                "direction":d.direction,
+                                "confidence":d.confidence,
+                                "reason":d.reason,
+                                "display_name":d.display_name,
+                                "pair":d.pair,
+                                "provider":name
+                            }
+                        last=RuntimeError(f"{name} returned no valid direction")
+                        log.warning("AI_PROVIDER_EMPTY_DECISION provider=%s",name)
                 except httpx.HTTPStatusError as e:
                     last=e
-                    detail=""
-                    try: detail=e.response.text[:160]
-                    except Exception: pass
-                    log.warning("AI_PROVIDER_FAILED provider=%s status=%s detail=%s",name,e.response.status_code,detail)
-                    if e.response.status_code == 429:
+                    status=e.response.status_code
+                    detail=e.response.text[:160].replace("\n"," ")
+                    log.warning("AI_PROVIDER_FAILED provider=%s status=%s detail=%s",name,status,detail)
+                    if status==429:
                         PROVIDER_COOLDOWN[name]=time.time()+PROVIDER_COOLDOWN_SECONDS
                     continue
                 except Exception as e:
                     last=e
                     log.warning("AI_PROVIDER_FAILED provider=%s type=%s message=%s",name,type(e).__name__,str(e)[:160])
                     continue
-    if last: raise RuntimeError(f"All configured AI providers failed: {last}")
+    if last:
+        raise RuntimeError(f"All configured AI providers failed: {type(last).__name__}")
     return None
