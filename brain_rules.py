@@ -44,6 +44,11 @@ class BrainState:
     asset_stats:dict[str,dict[str,float]]=field(default_factory=dict)
     strategy_stats:dict[str,dict[str,float]]=field(default_factory=dict)
     expiry_stats:dict[int,dict[str,float]]=field(default_factory=dict)
+    # Pattern/context memory is a second-stage learning layer. It only
+    # influences ranking after enough observations exist, so early outcomes
+    # cannot swing the live selector.
+    pattern_stats:dict[str,dict[str,float]]=field(default_factory=dict)
+    context_stats:dict[str,dict[str,float]]=field(default_factory=dict)
     total_results:int=0
 
     def start_cycle(self,cycle_id):
@@ -129,6 +134,15 @@ class BrainState:
         self._record_bucket(self._bucket(self.expiry_stats,expiry),result,weight)
         key=(pair,strategy,str(rec.get("direction","")),expiry)
         self._record_bucket(self._bucket(self.stats,key),result,weight)
+
+        # Keep pattern/context evidence separate from the existing learning
+        # layer. These features are recorded immediately but gated before they
+        # can affect the live ranking.
+        pattern=str(rec.get("pattern","") or "UNKNOWN")
+        trend=str(rec.get("trend_15m","") or "UNKNOWN")
+        structure=str(rec.get("structure_1m","") or "UNKNOWN")
+        self._record_bucket(self._bucket(self.pattern_stats,pattern),result,weight)
+        self._record_bucket(self._bucket(self.context_stats,f"{trend}|{structure}"),result,weight)
         self.total_results+=1
 
     def finish_signal(self,key,exit_price,result_ts=None):
@@ -156,8 +170,8 @@ class BrainState:
         # Bayesian smoothing prevents a single outcome from dominating.
         return (float(b.get("win",0))+0.5)/(n+1.0)
 
-    def learning_bonus(self,pair,strategy,expiry,direction=""):
-        """Return a bounded learned adjustment; neutral until evidence exists."""
+    def learning_bonus(self,pair,strategy,expiry,direction="",pattern="",trend_15m="",structure_1m=""):
+        """Return a bounded learned adjustment; conservative until evidence exists."""
         vals=[]
         for key in (
             (pair,strategy,direction,expiry),
@@ -167,9 +181,25 @@ class BrainState:
         for store,key in ((self.asset_stats,pair),(self.strategy_stats,strategy),(self.expiry_stats,expiry)):
             b=store.get(key)
             if b and b.get("n",0)>=2: vals.append(float(b.get("weighted",0)))
-        if not vals:return 0.0
-        # Keep learning subordinate to live technical evidence.
-        return max(-8.0,min(8.0,sum(vals)/max(1,len(vals))*1.5))
+
+        base_bonus=(sum(vals)/max(1,len(vals))*1.5) if vals else 0.0
+
+        # Pattern/context evidence is deliberately gated at 8 observations.
+        # A few wins/losses must not reshape live selection.
+        def gated_rate_bonus(store,key,scale=2.0):
+            b=store.get(key) if key else None
+            n=float(b.get("n",0) or 0) if b else 0.0
+            if n<8:return 0.0
+            rate=self._rate(b)
+            return max(-scale,min(scale,(rate-0.5)*2*scale))
+
+        pattern_bonus=gated_rate_bonus(self.pattern_stats,str(pattern or ""),2.0)
+        context_bonus=gated_rate_bonus(
+            self.context_stats,
+            f"{trend_15m or 'UNKNOWN'}|{structure_1m or 'UNKNOWN'}",
+            2.0
+        )
+        return max(-8.0,min(8.0,base_bonus+pattern_bonus+context_bonus))
 
     def choose_expiry(self,pair,strategy,direction,live_quality=0):
         """Select among 1/2/3/4/5/10/15m using evidence plus live condition."""
@@ -192,7 +222,11 @@ class BrainState:
         x=dict(c)
         pair=str(x.get("pair","")); strategy=str(x.get("strategy",""))
         direction=str(x.get("direction","")).upper()
-        x["learning_bonus"]=round(self.learning_bonus(pair,strategy,int(x.get("expiry_minutes") or 0),direction),2)
+        x["learning_bonus"]=round(self.learning_bonus(
+            pair,strategy,int(x.get("expiry_minutes") or 0),direction,
+            str(x.get("pattern") or ""),str(x.get("trend_15m") or ""),
+            str(x.get("structure_1m") or "")
+        ),2)
         x["market_quality"]=max(0.0,min(100.0,float(x.get("market_quality") or 0)+x["learning_bonus"]))
         x["confidence"]=max(0,min(99,int(x.get("confidence") or 0)+int(round(x["learning_bonus"]))))
         if pair and strategy:
