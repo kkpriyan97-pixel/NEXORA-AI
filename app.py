@@ -141,12 +141,32 @@ async def telegram_background(text_msg,label):
     except Exception as e:
         log.warning("TELEGRAM_SIGNAL_DELIVERY_FAILED label=%s type=%s message=%s",label,type(e).__name__,str(e)[:160])
 
+def _tick_records(value):
+    # OlympTrade tick payloads have appeared as either a list of records or a
+    # nested dict/list. Walk the payload instead of assuming one exact shape.
+    if isinstance(value,dict):
+        yield value
+        for v in value.values():
+            if isinstance(v,(dict,list)):
+                yield from _tick_records(v)
+    elif isinstance(value,list):
+        for v in value:
+            if isinstance(v,(dict,list)):
+                yield from _tick_records(v)
+
 async def on_tick(message):
     received_at=time.time()
-    for t in message.get("d",[]) or []:
-        if not isinstance(t,dict):continue
-        p=str(t.get("p") or t.get("pair") or "")
-        q=t.get("q");ts=t.get("t")
+    updated=0
+    for t in _tick_records(message.get("d")):
+        p=str(t.get("p") or t.get("pair") or t.get("symbol") or t.get("instrument") or "")
+        q=t.get("q")
+        if q is None:
+            q=t.get("price")
+        if q is None:
+            q=t.get("value")
+        if q is None:
+            q=t.get("v")
+        ts=t.get("t")
         if p and q is not None:
             try:
                 broker_ts=float(ts) if ts is not None else received_at
@@ -154,7 +174,14 @@ async def on_tick(message):
                 # freshness decisions because small broker/local clock skew can
                 # otherwise make a genuinely live tick look stale/future.
                 STATE["prices"][p]=(float(q),broker_ts,received_at)
-            except Exception:pass
+                updated+=1
+            except Exception:
+                pass
+    if updated:
+        last_log=STATE.get("_tick_state_log_at",0.0)
+        if received_at-last_log>=10.0:
+            STATE["_tick_state_log_at"]=received_at
+            log.info("TICK_STATE_READY updated=%d tracked=%d",updated,len(STATE["prices"]))
 
 def tick_received_at(pair):
     rec=STATE["prices"].get(pair)
