@@ -1,5 +1,5 @@
 import asyncio,json,logging,os,time
-from datetime import datetime
+from datetime import datetime,timezone
 from zoneinfo import ZoneInfo
 from typing import Any
 from telegram import Update
@@ -22,7 +22,7 @@ UAE_TZ=ZoneInfo("Asia/Dubai")
 def uae_time(ts):
     return datetime.fromtimestamp(float(ts),tz=UAE_TZ).strftime("%H:%M:%S")
 STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"network":{},"read_only":True,"cycle":0,"last_cycle":None}
-CANDLE_FETCH_SEM=asyncio.Semaphore(2)
+CANDLE_FETCH_SEM=asyncio.Semaphore(8)
 CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
 CANDLE_FETCH_RETRIES=3
@@ -602,42 +602,44 @@ async def result_watch(key):
     if not s:return
     await asyncio.sleep(max(0,s.expiry_minutes*60-(time.time()-s.entry_ts)))
 
-    # Never use the entry-time cached quote as the expiry quote.
-    # Request a fresh broker snapshot at the actual expiry boundary.
+    # Result verification is based only on a completed candle.
     expiry_price=None
     expiry_source=""
     client=CLIENT
-    for attempt in range(4):
+
+    for attempt in range(1,5):
         try:
             if client:
-                snap=await asyncio.wait_for(
-                    client.market.get_live_snapshot(s.pair),
-                    timeout=1.4
+                raw=await asyncio.wait_for(
+                    client.market.get_candles(s.pair,size=60,count=60),
+                    timeout=2.0
                 )
-                if snap and snap.get("price") is not None:
-                    expiry_price=float(snap["price"])
-                    expiry_source="expiry_snapshot"
-                    break
+                normalized=[]
+                if isinstance(raw,list):
+                    for item in raw:
+                        if isinstance(item,dict) and isinstance(item.get("candles"),list):
+                            normalized.extend(x for x in item["candles"] if isinstance(x,dict))
+                        elif isinstance(item,dict) and any(k in item for k in ("open","o","high","h","low","l","close","c")):
+                            normalized.append(item)
+                if normalized:
+                    try:normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
+                    except Exception:pass
+                    closed=_closed_candles(normalized,time.time())
+                    if closed:
+                        expiry_price=float(closed[-1].get("close",closed[-1].get("c")))
+                        STATE["candles"][s.pair]=normalized
+                        expiry_source="candle-closed"
+                        break
         except Exception as e:
-            log.warning(
-                "RESULT_EXPIRY_SNAPSHOT_FAILED pair=%s attempt=%d type=%s message=%s",
-                s.pair,attempt+1,type(e).__name__,str(e)[:120]
-            )
-        if attempt < 3:
-            await asyncio.sleep(0.35)
+            log.warning("RESULT_CANDLE_READ_FAILED pair=%s attempt=%d type=%s message=%s",
+                        s.pair,attempt,type(e).__name__,str(e)[:120])
+        if attempt<4:
+            await asyncio.sleep(0.5)
 
     if expiry_price is None:
-        rec=STATE["prices"].get(s.pair)
-        if rec and rec[0] is not None:
-            age=live_price_age(s.pair,time.time())
-            if age is not None and age <= 2.0:
-                expiry_price=float(rec[0])
-                expiry_source="fresh_tick"
-
-    if expiry_price is None:
-        log.warning("RESULT_PENDING_NO_FRESH_EXPIRY_PRICE pair=%s entry=%s",s.pair,s.entry_price)
-        await asyncio.sleep(1.0)
+        log.warning("RESULT_PENDING_NO_CLOSED_CANDLE pair=%s entry=%s",s.pair,s.entry_price)
         if key in BRAIN.active_signals:
+            await asyncio.sleep(1.0)
             return await result_watch(key)
         return
 
@@ -646,23 +648,23 @@ async def result_watch(key):
     direction_icon="⬆️" if rec["direction"]=="UP" else "⬇️"
     result_icon={"WIN":"✅","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
     await telegram(
-        f"📊 TRADE RESULT\\n"
-        f"\\n"
-        f"📈 {label}\\n"
-        f"\\n"
-        f"{direction_icon} {rec['direction']}\\n"
-        f"\\n"
-        f"💰 Entry: {rec['entry_price']}\\n"
-        f"🏁 Expiry: {rec['exit_price']}\\n"
-        f"⏱️ Duration: {rec['expiry_minutes']} MIN\\n"
-        f"🧠 Brain Strategy: {rec['strategy'] or '—'}\\n"
-        f"🎯 Brain Confidence: {rec['confidence']}%\\n"
-        f"📈 15m Trend: {rec['trend_15m'] or '—'}\\n"
-        f"🕯️ 1m Structure: {rec['structure_1m'] or '—'}\\n"
-        f"🔎 Verification: candle-closed\\n"
-        f"\\n"
-        f"{result_icon} {rec['result']}\\n"
-        f"\\n"
+        f"📊 TRADE RESULT\n"
+        f"\n"
+        f"📈 {label}\n"
+        f"\n"
+        f"{direction_icon} {rec['direction']}\n"
+        f"\n"
+        f"💰 Entry: {rec['entry_price']}\n"
+        f"🏁 Expiry: {rec['exit_price']}\n"
+        f"⏱️ Duration: {rec['expiry_minutes']} MIN\n"
+        f"🧠 Brain Strategy: {rec['strategy'] or '—'}\n"
+        f"🎯 Brain Confidence: {rec['confidence']}%\n"
+        f"📈 15m Trend: {rec['trend_15m'] or '—'}\n"
+        f"🕯️ 1m Structure: {rec['structure_1m'] or '—'}\n"
+        f"🔎 Verification: candle-closed\n"
+        f"\n"
+        f"{result_icon} {rec['result']}\n"
+        f"\n"
         f"⚠️ RESULT ONLY — AUTO TRADE OFF"
     )
     log.info(
@@ -744,8 +746,8 @@ async def cycle_loop():
             STATE["price_source"].get(s.pair,"unknown"),
             s.trend_15m or "UNKNOWN",s.structure_1m or "UNKNOWN",s.pattern or "UNKNOWN",
             s.expiry_minutes,s.entry_candle_ts,
-            time.strftime("%H:%M:%S.%f",time.gmtime(ts))[:-3],
-            time.strftime("%H:%M:%S.%f",time.gmtime(target))[:-3],
+            datetime.fromtimestamp(ts,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
+            datetime.fromtimestamp(target,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
             target-time.time()
         )
         asyncio.create_task(telegram_background(msg,f"{s.cycle_id}:{s.pair}:{s.entry_ts}"))
@@ -802,20 +804,9 @@ async def cycle_loop():
                             cycle_id,max(0,signal_at-time.time()))
             await asyncio.sleep(min(2.0,max(0,signal_at-time.time())))
 
-        # Refresh the chosen quote shortly before the signal deadline, then wait
-        # for the exact target-30s timestamp.
-        # Refresh the selected quote about 2 seconds before the user-facing
-        # signal deadline. This keeps the final send path fast and guarantees
-        # the entry price is recent without waiting at target time.
-        pre_quote_at=signal_at-4.0
-        if candidate:
-            await asyncio.sleep(max(0,pre_quote_at-time.time()))
-            try:
-                await ensure_candidate_quotes([candidate["pair"]])
-            except Exception as e:
-                log.warning("CYCLE_PRE_SIGNAL_QUOTE_REFRESH_FAILED cycle=%s type=%s message=%s",
-                            cycle_id,type(e).__name__,str(e)[:120])
-
+        # final_candidate(require_live_price=True) already checked the quote freshness.
+        # Avoid another blocking network request here so the exact 30-second deadline
+        # remains deterministic.
         await asyncio.sleep(max(0,signal_at-time.time()))
         sent=False
         if candidate and time.time() <= signal_at+0.20:
