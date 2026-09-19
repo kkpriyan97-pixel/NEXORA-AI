@@ -375,6 +375,11 @@ async def health(reader,writer):
             if ":" in line:
                 k,v=line.split(":",1);headers[k.strip().lower()]=v.strip()
         webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
+        if path.startswith("/health"):
+            body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals)}).encode()
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
+            await writer.drain()
+            return
         if path.startswith("/telegram/webhook") and webhook_secret and headers.get("x-telegram-bot-api-secret-token") != webhook_secret:
             writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
             await writer.drain()
