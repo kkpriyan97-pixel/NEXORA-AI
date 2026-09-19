@@ -7,6 +7,7 @@ from ai_engine import MarketSnapshot,build_ai_request,parse_ai_decision
 log=logging.getLogger("candice")
 PROVIDER_COOLDOWN={}
 PROVIDER_COOLDOWN_SECONDS=120.0
+TRANSIENT_COOLDOWN_SECONDS=10.0
 DEFAULT_FALLBACKS=("GEMINI","GROQ","NVIDIA","OPENROUTER","MISTRAL")
 PROVIDER_LOCKS={}
 ANALYSIS_SEMAPHORE=asyncio.Semaphore(3)
@@ -79,7 +80,7 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
             "confidence 0-100, and reason. This is DEMO read-only; never trade.\n"+
             json.dumps(request,ensure_ascii=False,separators=(",",":")))
     last=None
-    http_timeout=min(4.0,max(2.0,float(os.getenv("AI_HTTP_TIMEOUT","3.5"))))
+    http_timeout=min(3.0,max(1.5,float(os.getenv("AI_HTTP_TIMEOUT","2.0"))))
     connect_timeout=min(1.0,http_timeout)
 
     async with ANALYSIS_SEMAPHORE:
@@ -141,10 +142,23 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                     log.warning("AI_PROVIDER_FAILED provider=%s status=%s detail=%s",name,status,detail)
                     if status==429:
                         PROVIDER_COOLDOWN[name]=time.time()+PROVIDER_COOLDOWN_SECONDS
+                    elif status in (408,425,500,502,503,504):
+                        # Do not hammer a transiently overloaded provider during the same
+                        # 40-second live window; immediately continue to the next provider.
+                        PROVIDER_COOLDOWN[name]=time.time()+TRANSIENT_COOLDOWN_SECONDS
+                    elif status==413:
+                        # Payload-size errors are deterministic for this provider/request.
+                        # Short cooldown prevents repeated 413s from consuming the window.
+                        PROVIDER_COOLDOWN[name]=time.time()+TRANSIENT_COOLDOWN_SECONDS
                     continue
                 except Exception as e:
                     last=e
                     log.warning("AI_PROVIDER_FAILED provider=%s type=%s message=%s",name,type(e).__name__,str(e)[:160])
+                    # Timeout/network failures are transient. Cool the provider briefly so
+                    # the next candidate can reach another fallback instead of repeating the
+                    # same stalled request.
+                    if isinstance(e,(httpx.TimeoutException,httpx.NetworkError)):
+                        PROVIDER_COOLDOWN[name]=time.time()+TRANSIENT_COOLDOWN_SECONDS
                     continue
     if last:
         raise RuntimeError(f"All configured AI providers failed: {type(last).__name__}")
