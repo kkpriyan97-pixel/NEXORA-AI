@@ -64,37 +64,46 @@ def _norm_text(v):
     if isinstance(v,(dict,list)): return json.dumps(v,ensure_ascii=False).lower()
     return str(v).strip().lower()
 
-def is_flex_time_asset(x):
-    """
-    Keep the Flex Time universe from OlympTrade metadata without hardcoding
-    individual asset names/symbols. Explicit non-Flex products (for example
-    Quickler/5-second trading) are excluded; otherwise authenticated market
-    assets remain eligible. This preserves newly added Flex assets.
-    """
+# The following is the exact OPEN asset set from the account screenshots the user
+# supplied. Closed/hidden assets are deliberately not included. The broker feed
+# remains the source for live prices, but it is NOT allowed to widen this universe.
+SCREENSHOT_OPEN_ASSETS={
+    # OTC currency/metals
+    "eurcad otc","audnzd otc","gbpjpy otc","cadchf otc","chfjpy otc",
+    "gbpaud otc","eurjpy otc","eurchf otc","eurnzd otc","gbpchf otc",
+    "nzdcad otc","nzdjpy otc","gbpnzd otc","nzdchf otc","silver otc",
+    "euraud otc","eurusd otc","audusd otc","usdchf otc","gold otc",
+    "usdcad otc","nzdusd otc","audcad otc","gbpusd otc","gbpcad otc",
+    "usdjpy otc","audchf otc","cadjpy otc","eurgbp otc","audjpy otc",
+    # Composite / index assets visible in the screenshots
+    "asia composite index","europe composite index","football champions 2026 index",
+    "compound index","halal market axis","quickler","stable tick index",
+    "arabian general index","oasis index","qahwa index",
+}
+
+def asset_key(value):
+    text=_norm_text(value)
+    return " ".join(text.replace("/"," ").replace("_"," ").split())
+
+def screenshot_asset_allowed(x):
     if not isinstance(x,dict): return False
-    fields=("trading_mode","trade_mode","mode","product","category",
-            "instrument_type","expiration_type","expiration_mode","type","name",
-            "title","display_name","displayName")
-    text=" ".join(_norm_text(x.get(k)) for k in fields)
-    explicit_flex=any(k in text for k in (
-        "flex time","flex_time","flex-time","fixed time","fixed_time"
-    ))
-    explicit_quickler=any(k in text for k in (
-        "quickler","5 second","5-second","5 seconds","5_seconds"
-    ))
-    # Keep Quickler in the authenticated AVAILABLE-ASSET list because it is
-    # visibly available in the user's Flex account. It is marked
-    # signal_eligible=False below because Olymptrade documents Quickler as a
-    # special 5-second FT product, while Candice's current signal engine uses
-    # 1-minute analysis with 2/3/5/15-minute expiries.
-    # Do not hide an account-visible asset merely because it is not compatible
-    # with the current signal duration policy.
-    return True
+    p=pair_name(x)
+    title=display_name(x)
+    # Match the account-facing name first; pair is only a fallback because
+    # some composite products expose internal tickers instead of their UI name.
+    if asset_key(title) in SCREENSHOT_OPEN_ASSETS:
+        return True
+    return asset_key(p) in SCREENSHOT_OPEN_ASSETS
+
+def is_flex_time_asset(x):
+    if not isinstance(x,dict): return False
+    # The broker response may contain products that are not part of the
+    # screenshot-verified Flex-Time universe. Do not let those enter Candice.
+    return screenshot_asset_allowed(x)
 
 def build_assets(client,raw):
-    # IMPORTANT: raw is the authenticated Flex-Time/availability feed chosen
-    # by market_worker. Do not widen it with the general instrument catalogue.
-    # The feed is dynamic: open/closed assets can change at any moment.
+    # raw is still required for current account availability, but the allowed
+    # universe is intersected with the user's screenshot-verified OPEN assets.
     prof={}
     for x in raw or []:
         if not isinstance(x,dict): continue
@@ -102,42 +111,37 @@ def build_assets(client,raw):
         v=x.get("profitability")
         if p and isinstance(v,(int,float)): prof[p]=int(v)
 
-    out=[]; seen=set()
+    out=[]; seen=set(); rejected=[]
     for x in raw or []:
-        if not isinstance(x,dict) or not is_flex_time_asset(x): continue
+        if not isinstance(x,dict) or not is_flex_time_asset(x):
+            p=pair_name(x) if isinstance(x,dict) else ""
+            if p: rejected.append(p)
+            continue
         p=pair_name(x)
         if not p or p in seen: continue
-
-        # Only currently OPEN/tradable Flex assets enter the Brain.
-        # Never hard-code the historical 76 REAL + 37 OTC count; the platform
-        # is authoritative and this count is expected to change with time.
         if x.get("disabled") is True or x.get("locked") is True or x.get("locked_trading") is True:
             continue
         seen.add(p)
-
         title=display_name(x) or p
-        # Olymptrade's Quickler asset uses ticker ULTRA_X. Keep the
-        # platform-facing name in Candice's asset universe instead of exposing
-        # the internal ticker as if it were a different asset.
-        if p.upper() == "ULTRA_X":
-            title = "Quickler"
+        if p.upper()=="ULTRA_X": title="Quickler"
         v=prof.get(p,x.get("profitability",0))
         try: profitability=int(v)
         except Exception: profitability=0
-        quickler = "quickler" in " ".join(
+        quickler=(p.upper()=="ULTRA_X" or "quickler" in " ".join(
             _norm_text(x.get(k)) for k in
             ("pair","symbol","name","title","display_name","displayName",
              "product","category","instrument_type","expiration_type","expiration_mode")
-        )
+        ))
         out.append({
             "pair":p,"display_name":title,"title":title,
-            "signal_asset_label":title,
-            "profitability":profitability,
+            "signal_asset_label":title,"profitability":profitability,
             "locked":False,"locked_trading":False,"disabled":False,
             "mode":"OTC" if "_OTC" in p.upper() else "REAL",
-            "trading_mode":"FLEX_TIME",
-            "signal_eligible":not quickler
+            "trading_mode":"FLEX_TIME","signal_eligible":not quickler
         })
+    log.info("SCREENSHOT_ASSET_FILTER raw=%d accepted=%d rejected=%d",len(raw or []),len(out),len(rejected))
+    if rejected:
+        log.info("SCREENSHOT_ASSET_REJECTED sample=%s",rejected[:25])
     return out
 
 async def telegram(text, chat_id=None):
