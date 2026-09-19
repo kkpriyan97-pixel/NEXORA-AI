@@ -202,7 +202,9 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
     # AI reviews the strongest technical candidates in parallel. Sequential reviews
     # consumed the final 40-second window (3-4 seconds per provider call), so one
     # candidate could reach the target while the remaining reviews were still running.
-    top=raw[:3]
+    # Review a wider qualified pool in parallel so a missing/stale live price on
+    # the strongest asset does not consume the 30-second signal window.
+    top=raw[:9]
     now=time.time()
     reviewed=[]
 
@@ -302,7 +304,7 @@ async def cycle_loop():
         while time.time()<target:
             await refresh_candles()
             try:
-                new_candidate=await asyncio.wait_for(final_candidate(),timeout=max(1.0,target-time.time()))
+                new_candidate=await asyncio.wait_for(final_candidate(require_live_price=True),timeout=max(1.0,target-time.time()))
                 # Never erase a valid completed review because a later provider
                 # attempt timed out. Keep the strongest valid candidate until
                 # the exact entry boundary.
@@ -328,15 +330,15 @@ async def cycle_loop():
                 candidate=last_candidate
         except asyncio.TimeoutError:
             log.warning("CYCLE_TARGET_FINAL_CHECK_TIMEOUT cycle=%s",target//300)
-            candidate=last_candidate
+            candidate=None
         except Exception as e:
             log.exception("CYCLE_TARGET_FINAL_CHECK_FAILED cycle=%s type=%s message=%s",target//300,type(e).__name__,str(e)[:160])
-            candidate=last_candidate
+            candidate=None
         if candidate and BRAIN.can_send_cycle_signal():
             try:
                 p=candidate["pair"]; entry=STATE["prices"].get(p,(None,None))[0]
-                if entry is None:
-                    raise RuntimeError(f"Live entry price unavailable for {p}")
+                if not has_fresh_live_price(p,target,5.0):
+                    raise RuntimeError(f"Fresh live entry price unavailable for {p}")
                 confidence=int(candidate.get("confidence") or 0)
                 if confidence < 90:
                     raise ValueError(f"Final candidate confidence below threshold: {confidence}")
@@ -357,7 +359,7 @@ async def cycle_loop():
             except Exception as e:
                 log.exception("FINAL_SIGNAL_BUILD_FAILED cycle=%s type=%s message=%s",target//300,type(e).__name__,str(e)[:160])
         else:
-            log.info("NO_VALID_FINAL_SETUP cycle=%s",target//300)
+            log.info("NO_VALID_FINAL_SETUP cycle=%s reason=no_fresh_qualified_candidate",target//300)
         await asyncio.sleep(0.5)
 
 async def market_worker():
