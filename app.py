@@ -175,7 +175,7 @@ async def refresh_candles(force=False):
         else:STATE["analyses"].pop(p,None)
     log.info("LIVE_ANALYSIS_REFRESH assets=%d fetched=%d qualified=%d",len(assets),len(due),len(STATE["analyses"]))
 
-async def final_candidate():
+async def final_candidate(use_cached_only=False):
     BRAIN.prune_expired_cooldowns()
     eligible=BRAIN.filter_candidates(STATE["assets"])
     raw=[STATE["analyses"][a["pair"]].copy() for a in eligible if a["pair"] in STATE["analyses"]]
@@ -201,6 +201,8 @@ async def final_candidate():
         ttl=AI_REVIEW_TTL if cached and cached[1] else AI_REVIEW_FAIL_TTL
         if cached and time.time()-cached[0] < ttl:
             d=cached[1]
+        elif use_cached_only:
+            d=None
         else:
             d=None
             try:
@@ -208,6 +210,7 @@ async def final_candidate():
                 AI_REVIEW_CACHE[cache_key]=(time.time(),d)
             except Exception as e:
                 log.warning("AI_REVIEW_FAILED pair=%s type=%s message=%s",x["pair"],type(e).__name__,str(e)[:120])
+                AI_REVIEW_CACHE[cache_key]=(time.time(),None)
         if d and int(d.get("confidence",0))>=90:
             y=x.copy()
             y.update({"confidence":int(d["confidence"]),"reason":d.get("reason") or x["reason"],"ai_provider":d.get("provider")})
@@ -260,7 +263,7 @@ async def cycle_loop():
         await refresh_candles()
         try:
             last_candidate=candidate
-            candidate=await asyncio.wait_for(final_candidate(),timeout=1.0)
+            candidate=await asyncio.wait_for(final_candidate(use_cached_only=True),timeout=0.8)
             if candidate is None: candidate=last_candidate
         except asyncio.TimeoutError:
             log.warning("CYCLE_TARGET_FINAL_CHECK_TIMEOUT cycle=%s",target//300)
