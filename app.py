@@ -15,7 +15,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log=logging.getLogger("candice")
 BRAIN=BrainState()
-STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"read_only":True,"cycle":0,"last_cycle":None}
+STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"network":{},"read_only":True,"cycle":0,"last_cycle":None}
 CANDLE_FETCH_SEM=asyncio.Semaphore(2)
 CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
@@ -590,6 +590,37 @@ async def cycle_loop():
         # is performed here.
         await asyncio.sleep(max(0,target+0.25-time.time()))
 
+async def audit_outbound_network():
+    """
+    Record the actual public egress identity used by the Render process.
+    This is an audit/guard only; it does not spoof or bypass location controls.
+    Set REQUIRE_UAE_EGRESS=1 when the deployment is expected to have UAE egress.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=6) as h:
+            r=await h.get("https://ipapi.co/json/")
+            r.raise_for_status()
+            d=r.json()
+        ip=str(d.get("ip") or "")
+        country=str(d.get("country_code") or "").upper()
+        STATE["network"]={
+            "public_ip":ip,
+            "country":country,
+            "region":str(d.get("region") or ""),
+            "city":str(d.get("city") or ""),
+            "org":str(d.get("org") or "")
+        }
+        log.info("OUTBOUND_NETWORK public_ip=%s country=%s region=%s city=%s org=%s",
+                 ip,country,STATE["network"]["region"],STATE["network"]["city"],STATE["network"]["org"])
+        if os.getenv("REQUIRE_UAE_EGRESS","0").strip()=="1" and country!="AE":
+            raise RuntimeError(f"UAE egress required but detected country={country or 'UNKNOWN'} ip={ip or 'UNKNOWN'}")
+        return country
+    except Exception as e:
+        log.warning("OUTBOUND_NETWORK_AUDIT_FAILED type=%s message=%s",type(e).__name__,str(e)[:180])
+        if os.getenv("REQUIRE_UAE_EGRESS","0").strip()=="1":
+            raise
+        return ""
+
 async def market_worker():
     global CLIENT
     while True:
@@ -597,7 +628,10 @@ async def market_worker():
         if not token:STATE["status"]="waiting_for_token";await asyncio.sleep(30);continue
         client=OlympTradeClient(access_token=token,log_raw_messages=False);CLIENT=client;client.register_callback(parameters.E_TICK_UPDATE,on_tick)
         try:
-            STATE["status"]="connecting";await client.start();STATE["status"]="connected"
+            STATE["status"]="connecting"
+            await audit_outbound_network()
+            await client.start()
+            STATE["status"]="connected"
             # Session initialization is what causes broker event 55 to arrive.
             # Start it without waiting for the library's slow account-info fallback.
             init_task=asyncio.create_task(client.initialize_session())
@@ -638,16 +672,17 @@ async def market_worker():
                 log.error("DEMO_ACCOUNT_NOT_FOUND_IN_EVENT_55")
                 raise RuntimeError("DEMO account id not available from broker event 55")
             raw=await client.market.get_available_assets(client.account_id)
-            # Use the same authenticated profitability/availability stream that
-            # produced the original working Flex comparison (historically seen
-            # as 76 REAL + 37 OTC). This is the source-of-truth universe.
-            flex_raw=event_records(client,182)
-            source=flex_raw if flex_raw else raw
+            # IMPORTANT: the authenticated account-scoped asset response is the
+            # source of truth. Do NOT replace it with cached event 182/global
+            # Flex metadata: that stream can contain region/account-ineligible
+            # instruments (for example India-specific OTC products).
+            source=raw or []
             assets=build_assets(client,source)
             STATE["assets"]=assets;STATE["status"]="live_read_only"
             real_n=sum(a["mode"]=="REAL" for a in assets); otc_n=sum(a["mode"]=="OTC" for a in assets)
-            log.info("FLEX_UNIVERSE_SOURCE event=182 source_count=%d open_real=%d open_otc=%d open_total=%d",len(source),real_n,otc_n,len(assets))
-            log.info("ALL_FLEX_OPEN_ASSETS_READY count=%d",len(assets))
+            log.info("ACCOUNT_ASSET_SOURCE account_id=%s source_count=%d open_real=%d open_otc=%d open_total=%d",
+                     client.account_id,len(source),real_n,otc_n,len(assets))
+            log.info("ALL_ACCOUNT_OPEN_ASSETS_READY count=%d",len(assets))
             # Do not bulk-call MarketAPI.subscribe_ticks(). The current broker
             # endpoint rejects its event-12/280 requests. Live event-1 ticks
             # already arrive from the authenticated session; missing quotes are
@@ -683,7 +718,7 @@ async def health(reader,writer):
                 k,v=line.split(":",1);headers[k.strip().lower()]=v.strip()
         webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
         if path.startswith("/health"):
-            body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals)}).encode()
+            body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"network":STATE.get("network",{})}).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
             await writer.drain()
             return
@@ -709,7 +744,7 @@ async def health(reader,writer):
                     log.info("TELEGRAM_START_RECEIVED chat_id=%s sent=%s",chat_id,sent)
             except Exception as e:
                 log.warning("TELEGRAM_WEBHOOK_PARSE_FAILED %s",e)
-        body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals)}).encode()
+        body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"network":STATE.get("network",{})}).encode()
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"+body_out);await writer.drain()
     finally:writer.close()
 
