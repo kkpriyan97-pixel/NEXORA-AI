@@ -429,7 +429,14 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
         # evidence-first Candice Brain decision instead of losing the whole
         # 5-minute cycle. This fallback never bypasses the 90% Brain threshold,
         # the live-candle evidence, the 15m conflict gate, or DEMO/read-only mode.
-        if not use_cached_only and not d and int(x.get("confidence") or 0) >= 90:
+        # An external provider can return a valid JSON decision but with
+        # confidence below Candice's 90% send threshold. Treat that the same as
+        # provider unavailability for the final gate: the evidence-first local
+        # Brain result remains eligible if it already passed the same 90%
+        # technical threshold. Do not downgrade a qualified market setup merely
+        # because an external provider produced a low-confidence review.
+        external_confidence=int(d.get("confidence",0)) if isinstance(d,dict) else 0
+        if not use_cached_only and external_confidence < 90 and int(x.get("confidence") or 0) >= 90:
             y=x.copy()
             y.update({
                 "confidence":int(x.get("confidence") or 0),
