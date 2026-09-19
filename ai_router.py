@@ -79,7 +79,7 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
             "confidence 0-100, and reason. This is DEMO read-only; never trade.\n"+
             json.dumps(request,ensure_ascii=False,separators=(",",":")))
     last=None
-    http_timeout=min(2.5,max(1.0,float(os.getenv("AI_HTTP_TIMEOUT","2.2"))))
+    http_timeout=min(4.0,max(2.0,float(os.getenv("AI_HTTP_TIMEOUT","3.5"))))
     connect_timeout=min(1.0,http_timeout)
 
     async with ANALYSIS_SEMAPHORE:
