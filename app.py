@@ -15,13 +15,17 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log=logging.getLogger("candice")
 BRAIN=BrainState()
-STATE={"status":"starting","assets":[],"prices":{},"candles":{},"analyses":{},"read_only":True,"cycle":0,"last_cycle":None}
+STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"read_only":True,"cycle":0,"last_cycle":None}
 CANDLE_FETCH_SEM=asyncio.Semaphore(2)
 CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
 TICK_RESUB_SEM=asyncio.Semaphore(3)
 TICK_RESUB_TIMEOUT=1.5
 LIVE_TICK_MAX_AGE=5.0
+QUOTE_SNAPSHOT_MAX_AGE=6.0
+QUOTE_SNAPSHOT_REFRESH=3.5
+QUOTE_SNAPSHOT_SEM=asyncio.Semaphore(3)
+QUOTE_SNAPSHOT_LAST={}
 AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=90.0
 AI_REVIEW_FAIL_TTL=20.0
@@ -174,6 +178,7 @@ async def on_tick(message):
                 # freshness decisions because small broker/local clock skew can
                 # otherwise make a genuinely live tick look stale/future.
                 STATE["prices"][p]=(float(q),broker_ts,received_at)
+                STATE["price_source"][p]="tick"
                 updated+=1
             except Exception:
                 pass
@@ -219,6 +224,50 @@ async def ensure_candidate_ticks(pairs):
         log.info("TICK_RESUBSCRIBE_ATTEMPT pairs=%d succeeded=%d",len(unique),successes)
         await asyncio.sleep(0.15)
     return successes
+
+async def ensure_candidate_quotes(pairs):
+    client=CLIENT
+    if not client or not pairs:
+        return 0
+
+    now=time.time()
+    unique=[]
+    seen=set()
+    for p in pairs:
+        p=str(p or "")
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        if has_fresh_live_price(p,now,LIVE_TICK_MAX_AGE):
+            continue
+        if now-QUOTE_SNAPSHOT_LAST.get(p,0.0) < QUOTE_SNAPSHOT_REFRESH:
+            continue
+        unique.append(p)
+
+    if not unique:
+        return 0
+
+    fetched=0
+    async def one(pair):
+        nonlocal fetched
+        QUOTE_SNAPSHOT_LAST[pair]=time.time()
+        async with QUOTE_SNAPSHOT_SEM:
+            try:
+                snap=await asyncio.wait_for(client.market.get_live_snapshot(pair),timeout=1.4)
+                if not snap or snap.get("price") is None:
+                    return
+                received=time.time()
+                STATE["prices"][pair]=(float(snap["price"]),float(snap.get("timestamp",received)),received)
+                STATE["price_source"][pair]="snapshot_5s"
+                fetched+=1
+            except Exception as e:
+                log.debug("QUOTE_SNAPSHOT_FAILED pair=%s type=%s message=%s",
+                          pair,type(e).__name__,str(e)[:120])
+
+    await asyncio.gather(*(one(p) for p in unique),return_exceptions=True)
+    if fetched:
+        log.info("QUOTE_SNAPSHOT_REFRESH requested=%d received=%d",len(unique),fetched)
+    return fetched
 
 async def refresh_candles(force=False):
     client=CLIENT;assets=list(STATE["assets"])
@@ -291,12 +340,15 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
     if require_live_price:
         live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
         if not live_raw:
-            # The broker can stop pushing a quiet instrument even while its
-            # setup remains qualified. Re-subscribe only the strongest
-            # candidates instead of waiting for the whole universe.
+            # Retry the broker tick subscription for the strongest candidates.
             retry_pairs=[x["pair"] for x in raw[:8]]
             await ensure_candidate_ticks(retry_pairs)
             live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
+            # If no qualified asset has a fresh tick, obtain a read-only
+            # short-interval quote snapshot rather than fabricating a price.
+            if not live_raw:
+                await ensure_candidate_quotes(retry_pairs)
+                live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),QUOTE_SNAPSHOT_MAX_AGE)]
             log.info("LIVE_PRICE_GUARD qualified=%d fresh=%d retried=%d",
                      len(raw),len(live_raw),len(retry_pairs))
         if not live_raw:
@@ -455,7 +507,7 @@ async def cycle_loop():
                      f"💰 ENTRY: {s.entry_price}\\n\\n📈 15M TREND: {s.trend_15m}\\n"
                      f"🕯️ 1M STRUCTURE: {s.structure_1m}\\n🧠 STRATEGY: {s.strategy}\\n"
                      f"🎯 CONFIDENCE: {s.confidence}%\\n🟢 ACCOUNT: DEMO\\n\\n🧠 {s.reason}\\n━━━━━━━━━━━━━━━━━━━━")
-                log.info("FINAL_SIGNAL cycle=%s pair=%s direction=%s confidence=%s",target//300,s.pair,s.direction,s.confidence)
+                log.info("FINAL_SIGNAL cycle=%s pair=%s direction=%s confidence=%s price_source=%s",target//300,s.pair,s.direction,s.confidence,STATE["price_source"].get(s.pair,"unknown"))
                 asyncio.create_task(telegram_background(msg,f"{s.cycle_id}:{s.pair}:{s.entry_ts}"))
                 asyncio.create_task(result_watch(key))
             except Exception as e:
