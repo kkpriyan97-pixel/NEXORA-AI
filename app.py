@@ -184,7 +184,15 @@ async def refresh_candles(force=False):
         else:STATE["analyses"].pop(p,None)
     log.info("LIVE_ANALYSIS_REFRESH assets=%d fetched=%d qualified=%d",len(assets),len(due),len(STATE["analyses"]))
 
-async def final_candidate(use_cached_only=False):
+def has_fresh_live_price(pair,reference_ts=None,max_age=5.0):
+    rec=STATE["prices"].get(pair)
+    if not rec or rec[0] is None or rec[1] is None:return False
+    ref=time.time() if reference_ts is None else float(reference_ts)
+    try:age=ref-float(rec[1])
+    except Exception:return False
+    return 0 <= age <= float(max_age)
+
+async def final_candidate(use_cached_only=False,require_live_price=False):
     BRAIN.prune_expired_cooldowns()
     eligible=BRAIN.filter_candidates(STATE["assets"])
     raw=[STATE["analyses"][a["pair"]].copy() for a in eligible if a["pair"] in STATE["analyses"]]
@@ -259,7 +267,10 @@ async def final_candidate(use_cached_only=False):
             log.warning("AI_REVIEW_TASK_FAILED pair=%s type=%s message=%s",x["pair"],type(r).__name__,str(r)[:120])
         elif r:
             reviewed.append(r)
-    return rank_signal_candidates(reviewed)[0] if reviewed else None
+    ranked=rank_signal_candidates(reviewed)
+    if require_live_price:
+        ranked=[x for x in ranked if has_fresh_live_price(x["pair"],time.time(),5.0)]
+    return ranked[0] if ranked else None
 
 async def result_watch(key):
     s=BRAIN.active_signals.get(key)
@@ -310,7 +321,7 @@ async def cycle_loop():
         except Exception as e:
             log.warning("CYCLE_TARGET_CANDLE_REFRESH_FAILED cycle=%s type=%s message=%s",target//300,type(e).__name__,str(e)[:120])
         try:
-            boundary_candidate=await asyncio.wait_for(final_candidate(use_cached_only=True),timeout=0.8)
+            boundary_candidate=await asyncio.wait_for(final_candidate(use_cached_only=True,require_live_price=True),timeout=0.8)
             if boundary_candidate is not None:
                 candidate=boundary_candidate
             else:
