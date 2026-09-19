@@ -38,7 +38,9 @@ def pair_name(x):
     return str(x.get("pair") or x.get("p") or x.get("symbol") or x.get("instrument") or x.get("id") or "")
 
 def display_name(x):
-    for k in ("title","name","display_name","displayName"):
+    # Preserve the exact account-facing asset name returned by the
+    # authenticated account feed; prefer display fields over internal names.
+    for k in ("title","display_name","displayName","name"):
         if isinstance(x.get(k),str) and x[k].strip():return x[k].strip()
     return ""
 
@@ -123,7 +125,7 @@ def build_assets(client,raw):
         )
         out.append({
             "pair":p,"display_name":title,"title":title,
-            "signal_asset_label":f"{title} ({p})",
+            "signal_asset_label":title,
             "profitability":profitability,
             "locked":False,"locked_trading":False,"disabled":False,
             "mode":"OTC" if "_OTC" in p.upper() else "REAL",
@@ -457,7 +459,7 @@ async def result_watch(key):
         if cs:price=float(cs[-1].get("close",cs[-1].get("c",s.entry_price)))
     if price is None:return
     rec=BRAIN.finish_signal(key,price)
-    label=f"{rec['display_name']} ({rec['pair']})"
+    label=rec["display_name"]
     icon={"WIN":"🟢","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
     await telegram(f"━━━━━━━━━━━━━━━━━━━━\n🎯 CANDICE AI RESULT\n━━━━━━━━━━━━━━━━━━━━\n\n📊 ASSET: {label}\n➡️ DIRECTION: {rec['direction']}\n\n💰 ENTRY: {rec['entry_price']}\n💰 EXIT: {rec['exit_price']}\n⏱️ EXPIRY: {rec['expiry_minutes']} MIN\n\n{icon} {rec['result']}\n\n🧠 STRATEGY: {rec['strategy']}\n📈 15M TREND: {rec['trend_15m']}\n🕯️ 1M STRUCTURE: {rec['structure_1m']}\n\n🧠 Brain learning recorded\n━━━━━━━━━━━━━━━━━━━━")
     log.info("RESULT pair=%s result=%s exit=%s cooldown=%s",rec["pair"],rec["result"],rec["exit_price"],rec["result"]=="LOSS")
@@ -511,7 +513,7 @@ async def cycle_loop():
         )
         key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
         msg=(f"━━━━━━━━━━━━━━━━━━━━\\n🎯 CANDICE AI • LIVE MARKET\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
-             f"📊 ASSET: {s.display_name} ({s.pair})\\n➡️ DIRECTION: {s.direction}\\n\\n"
+             f"📊 ASSET: {s.display_name}\\n➡️ DIRECTION: {s.direction}\\n\\n"
              f"🕒 SIGNAL: {time.strftime('%H:%M:%S',time.localtime(ts))} UAE\\n"
              f"🎯 TARGET: {time.strftime('%H:%M:%S',time.localtime(target))} UAE\\n"
              f"⏳ SIGNAL COUNTDOWN: 00:30\\n\\n⏱️ EXPIRY: {s.expiry_minutes} MIN\\n"
