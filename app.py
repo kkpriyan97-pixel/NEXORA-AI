@@ -74,10 +74,13 @@ def is_flex_time_asset(x):
     explicit_quickler=any(k in text for k in (
         "quickler","5 second","5-second","5 seconds","5_seconds"
     ))
-    # OlympTrade's asset list contains the normal Flex Time instruments
-    # alongside special products. Prefer explicit metadata when available.
-    if explicit_quickler and not explicit_flex:
-        return False
+    # Keep Quickler in the authenticated AVAILABLE-ASSET list because it is
+    # visibly available in the user's Flex account. It is marked
+    # signal_eligible=False below because Olymptrade documents Quickler as a
+    # special 5-second FT product, while Candice's current signal engine uses
+    # 1-minute analysis with 2/3/5/15-minute expiries.
+    # Do not hide an account-visible asset merely because it is not compatible
+    # with the current signal duration policy.
     return True
 
 def build_assets(client,raw):
@@ -108,13 +111,19 @@ def build_assets(client,raw):
         v=prof.get(p,x.get("profitability",0))
         try: profitability=int(v)
         except Exception: profitability=0
+        quickler = "quickler" in " ".join(
+            _norm_text(x.get(k)) for k in
+            ("pair","symbol","name","title","display_name","displayName",
+             "product","category","instrument_type","expiration_type","expiration_mode")
+        )
         out.append({
             "pair":p,"display_name":title,"title":title,
             "signal_asset_label":f"{title} ({p})",
             "profitability":profitability,
             "locked":False,"locked_trading":False,"disabled":False,
             "mode":"OTC" if "_OTC" in p.upper() else "REAL",
-            "trading_mode":"FLEX_TIME"
+            "trading_mode":"FLEX_TIME",
+            "signal_eligible":not quickler
         })
     return out
 
@@ -276,6 +285,8 @@ async def refresh_candles(force=False):
     due=[a for a in assets if force or now-CANDLE_FETCH_LAST.get(a["pair"],0)>=CANDLE_FETCH_INTERVAL]
     async def one(a):
         p=a["pair"]
+        if not a.get("signal_eligible",True):
+            return
         async with CANDLE_FETCH_SEM:
             try:
                 await asyncio.sleep(0.35)
@@ -299,12 +310,16 @@ async def refresh_candles(force=False):
                 CANDLE_FETCH_LAST[p]=time.time()
     await asyncio.gather(*(one(a) for a in due))
     for a in assets:
+        if not a.get("signal_eligible",True):
+            continue
         p=a["pair"];price=STATE["prices"].get(p,(None,None))[0]
         an=analyze_asset(a,STATE["candles"].get(p,[]),price)
         if an:
             an["profitability"]=a["profitability"];STATE["analyses"][p]=an
         else:STATE["analyses"].pop(p,None)
-    log.info("LIVE_ANALYSIS_REFRESH assets=%d fetched=%d qualified=%d",len(assets),len(due),len(STATE["analyses"]))
+    log.info("LIVE_ANALYSIS_REFRESH assets=%d signal_eligible=%d fetched=%d qualified=%d",
+             len(assets),sum(1 for a in assets if a.get("signal_eligible",True)),
+             len(due),len(STATE["analyses"]))
 
 def has_fresh_live_price(pair,reference_ts=None,max_age=LIVE_TICK_MAX_AGE):
     rec=STATE["prices"].get(pair)
@@ -325,7 +340,10 @@ def live_price_age(pair,reference_ts=None):
 
 async def final_candidate(use_cached_only=False,require_live_price=False):
     BRAIN.prune_expired_cooldowns()
-    eligible=BRAIN.filter_candidates(STATE["assets"])
+    eligible=[
+        a for a in BRAIN.filter_candidates(STATE["assets"])
+        if a.get("signal_eligible",True)
+    ]
     raw=[STATE["analyses"][a["pair"]].copy() for a in eligible if a["pair"] in STATE["analyses"]]
     raw=[BRAIN.adaptive_candidate(x) for x in raw]
     raw=rank_signal_candidates(raw)
