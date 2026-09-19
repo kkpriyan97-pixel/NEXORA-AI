@@ -1,4 +1,6 @@
 import asyncio,json,logging,os,time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -33,6 +35,10 @@ AI_PROVIDER_COOLDOWN={}
 AI_REVIEW_TIMEOUT=2.4
 CLIENT=None
 LOCK=asyncio.Lock()
+UAE_TZ=ZoneInfo("Asia/Dubai")
+
+def uae_time(ts):
+    return datetime.fromtimestamp(float(ts),tz=UAE_TZ).strftime("%H:%M:%S")
 
 def pair_name(x):
     return str(x.get("pair") or x.get("p") or x.get("symbol") or x.get("instrument") or x.get("id") or "")
@@ -147,8 +153,7 @@ async def telegram(text, chat_id=None):
                 try: detail=r.json()
                 except Exception: detail={"description":r.text[:200]}
                 log.warning("TELEGRAM_SEND_FAILED status=%s description=%s",r.status_code,detail.get("description"))
-                return False
-            return True
+                return False            return True
     except Exception as e:
         log.warning("TELEGRAM_SEND_FAILED type=%s message=%s",type(e).__name__,str(e)[:200]);return False
 
@@ -297,8 +302,7 @@ async def refresh_candles(force=False):
         async with CANDLE_FETCH_SEM:
             try:
                 await asyncio.sleep(0.35)
-                cs=await client.market.get_candles(p,size=60,count=60)
-                normalized=[]
+                cs=await client.market.get_candles(p,size=60,count=60)                normalized=[]
                 if isinstance(cs,list):
                     for item in cs:
                         if isinstance(item,dict) and isinstance(item.get("candles"),list):
@@ -444,24 +448,80 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
             log.warning("AI_REVIEW_TASK_FAILED pair=%s type=%s message=%s",x["pair"],type(r).__name__,str(r)[:120])
         elif r:
             reviewed.append(r)
-    ranked=rank_signal_candidates(reviewed)
-    if require_live_price:
-        ranked=[x for x in ranked if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
-    return ranked[0] if ranked else None
-
-async def result_watch(key):
+    ranked=rank_signal_candasync def result_watch(key):
     s=BRAIN.active_signals.get(key)
     if not s:return
     await asyncio.sleep(max(0,s.expiry_minutes*60-(time.time()-s.entry_ts)))
-    price=STATE["prices"].get(s.pair,(None,None))[0]
-    if price is None:
-        cs=STATE["candles"].get(s.pair,[])
-        if cs:price=float(cs[-1].get("close",cs[-1].get("c",s.entry_price)))
-    if price is None:return
-    rec=BRAIN.finish_signal(key,price)
+
+    # Never use the entry-time cached quote as the expiry quote. The previous
+    # implementation could read the same stale price at expiry and misclassify
+    # a real WIN/LOSS as TIE. Request a fresh broker snapshot at expiry.
+    expiry_price=None
+    expiry_source=""
+    client=CLIENT
+    for attempt in range(4):
+        try:
+            if client:
+                snap=await asyncio.wait_for(
+                    client.market.get_live_snapshot(s.pair),
+                    timeout=1.4
+                )
+                if snap and snap.get("price") is not None:
+                    expiry_price=float(snap["price"])
+                    expiry_source="expiry_snapshot"
+                    break
+        except Exception as e:
+            log.warning(
+                "RESULT_EXPIRY_SNAPSHOT_FAILED pair=%s attempt=%d type=%s message=%s",
+                s.pair,attempt+1,type(e).__name__,str(e)[:120]
+            )
+        if attempt < 3:
+            await asyncio.sleep(0.35)
+
+    # A very fresh tick is a secondary source only.
+    if expiry_price is None:
+        rec=STATE["prices"].get(s.pair)
+        if rec and rec[0] is not None:
+            age=live_price_age(s.pair,time.time())
+            if age is not None and age <= 2.0:
+                expiry_price=float(rec[0])
+                expiry_source="fresh_tick"
+
+    # Never invent a TIE from a stale price. Retry until a fresh expiry quote
+    # is available instead.
+    if expiry_price is None:
+        log.warning(
+            "RESULT_PENDING_NO_FRESH_EXPIRY_PRICE pair=%s entry=%s",
+            s.pair,s.entry_price
+        )
+        await asyncio.sleep(1.0)
+        if key in BRAIN.active_signals:
+            return await result_watch(key)
+        return
+
+    rec=BRAIN.finish_signal(key,expiry_price)
     label=rec["display_name"]
     icon={"WIN":"🟢","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
-    await telegram(f"━━━━━━━━━━━━━━━━━━━━\n🎯 CANDICE AI RESULT\n━━━━━━━━━━━━━━━━━━━━\n\n📊 ASSET: {label}\n➡️ DIRECTION: {rec['direction']}\n\n💰 ENTRY: {rec['entry_price']}\n💰 EXIT: {rec['exit_price']}\n⏱️ EXPIRY: {rec['expiry_minutes']} MIN\n\n{icon} {rec['result']}\n\n🧠 STRATEGY: {rec['strategy']}\n📈 15M TREND: {rec['trend_15m']}\n🕯️ 1M STRUCTURE: {rec['structure_1m']}\n\n🧠 Brain learning recorded\n━━━━━━━━━━━━━━━━━━━━")
+    await telegram(
+        f"━━━━━━━━━━━━━━━━━━━━\\n🎯 CANDICE AI RESULT\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
+        f"📊 ASSET: {label}\\n"
+        f"➡️ DIRECTION: {rec['direction']}\\n\\n"
+        f"💰 ENTRY: {rec['entry_price']}\\n"
+        f"💰 EXIT: {rec['exit_price']}\\n"
+        f"⏱️ EXPIRY: {rec['expiry_minutes']} MIN\\n\\n"
+        f"{icon} {rec['result']}\\n\\n"
+        f"🧠 STRATEGY: {rec['strategy']}\\n"
+        f"📈 15M TREND: {rec['trend_15m']}\\n"
+        f"🕯️ 1M STRUCTURE: {rec['structure_1m']}\\n\\n"
+        f"🧠 Brain learning recorded\\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+    log.info(
+        "RESULT pair=%s result=%s entry=%s exit=%s source=%s cooldown=%s",
+        rec["pair"],rec["result"],rec["entry_price"],rec["exit_price"],
+        expiry_source,rec["result"]=="LOSS"
+    )
+']}\n\n🧠 Brain learning recorded\n━━━━━━━━━━━━━━━━━━━━")
     log.info("RESULT pair=%s result=%s exit=%s cooldown=%s",rec["pair"],rec["result"],rec["exit_price"],rec["result"]=="LOSS")
 
 async def cycle_loop():
@@ -517,8 +577,8 @@ async def cycle_loop():
              f"📊 {s.display_name}\n\n"
              f"<b>{'🔻 DOWN' if s.direction.upper() == 'DOWN' else '🟢 UP'}</b>\n"
              f"<b>⏱️ {s.expiry_minutes} MIN EXPIRY</b>\n\n"
-             f"🕒 {time.strftime('%H:%M:%S',time.localtime(ts))} UAE\n"
-             f"🎯 Entry → {time.strftime('%H:%M:%S',time.localtime(target))}\n\n"
+             f"🕒 {uae_time(ts)} UAE\n"
+             f"🎯 Entry → {uae_time(target)}\n\n"
              f"💰 {s.entry_price}\n"
              f"🎯 Confidence → {s.confidence}%\n\n"
              f"📈 Trend → {s.trend_15m or '—'}\n"
@@ -597,8 +657,7 @@ async def cycle_loop():
         pre_quote_at=signal_at-2.0
         if candidate:
             await asyncio.sleep(max(0,pre_quote_at-time.time()))
-            try:
-                await ensure_candidate_quotes([candidate["pair"]])
+            try:                await ensure_candidate_quotes([candidate["pair"]])
             except Exception as e:
                 log.warning("CYCLE_PRE_SIGNAL_QUOTE_REFRESH_FAILED cycle=%s type=%s message=%s",
                             cycle_id,type(e).__name__,str(e)[:120])
@@ -747,8 +806,7 @@ async def health(reader,writer):
         for line in head.decode("latin1","ignore").split("\r\n")[1:]:
             if ":" in line:
                 k,v=line.split(":",1);headers[k.strip().lower()]=v.strip()
-        webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
-        if path.startswith("/health"):
+        webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()        if path.startswith("/health"):
             body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"network":STATE.get("network",{})}).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
             await writer.drain()
