@@ -19,6 +19,9 @@ STATE={"status":"starting","assets":[],"prices":{},"candles":{},"analyses":{},"r
 CANDLE_FETCH_SEM=asyncio.Semaphore(2)
 CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
+TICK_RESUB_SEM=asyncio.Semaphore(3)
+TICK_RESUB_TIMEOUT=1.5
+LIVE_TICK_MAX_AGE=5.0
 AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=90.0
 AI_REVIEW_FAIL_TTL=20.0
@@ -139,13 +142,56 @@ async def telegram_background(text_msg,label):
         log.warning("TELEGRAM_SIGNAL_DELIVERY_FAILED label=%s type=%s message=%s",label,type(e).__name__,str(e)[:160])
 
 async def on_tick(message):
+    received_at=time.time()
     for t in message.get("d",[]) or []:
         if not isinstance(t,dict):continue
         p=str(t.get("p") or t.get("pair") or "")
         q=t.get("q");ts=t.get("t")
         if p and q is not None:
-            try:STATE["prices"][p]=(float(q),float(ts) if ts is not None else time.time())
+            try:
+                broker_ts=float(ts) if ts is not None else received_at
+                # Keep broker time for audit, but use local receive time for
+                # freshness decisions because small broker/local clock skew can
+                # otherwise make a genuinely live tick look stale/future.
+                STATE["prices"][p]=(float(q),broker_ts,received_at)
             except Exception:pass
+
+def tick_received_at(pair):
+    rec=STATE["prices"].get(pair)
+    if not rec or len(rec)<1:return None
+    try:
+        # New records store local receipt time in slot 2. Older records remain
+        # compatible and fall back to their broker timestamp.
+        return float(rec[2]) if len(rec)>=3 and rec[2] is not None else float(rec[1])
+    except Exception:
+        return None
+
+async def ensure_candidate_ticks(pairs):
+    client=CLIENT
+    if not client or not pairs:return 0
+    unique=[]
+    seen=set()
+    for p in pairs:
+        p=str(p or "")
+        if p and p not in seen:
+            seen.add(p);unique.append(p)
+
+    successes=0
+    async def one(pair):
+        nonlocal successes
+        async with TICK_RESUB_SEM:
+            try:
+                await asyncio.wait_for(client.market.subscribe_ticks(pair),timeout=TICK_RESUB_TIMEOUT)
+                successes+=1
+            except Exception as e:
+                log.debug("TICK_RESUBSCRIBE_FAILED pair=%s type=%s message=%s",
+                          pair,type(e).__name__,str(e)[:120])
+
+    await asyncio.gather(*(one(p) for p in unique),return_exceptions=True)
+    if successes:
+        log.info("TICK_RESUBSCRIBE_ATTEMPT pairs=%d succeeded=%d",len(unique),successes)
+        await asyncio.sleep(0.15)
+    return successes
 
 async def refresh_candles(force=False):
     client=CLIENT;assets=list(STATE["assets"])
@@ -184,13 +230,22 @@ async def refresh_candles(force=False):
         else:STATE["analyses"].pop(p,None)
     log.info("LIVE_ANALYSIS_REFRESH assets=%d fetched=%d qualified=%d",len(assets),len(due),len(STATE["analyses"]))
 
-def has_fresh_live_price(pair,reference_ts=None,max_age=5.0):
+def has_fresh_live_price(pair,reference_ts=None,max_age=LIVE_TICK_MAX_AGE):
     rec=STATE["prices"].get(pair)
-    if not rec or rec[0] is None or rec[1] is None:return False
+    if not rec or len(rec)<1 or rec[0] is None:return False
+    received=tick_received_at(pair)
+    if received is None:return False
     ref=time.time() if reference_ts is None else float(reference_ts)
-    try:age=ref-float(rec[1])
+    try:age=ref-received
     except Exception:return False
     return 0 <= age <= float(max_age)
+
+def live_price_age(pair,reference_ts=None):
+    received=tick_received_at(pair)
+    if received is None:return None
+    ref=time.time() if reference_ts is None else float(reference_ts)
+    try:return max(0.0,ref-received)
+    except Exception:return None
 
 async def final_candidate(use_cached_only=False,require_live_price=False):
     BRAIN.prune_expired_cooldowns()
@@ -207,7 +262,16 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
     # This guarantees that a stale top-ranked asset cannot block the next
     # qualified asset that has a usable live price.
     if require_live_price:
-        live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),5.0)]
+        live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
+        if not live_raw:
+            # The broker can stop pushing a quiet instrument even while its
+            # setup remains qualified. Re-subscribe only the strongest
+            # candidates instead of waiting for the whole universe.
+            retry_pairs=[x["pair"] for x in raw[:8]]
+            await ensure_candidate_ticks(retry_pairs)
+            live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
+            log.info("LIVE_PRICE_GUARD qualified=%d fresh=%d retried=%d",
+                     len(raw),len(live_raw),len(retry_pairs))
         if not live_raw:
             return None
         top=live_raw[:20]
@@ -279,7 +343,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
             reviewed.append(r)
     ranked=rank_signal_candidates(reviewed)
     if require_live_price:
-        ranked=[x for x in ranked if has_fresh_live_price(x["pair"],time.time(),5.0)]
+        ranked=[x for x in ranked if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
     return ranked[0] if ranked else None
 
 async def result_watch(key):
@@ -346,8 +410,10 @@ async def cycle_loop():
         if candidate and BRAIN.can_send_cycle_signal():
             try:
                 p=candidate["pair"]; entry=STATE["prices"].get(p,(None,None))[0]
-                if not has_fresh_live_price(p,target,5.0):
-                    raise RuntimeError(f"Fresh live entry price unavailable for {p}")
+                if not has_fresh_live_price(p,target,LIVE_TICK_MAX_AGE):
+                    raise RuntimeError(
+                        f"Fresh live entry price unavailable for {p} "
+                        f"age={live_price_age(p,target)}")
                 confidence=int(candidate.get("confidence") or 0)
                 if confidence < 90:
                     raise ValueError(f"Final candidate confidence below threshold: {confidence}")
