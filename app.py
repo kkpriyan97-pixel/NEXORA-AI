@@ -20,7 +20,7 @@ CANDLE_FETCH_SEM=asyncio.Semaphore(2)
 CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
 AI_REVIEW_CACHE={}
-AI_REVIEW_TTL=20.0
+AI_REVIEW_TTL=90.0
 AI_REVIEW_FAIL_TTL=20.0
 AI_PROVIDER_COOLDOWN={}
 AI_REVIEW_TIMEOUT=2.4
@@ -226,6 +226,19 @@ async def final_candidate(use_cached_only=False):
                 "reason":x.get("reason") or "Candice local Brain verified live market evidence",
                 "ai_provider":"CANDICE_LOCAL_BRAIN"
             })
+            # Persist the completed local decision in the same short-lived
+            # cache used by the exact-boundary check. The previous version
+            # cached None on provider failure, so the valid local result could
+            # disappear before the 5-minute boundary.
+            AI_REVIEW_CACHE[cache_key]=(time.time(),{
+                "decision":"SIGNAL",
+                "direction":y["direction"],
+                "confidence":y["confidence"],
+                "reason":y["reason"],
+                "display_name":y["display_name"],
+                "pair":y["pair"],
+                "provider":"CANDICE_LOCAL_BRAIN"
+            })
             log.warning("AI_EXTERNAL_FALLBACK_LOCAL pair=%s confidence=%s strategy=%s",
                         x["pair"],x.get("confidence"),x.get("strategy"))
             return y
@@ -269,16 +282,25 @@ async def cycle_loop():
         while time.time()<target:
             await refresh_candles()
             try:
-                candidate=await asyncio.wait_for(final_candidate(),timeout=max(1.0,target-time.time()))
+                new_candidate=await asyncio.wait_for(final_candidate(),timeout=max(1.0,target-time.time()))
+                # Never erase a valid completed review because a later provider
+                # attempt timed out. Keep the strongest valid candidate until
+                # the exact entry boundary.
+                if new_candidate is not None:
+                    candidate=new_candidate
             except asyncio.TimeoutError:
-                log.warning("CYCLE_FINAL_EVALUATION_TIMEOUT cycle=%s remaining=%.2f",target//300,max(0,target-time.time())); candidate=None
+                log.warning("CYCLE_FINAL_EVALUATION_TIMEOUT cycle=%s remaining=%.2f",
+                            target//300,max(0,target-time.time()))
             await asyncio.sleep(min(2,max(0,target-time.time())))
         # Exact target: refresh price/candles once more, then use fresh tick price.
         await refresh_candles()
         try:
             last_candidate=candidate
-            candidate=await asyncio.wait_for(final_candidate(use_cached_only=True),timeout=0.8)
-            if candidate is None: candidate=last_candidate
+            boundary_candidate=await asyncio.wait_for(final_candidate(use_cached_only=True),timeout=0.8)
+            if boundary_candidate is not None:
+                candidate=boundary_candidate
+            else:
+                candidate=last_candidate
         except asyncio.TimeoutError:
             log.warning("CYCLE_TARGET_FINAL_CHECK_TIMEOUT cycle=%s",target//300)
             candidate=last_candidate
