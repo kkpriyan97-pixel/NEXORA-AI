@@ -780,15 +780,22 @@ async def cycle_loop():
         )
 
         candidate=None
-        # Use the 45s before the signal deadline for analysis. Once the deadline
-        # is reached, stop recomputing so no slow AI/provider call can push the
-        # signal past the required 30s lead time.
+        # Refresh closed-candle analysis at most once per UTC minute. The previous
+        # loop refreshed all 28 assets every ~2s; stale broker responses then
+        # consumed the entire pre-signal window and the valid candidate never
+        # reached the exact 30s send point.
+        refreshed_minute=None
+        # Use the pre-signal window for analysis, but never let repeated candle
+        # fetches block the exact 30-second signal deadline.
         while time.time() < signal_at-0.75:
-            try:
-                await refresh_candles()
-            except Exception as e:
-                log.warning("CYCLE_CANDLE_REFRESH_FAILED cycle=%s type=%s message=%s",
-                            cycle_id,type(e).__name__,str(e)[:160])
+            current_minute=int(time.time())//60
+            if refreshed_minute != current_minute:
+                try:
+                    await refresh_candles()
+                    refreshed_minute=current_minute
+                except Exception as e:
+                    log.warning("CYCLE_CANDLE_REFRESH_FAILED cycle=%s type=%s message=%s",
+                                cycle_id,type(e).__name__,str(e)[:160])
             remaining=max(0,signal_at-time.time())
             if remaining <= 0.75:
                 break
