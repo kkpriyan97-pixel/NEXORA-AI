@@ -17,6 +17,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log=logging.getLogger("candice")
 BRAIN=BrainState()
+UAE_TZ=ZoneInfo("Asia/Dubai")
+
+def uae_time(ts):
+    return datetime.fromtimestamp(float(ts),tz=UAE_TZ).strftime("%H:%M:%S")
 STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"network":{},"read_only":True,"cycle":0,"last_cycle":None}
 CANDLE_FETCH_SEM=asyncio.Semaphore(2)
 CANDLE_FETCH_LAST={}
@@ -35,10 +39,6 @@ AI_PROVIDER_COOLDOWN={}
 AI_REVIEW_TIMEOUT=2.4
 CLIENT=None
 LOCK=asyncio.Lock()
-UAE_TZ=ZoneInfo("Asia/Dubai")
-
-def uae_time(ts):
-    return datetime.fromtimestamp(float(ts),tz=UAE_TZ).strftime("%H:%M:%S")
 
 def pair_name(x):
     return str(x.get("pair") or x.get("p") or x.get("symbol") or x.get("instrument") or x.get("id") or "")
@@ -153,7 +153,8 @@ async def telegram(text, chat_id=None):
                 try: detail=r.json()
                 except Exception: detail={"description":r.text[:200]}
                 log.warning("TELEGRAM_SEND_FAILED status=%s description=%s",r.status_code,detail.get("description"))
-                return False            return True
+                return False
+            return True
     except Exception as e:
         log.warning("TELEGRAM_SEND_FAILED type=%s message=%s",type(e).__name__,str(e)[:200]);return False
 
@@ -397,7 +398,8 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
         cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
         cached=AI_REVIEW_CACHE.get(cache_key)
         ttl=AI_REVIEW_TTL if cached and cached[1] else AI_REVIEW_FAIL_TTL
-        if cached and time.time()-cached[0] < ttl:            d=cached[1]
+        if cached and time.time()-cached[0] < ttl:
+            d=cached[1]
         elif use_cached_only:
             d=None
         else:
@@ -505,17 +507,17 @@ async def result_watch(key):
     label=rec["display_name"]
     icon={"WIN":"🟢","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
     await telegram(
-        f"━━━━━━━━━━━━━━━━━━━━\n🎯 CANDICE AI RESULT\n━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📊 ASSET: {label}\n"
-        f"➡️ DIRECTION: {rec['direction']}\n\n"
-        f"💰 ENTRY: {rec['entry_price']}\n"
-        f"💰 EXIT: {rec['exit_price']}\n"
-        f"⏱️ EXPIRY: {rec['expiry_minutes']} MIN\n\n"
-        f"{icon} {rec['result']}\n\n"
-        f"🧠 STRATEGY: {rec['strategy']}\n"
-        f"📈 15M TREND: {rec['trend_15m']}\n"
-        f"🕯️ 1M STRUCTURE: {rec['structure_1m']}\n\n"
-        f"🧠 Brain learning recorded\n"
+        f"━━━━━━━━━━━━━━━━━━━━\\n🎯 CANDICE AI RESULT\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
+        f"📊 ASSET: {label}\\n"
+        f"➡️ DIRECTION: {rec['direction']}\\n\\n"
+        f"💰 ENTRY: {rec['entry_price']}\\n"
+        f"💰 EXIT: {rec['exit_price']}\\n"
+        f"⏱️ EXPIRY: {rec['expiry_minutes']} MIN\\n\\n"
+        f"{icon} {rec['result']}\\n\\n"
+        f"🧠 STRATEGY: {rec['strategy']}\\n"
+        f"📈 15M TREND: {rec['trend_15m']}\\n"
+        f"🕯️ 1M STRUCTURE: {rec['structure_1m']}\\n\\n"
+        f"🧠 Brain learning recorded\\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
     log.info(
@@ -797,7 +799,8 @@ async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def health(reader,writer):
     try:
-        raw=await reader.read(65536)        head,_,body=raw.partition(b"\r\n\r\n")
+        raw=await reader.read(65536)
+        head,_,body=raw.partition(b"\r\n\r\n")
         first=head.split(b"\r\n",1)[0].decode("latin1","ignore")
         parts=first.split(" ")
         path=parts[1] if len(parts)>1 else "/"
@@ -805,7 +808,8 @@ async def health(reader,writer):
         for line in head.decode("latin1","ignore").split("\r\n")[1:]:
             if ":" in line:
                 k,v=line.split(":",1);headers[k.strip().lower()]=v.strip()
-        webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()        if path.startswith("/health"):
+        webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
+        if path.startswith("/health"):
             body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"network":STATE.get("network",{})}).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
             await writer.drain()
