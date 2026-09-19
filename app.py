@@ -197,7 +197,8 @@ async def on_tick(message):
         q=t.get("q")
         if q is None:
             q=t.get("price")
-        if q is None:            q=t.get("value")
+        if q is None:
+            q=t.get("value")
         if q is None:
             q=t.get("v")
         ts=t.get("t")
@@ -314,15 +315,13 @@ def _closed_candles(candles,reference_ts=None):
     out=[]
     for c in candles or []:
         ts=_candle_epoch(c)
-        if ts is not None and ts < boundary:
-            out.append(c)
+        if ts is not None and ts < boundary:out.append(c)
     return out
 
 def _candle_data_stale(pair,reference_ts=None):
     now=time.time() if reference_ts is None else float(reference_ts)
     closed=_closed_candles(STATE["candles"].get(pair,[]),now)
-    if not closed:
-        return True
+    if not closed:return True
     ts=_candle_epoch(closed[-1])
     return ts is None or (now-ts)>75.0
 
@@ -333,8 +332,7 @@ async def refresh_candles(force=False):
     due=[a for a in assets if force or now-CANDLE_FETCH_LAST.get(a["pair"],0)>=CANDLE_FETCH_INTERVAL or _candle_data_stale(a["pair"],now)]
     async def one(a):
         p=a["pair"]
-        if not a.get("signal_eligible",True):
-            return
+        if not a.get("signal_eligible",True):return
         async with CANDLE_FETCH_SEM:
             try:
                 await asyncio.sleep(0.35)
@@ -342,34 +340,26 @@ async def refresh_candles(force=False):
                 normalized=[]
                 if isinstance(cs,list):
                     for item in cs:
-                        if isinstance(item,dict) and isinstance(item.get("candles"),list):
-                            normalized.extend(x for x in item["candles"] if isinstance(x,dict))
-                        elif isinstance(item,dict) and any(k in item for k in ("open","o","high","h","low","l","close","c")):
-                            normalized.append(item)
+                        if isinstance(item,dict) and isinstance(item.get("candles"),list):normalized.extend(x for x in item["candles"] if isinstance(x,dict))
+                        elif isinstance(item,dict) and any(k in item for k in ("open","o","high","h","low","l","close","c")):normalized.append(item)
                 if normalized:
-                    try:
-                        normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
-                    except Exception:
-                        pass
+                    try:normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
+                    except Exception:pass
                     STATE["candles"][p]=normalized
                 CANDLE_FETCH_LAST[p]=time.time()
             except Exception as e:
-                log.warning("CANDLE_REFRESH_THROTTLED_OR_FAILED pair=%s %s",p,e)
-                CANDLE_FETCH_LAST[p]=time.time()
+                log.warning("CANDLE_REFRESH_THROTTLED_OR_FAILED pair=%s %s",p,e);CANDLE_FETCH_LAST[p]=time.time()
     await asyncio.gather(*(one(a) for a in due))
     for a in assets:
-        if not a.get("signal_eligible",True):
-            continue
+        if not a.get("signal_eligible",True):continue
         p=a["pair"];price=STATE["prices"].get(p,(None,None))[0]
         closed=_closed_candles(STATE["candles"].get(p,[]),time.time())
         an=analyze_asset(a,closed,price)
-        if an:
-            an["profitability"]=a["profitability"];STATE["analyses"][p]=an
+        if an:an["profitability"]=a["profitability"];STATE["analyses"][p]=an
         else:STATE["analyses"].pop(p,None)
     stale_count=sum(1 for a in assets if a.get("signal_eligible",True) and _candle_data_stale(a["pair"],time.time()))
     log.info("LIVE_ANALYSIS_REFRESH assets=%d signal_eligible=%d fetched=%d stale=%d qualified=%d",
-             len(assets),sum(1 for a in assets if a.get("signal_eligible",True)),
-             len(due),stale_count,len(STATE["analyses"]))
+             len(assets),sum(1 for a in assets if a.get("signal_eligible",True)),len(due),stale_count,len(STATE["analyses"]))
 
 def has_fresh_live_price(pair,reference_ts=None,max_age=LIVE_TICK_MAX_AGE):
     rec=STATE["prices"].get(pair)
@@ -396,7 +386,8 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
     ]
     raw=[STATE["analyses"][a["pair"]].copy() for a in eligible if a["pair"] in STATE["analyses"]]
     raw=[BRAIN.adaptive_candidate(x) for x in raw]
-    raw=rank_signal_candidates(raw)    if not raw:return None
+    raw=rank_signal_candidates(raw)
+    if not raw:return None
     # AI reviews the strongest technical candidates in parallel. Sequential reviews
     # consumed the final 40-second window (3-4 seconds per provider call), so one
     # candidate could reach the target while the remaining reviews were still running.
@@ -424,17 +415,13 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
         top=raw[:20]
     now=time.time()
     reviewed=[]
-
     async def review_one(x):
         cs=STATE["candles"].get(x["pair"],[])
         price=STATE["prices"].get(x["pair"],(x.get("price"),None))[0]
         asset=next((a for a in eligible if a["pair"]==x["pair"]),None)
         if not asset:
             return None
-        closed=_closed_candles(cs,now)
-        if len(closed)<45:
-            return None
-        snap=snapshot_from_asset(asset,closed,price,now)
+        snap=snapshot_from_asset(asset,cs,price,now)
         cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
         cached=AI_REVIEW_CACHE.get(cache_key)
         ttl=AI_REVIEW_TTL if cached and cached[1] else AI_REVIEW_FAIL_TTL
@@ -582,23 +569,29 @@ async def result_watch(key):
     direction_icon="⬆️" if rec["direction"]=="UP" else "⬇️"
     result_icon={"WIN":"✅","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
     await telegram(
-        f"📊 TRADE RESULT\n"
-        f"\n"
-        f"📈 {label}\n"
-        f"\n"
-        f"{direction_icon} {rec['direction']}\n"
-        f"\n"
-        f"💰 Entry: {rec['entry_price']}\n"
-        f"🏁 Expiry: {rec['exit_price']}\n"
-        f"⏱️ Duration: {rec['expiry_minutes']} MIN\n"
-        f"🔎 Verification: candle-closed\n"
-        f"\n"
-        f"{result_icon} {rec['result']}\n"
-        f"\n"
-        f"⚠️ RESULT ONLY — AUTO TRADE OFF"    )
+        f"📊 TRADE RESULT\\n"
+        f"\\n"
+        f"📈 {label}\\n"
+        f"\\n"
+        f"{direction_icon} {rec['direction']}\\n"
+        f"\\n"
+        f"💰 Entry: {rec['entry_price']}\\n"
+        f"🏁 Expiry: {rec['exit_price']}\\n"
+        f"⏱️ Duration: {rec['expiry_minutes']} MIN\\n"
+        f"🧠 Brain Strategy: {rec['strategy'] or '—'}\\n"
+        f"🎯 Brain Confidence: {rec['confidence']}%\\n"
+        f"📈 15m Trend: {rec['trend_15m'] or '—'}\\n"
+        f"🕯️ 1m Structure: {rec['structure_1m'] or '—'}\\n"
+        f"🔎 Verification: candle-closed\\n"
+        f"\\n"
+        f"{result_icon} {rec['result']}\\n"
+        f"\\n"
+        f"⚠️ RESULT ONLY — AUTO TRADE OFF"
+    )
     log.info(
-        "RESULT pair=%s result=%s entry=%s exit=%s source=%s cooldown=%s",
-        rec["pair"],rec["result"],rec["entry_price"],rec["exit_price"],
+        "RESULT pair=%s result=%s strategy=%s confidence=%s trend=%s structure=%s pattern=%s entry=%s exit=%s source=%s cooldown=%s",
+        rec["pair"],rec["result"],rec["strategy"],rec["confidence"],rec["trend_15m"],
+        rec["structure_1m"],rec["pattern"],rec["entry_price"],rec["exit_price"],
         expiry_source,rec["result"]=="LOSS"
     )
 
@@ -668,11 +661,12 @@ async def cycle_loop():
              f"🟢 DEMO • READ ONLY\n"
              f"🤖 CANDICE BRAIN")
         log.info(
-            "FINAL_SIGNAL cycle=%s pair=%s direction=%s confidence=%s price_source=%s "
-            "trend=%s structure=%s pattern=%s signal_utc=%s target_utc=%s lead_seconds=%.3f",
-            int(target//300),s.pair,s.direction,s.confidence,
+            "FINAL_SIGNAL cycle=%s pair=%s direction=%s strategy=%s confidence=%s price_source=%s "
+            "trend=%s structure=%s pattern=%s expiry=%s entry_candle=%s signal_utc=%s target_utc=%s lead_seconds=%.3f",
+            int(target//300),s.pair,s.direction,s.strategy or "UNKNOWN",s.confidence,
             STATE["price_source"].get(s.pair,"unknown"),
             s.trend_15m or "UNKNOWN",s.structure_1m or "UNKNOWN",s.pattern or "UNKNOWN",
+            s.expiry_minutes,s.entry_candle_ts,
             time.strftime("%H:%M:%S.%f",time.gmtime(ts))[:-3],
             time.strftime("%H:%M:%S.%f",time.gmtime(target))[:-3],
             target-time.time()
@@ -795,3 +789,153 @@ async def audit_outbound_network():
         return ""
 
 async def market_worker():
+    global CLIENT
+    while True:
+        token=os.getenv("OLYMPTRADE_ACCESS_TOKEN","").strip()
+        if not token:STATE["status"]="waiting_for_token";await asyncio.sleep(30);continue
+        client=OlympTradeClient(access_token=token,log_raw_messages=False);CLIENT=client;client.register_callback(parameters.E_TICK_UPDATE,on_tick)
+        try:
+            STATE["status"]="connecting"
+            await audit_outbound_network()
+            await client.start()
+            STATE["status"]="connected"
+            # Session initialization is what causes broker event 55 to arrive.
+            # Start it without waiting for the library's slow account-info fallback.
+            init_task=asyncio.create_task(client.initialize_session())
+            demo_found=False
+            for _ in range(20):
+                await asyncio.sleep(0.25)
+                for m in client.get_cached_events(55):
+                    d=m.get("d") if isinstance(m,dict) else None
+                    if isinstance(d,list):
+                        for a in d:
+                            if isinstance(a,dict) and a.get("group")=="demo" and a.get("account_id") is not None:
+                                client.account_id=a.get("account_id")
+                                client.account_group="demo"
+                                demo_found=True
+                                break
+                    if demo_found: break
+                if demo_found: break
+            if demo_found:
+                log.info("DEMO_ACCOUNT_SELECTED account_id=%s",client.account_id)
+                if not init_task.done():
+                    init_task.cancel()
+                try: await init_task                except asyncio.CancelledError: pass
+            else:
+                try: await init_task
+                except Exception as e: log.warning("SESSION_INIT_AFTER_EVENT55_FAILED %s",e)
+                for m in client.get_cached_events(55):
+                    d=m.get("d") if isinstance(m,dict) else None
+                    if isinstance(d,list):
+                        for a in d:
+                            if isinstance(a,dict) and a.get("group")=="demo" and a.get("account_id") is not None:
+                                client.account_id=a.get("account_id")
+                                client.account_group="demo"
+                                demo_found=True
+                                break
+                    if demo_found: break
+            if not demo_found:
+                log.error("DEMO_ACCOUNT_NOT_FOUND_IN_EVENT_55")
+                raise RuntimeError("DEMO account id not available from broker event 55")
+            raw=await client.market.get_available_assets(client.account_id)
+            # IMPORTANT: the authenticated account-scoped asset response is the
+            # source of truth. Do NOT replace it with cached event 182/global
+            # Flex metadata: that stream can contain region/account-ineligible
+            # instruments (for example India-specific OTC products).
+            source=raw or []
+            assets=build_assets(client,source)
+            STATE["assets"]=assets;STATE["status"]="live_read_only"
+            real_n=sum(a["mode"]=="REAL" for a in assets); otc_n=sum(a["mode"]=="OTC" for a in assets)
+            log.info("ACCOUNT_ASSET_SOURCE account_id=%s source_count=%d open_real=%d open_otc=%d open_total=%d",
+                     client.account_id,len(source),real_n,otc_n,len(assets))
+            log.info("ALL_ACCOUNT_OPEN_ASSETS_READY count=%d",len(assets))
+            # Do not bulk-call MarketAPI.subscribe_ticks(). The current broker
+            # endpoint rejects its event-12/280 requests. Live event-1 ticks
+            # already arrive from the authenticated session; missing quotes are
+            # handled by the read-only snapshot fallback in final_candidate().
+            log.info("TICK_SUBSCRIPTION_MODE disabled_reason=broker_event_12_280_rejected")
+            await refresh_candles(force=True)
+            while True:await asyncio.sleep(30)
+        except Exception as e:
+            STATE["status"]="error";log.exception("MARKET_WORKER_ERROR %s",e);await asyncio.sleep(15)
+        finally:
+            try:await client.stop()
+            except Exception:pass
+            CLIENT=None
+
+async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "✅ NEXORA AI is online.\\n\\n"
+        "Candice Brain: LIVE\\n"
+        "Mode: DEMO / Read-only"
+    )
+
+
+async def health(reader,writer):
+    try:
+        raw=await reader.read(65536)
+        head,_,body=raw.partition(b"\r\n\r\n")
+        first=head.split(b"\r\n",1)[0].decode("latin1","ignore")
+        parts=first.split(" ")
+        path=parts[1] if len(parts)>1 else "/"
+        headers={}
+        for line in head.decode("latin1","ignore").split("\r\n")[1:]:
+            if ":" in line:
+                k,v=line.split(":",1);headers[k.strip().lower()]=v.strip()
+        webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
+        if path.startswith("/health"):
+            body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"network":STATE.get("network",{})}).encode()
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
+            await writer.drain()
+            return
+        if path.startswith("/telegram/webhook") and webhook_secret and headers.get("x-telegram-bot-api-secret-token") != webhook_secret:
+            writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
+        if path.startswith("/telegram/webhook") and not body:
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNEXORA Telegram webhook is ready")
+            await writer.drain()
+            return
+        if path.startswith("/telegram/webhook") and body:
+            try:
+                upd=json.loads(body.decode("utf-8"))
+                msg=upd.get("message") or upd.get("edited_message") or {}
+                txt=str(msg.get("text") or "").strip()
+                chat_id=(msg.get("chat") or {}).get("id")
+                if chat_id is not None:
+                    STATE["telegram_chat_id"]=chat_id
+                    log.info("TELEGRAM_CHAT_ID_CAPTURED chat_id=%s",chat_id)
+                if txt.lower().startswith("/start") and chat_id is not None:
+                    sent=await telegram("✅ NEXORA AI is online.\n\nCandice Brain: LIVE\nMode: DEMO / Read-only", chat_id=chat_id)
+                    log.info("TELEGRAM_START_RECEIVED chat_id=%s sent=%s",chat_id,sent)
+            except Exception as e:
+                log.warning("TELEGRAM_WEBHOOK_PARSE_FAILED %s",e)
+        body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"network":STATE.get("network",{})}).encode()
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"+body_out);await writer.drain()
+    finally:writer.close()
+
+async def configure_telegram_webhook():
+    token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+    if not token:
+        log.warning("TELEGRAM_NOT_CONFIGURED"); return
+    url=os.getenv("TELEGRAM_WEBHOOK_URL","https://priyanithan-zflv.onrender.com/telegram/webhook").strip()
+    secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
+    try:
+        payload={"url":url}
+        if secret: payload["secret_token"]=secret
+        async with httpx.AsyncClient(timeout=10) as h:
+            await h.post(f"https://api.telegram.org/bot{token}/deleteWebhook",json={"drop_pending_updates":False})
+            r=await h.post(f"https://api.telegram.org/bot{token}/setWebhook",json=payload)
+            r.raise_for_status()
+            info=await h.get(f"https://api.telegram.org/bot{token}/getWebhookInfo")
+            try: data=info.json().get("result",{})
+            except Exception: data={}
+            log.info("TELEGRAM_WEBHOOK_READY url=%s pending=%s last_error=%s",data.get("url",""),data.get("pending_update_count",0),str(data.get("last_error_message",""))[:160])
+    except Exception as e:
+        log.warning("TELEGRAM_WEBHOOK_SETUP_FAILED %s",e)
+
+async def main():
+    port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
+    await configure_telegram_webhook()
+    await asyncio.gather(market_worker(),cycle_loop(),server.serve_forever())
+if __name__=="__main__":asyncio.run(main())
