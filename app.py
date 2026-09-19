@@ -120,7 +120,7 @@ def build_assets(client,raw):
 
 async def telegram(text, chat_id=None):
     token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
-    chat=str(chat_id or os.getenv("TELEGRAM_CHAT_ID","")).strip()
+    chat=str(chat_id or STATE.get("telegram_chat_id") or os.getenv("TELEGRAM_CHAT_ID","")).strip()
     if not token or not chat:
         log.warning("TELEGRAM_NOT_CONFIGURED")
         return False
@@ -452,8 +452,9 @@ async def cycle_loop():
             return False
 
         p=candidate["pair"]
-        # Refresh the selected quote before the 30s signal deadline.
-        await ensure_candidate_quotes([p])
+        # The quote is refreshed immediately before this function is called.
+        # Keep this send path non-blocking so the 30s signal deadline is not
+        # consumed by another network request.
         now=time.time()
         if not has_fresh_live_price(p,now,QUOTE_SNAPSHOT_MAX_AGE):
             log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=quote_not_fresh",
@@ -559,7 +560,12 @@ async def cycle_loop():
 
         # Refresh the chosen quote shortly before the signal deadline, then wait
         # for the exact target-30s timestamp.
+        # Refresh the selected quote about 2 seconds before the user-facing
+        # signal deadline. This keeps the final send path fast and guarantees
+        # the entry price is recent without waiting at target time.
+        pre_quote_at=signal_at-2.0
         if candidate:
+            await asyncio.sleep(max(0,pre_quote_at-time.time()))
             try:
                 await ensure_candidate_quotes([candidate["pair"]])
             except Exception as e:
@@ -695,6 +701,9 @@ async def health(reader,writer):
                 msg=upd.get("message") or upd.get("edited_message") or {}
                 txt=str(msg.get("text") or "").strip()
                 chat_id=(msg.get("chat") or {}).get("id")
+                if chat_id is not None:
+                    STATE["telegram_chat_id"]=chat_id
+                    log.info("TELEGRAM_CHAT_ID_CAPTURED chat_id=%s",chat_id)
                 if txt.lower().startswith("/start") and chat_id is not None:
                     sent=await telegram("✅ NEXORA AI is online.\n\nCandice Brain: LIVE\nMode: DEMO / Read-only", chat_id=chat_id)
                     log.info("TELEGRAM_START_RECEIVED chat_id=%s sent=%s",chat_id,sent)
