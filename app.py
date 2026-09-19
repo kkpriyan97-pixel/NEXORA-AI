@@ -1,6 +1,7 @@
 import asyncio,json,logging,os,time
 from typing import Any
 from telegram import Update
+from telegram.ext import ContextTypes
 import httpx
 from olymptrade_ws import OlympTradeClient
 from olymptrade_ws.olympconfig import parameters
@@ -178,12 +179,13 @@ async def final_candidate():
     BRAIN.prune_expired_cooldowns()
     eligible=BRAIN.filter_candidates(STATE["assets"])
     raw=[STATE["analyses"][a["pair"]].copy() for a in eligible if a["pair"] in STATE["analyses"]]
+    raw=[BRAIN.adaptive_candidate(x) for x in raw]
     raw=rank_signal_candidates(raw)
     if not raw:return None
     # AI reviews the strongest technical candidates in parallel. Sequential reviews
     # consumed the final 40-second window (3-4 seconds per provider call), so one
     # candidate could reach the target while the remaining reviews were still running.
-    top=raw[:3]
+    top=raw[:5]
     now=time.time()
     reviewed=[]
 
