@@ -7,15 +7,16 @@ from ai_engine import MarketSnapshot,build_ai_request,parse_ai_decision
 log=logging.getLogger("candice")
 PROVIDER_COOLDOWN={}
 PROVIDER_COOLDOWN_SECONDS=120.0
+DEFAULT_FALLBACKS=("GEMINI","GROQ","NVIDIA","OPENROUTER","MISTRAL")
 PROVIDER_LOCKS={}
-ANALYSIS_SEMAPHORE=asyncio.Semaphore(1)
+ANALYSIS_SEMAPHORE=asyncio.Semaphore(3)
 _logged_ready=set()
 
 def _providers():
     names=[]
     primary=os.getenv("AI_PROVIDER","OPENAI").strip().upper()
     if primary:names.append(primary)
-    for n in os.getenv("AI_FALLBACK_PROVIDERS","OPENROUTER,MISTRAL").split(","):
+    for n in os.getenv("AI_FALLBACK_PROVIDERS",",".join(DEFAULT_FALLBACKS)).split(","):
         n=n.strip().upper()
         if n and n not in names:names.append(n)
     return names
@@ -24,10 +25,15 @@ def _cfg(name):
     key=os.getenv(f"{name}_API_KEY","").strip()
     if not key and name=="OPENAI":key=os.getenv("OPENAI_API_KEY","").strip()
     if not key and name=="OPENROUTER":key=os.getenv("OPENROUTER_API_KEY","").strip()
+    if not key and name=="GEMINI":key=os.getenv("GEMINI_API_KEY","").strip()
+    if not key and name=="GROQ":key=os.getenv("GROQ_API_KEY","").strip()
+    if not key and name=="NVIDIA":key=os.getenv("NVIDIA_API_KEY","").strip() or os.getenv("NVIDIA_NIM_API_KEY","").strip()
     base=os.getenv(f"{name}_BASE_URL","").strip().rstrip("/")
     if not base:
-        base={"OPENAI":"https://api.openai.com/v1","OPENROUTER":"https://openrouter.ai/api/v1","MISTRAL":"https://api.mistral.ai/v1"}.get(name,"")
+        base={"OPENAI":"https://api.openai.com/v1","GEMINI":"https://generativelanguage.googleapis.com/v1beta/openai","GROQ":"https://api.groq.com/openai/v1","NVIDIA":"https://integrate.api.nvidia.com/v1","OPENROUTER":"https://openrouter.ai/api/v1","MISTRAL":"https://api.mistral.ai/v1"}.get(name,"")
     model=os.getenv(f"{name}_MODEL","").strip() or os.getenv("AI_MODEL","").strip()
+    if not model:
+        model={"GEMINI":"gemini-3.8-flash","GROQ":"openai/gpt-oss-20b","NVIDIA":"openai/gpt-oss-20b"}.get(name,"")
     if not key or not base or not model:return None
     return base,model,key
 
@@ -69,10 +75,11 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
             "confidence 0-100, and reason. This is DEMO read-only; never trade.\n"+
             json.dumps(request,ensure_ascii=False,separators=(",",":")))
     last=None
-    http_timeout=min(1.8,max(0.8,float(os.getenv("AI_HTTP_TIMEOUT","1.5"))))
+    http_timeout=min(2.5,max(1.0,float(os.getenv("AI_HTTP_TIMEOUT","2.2"))))
     connect_timeout=min(1.0,http_timeout)
 
     async with ANALYSIS_SEMAPHORE:
+        log.info("AI_FALLBACK_CHAIN providers=%s",",".join(_providers()))
         for name in _providers():
             cfg=_cfg(name)
             if not cfg:
@@ -137,4 +144,5 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                     continue
     if last:
         raise RuntimeError(f"All configured AI providers failed: {type(last).__name__}")
+    log.warning("AI_NO_CONFIGURED_PROVIDER providers=%s",",".join(_providers()))
     return None
