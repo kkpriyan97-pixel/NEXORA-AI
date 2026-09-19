@@ -303,7 +303,8 @@ async def refresh_candles(force=False):
         async with CANDLE_FETCH_SEM:
             try:
                 await asyncio.sleep(0.35)
-                cs=await client.market.get_candles(p,size=60,count=60)                normalized=[]
+                cs=await client.market.get_candles(p,size=60,count=60)
+                normalized=[]
                 if isinstance(cs,list):
                     for item in cs:
                         if isinstance(item,dict) and isinstance(item.get("candles"),list):
@@ -483,7 +484,6 @@ async def result_watch(key):
         if attempt < 3:
             await asyncio.sleep(0.35)
 
-    # A very fresh tick is a secondary source only.
     if expiry_price is None:
         rec=STATE["prices"].get(s.pair)
         if rec and rec[0] is not None:
@@ -492,12 +492,8 @@ async def result_watch(key):
                 expiry_price=float(rec[0])
                 expiry_source="fresh_tick"
 
-    # Never invent a TIE from stale data. Wait for a genuinely fresh expiry price.
     if expiry_price is None:
-        log.warning(
-            "RESULT_PENDING_NO_FRESH_EXPIRY_PRICE pair=%s entry=%s",
-            s.pair,s.entry_price
-        )
+        log.warning("RESULT_PENDING_NO_FRESH_EXPIRY_PRICE pair=%s entry=%s",s.pair,s.entry_price)
         await asyncio.sleep(1.0)
         if key in BRAIN.active_signals:
             return await result_watch(key)
@@ -659,7 +655,8 @@ async def cycle_loop():
         pre_quote_at=signal_at-2.0
         if candidate:
             await asyncio.sleep(max(0,pre_quote_at-time.time()))
-            try:                await ensure_candidate_quotes([candidate["pair"]])
+            try:
+                await ensure_candidate_quotes([candidate["pair"]])
             except Exception as e:
                 log.warning("CYCLE_PRE_SIGNAL_QUOTE_REFRESH_FAILED cycle=%s type=%s message=%s",
                             cycle_id,type(e).__name__,str(e)[:120])
