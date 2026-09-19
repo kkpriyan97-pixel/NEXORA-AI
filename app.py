@@ -35,6 +35,11 @@ QUOTE_SNAPSHOT_LAST={}
 AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=90.0
 AI_REVIEW_FAIL_TTL=20.0
+# Preserve a fully reviewed candidate for the short exact-boundary window.
+# This prevents a transient provider/cache refresh from erasing a valid setup
+# after it has already passed the Brain + live-price gates.
+CANDIDATE_CACHE={}
+CANDIDATE_CACHE_TTL=75.0
 AI_PROVIDER_COOLDOWN={}
 AI_REVIEW_TIMEOUT=2.4
 CLIENT=None
@@ -418,6 +423,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
         if d and int(d.get("confidence",0))>=90:
             y=x.copy()
             y.update({"confidence":int(d["confidence"]),"reason":d.get("reason") or x["reason"],"ai_provider":d.get("provider")})
+            CANDIDATE_CACHE[cache_key]=(time.time(),y.copy())
             return y
         # When every external LLM provider is unavailable, preserve the live
         # evidence-first Candice Brain decision instead of losing the whole
@@ -443,6 +449,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
                 "pair":y["pair"],
                 "provider":"CANDICE_LOCAL_BRAIN"
             })
+            CANDIDATE_CACHE[cache_key]=(time.time(),y.copy())
             log.warning("AI_EXTERNAL_FALLBACK_LOCAL pair=%s confidence=%s strategy=%s",
                         x["pair"],x.get("confidence"),x.get("strategy"))
             return y
@@ -457,7 +464,37 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
     ranked=rank_signal_candidates(reviewed)
     if require_live_price:
         ranked=[x for x in ranked if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
-    return ranked[0] if ranked else None
+    if ranked:
+        return ranked[0]
+
+    # Exact-boundary resilience: if this cycle already completed a valid Brain
+    # + AI/local review for the same candle, reuse that completed decision for a
+    # few seconds instead of re-running the provider at the deadline. The live
+    # quote is still required, so this cannot send on stale market data.
+    cached_candidates=[]
+    now_cache=time.time()
+    for x in top:
+        key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
+        cached=CANDIDATE_CACHE.get(key)
+        if not cached:
+            continue
+        cached_at,candidate=cached
+        if now_cache-cached_at > CANDIDATE_CACHE_TTL:
+            CANDIDATE_CACHE.pop(key,None)
+            continue
+        if int(candidate.get("confidence") or 0) < 90:
+            continue
+        if require_live_price and not has_fresh_live_price(candidate["pair"],now_cache,QUOTE_SNAPSHOT_MAX_AGE):
+            continue
+        cached_candidates.append(candidate.copy())
+    cached_ranked=rank_signal_candidates(cached_candidates)
+    if cached_ranked:
+        log.info("FINAL_CANDIDATE_CACHE_FALLBACK count=%d pair=%s confidence=%s",
+                 len(cached_ranked),cached_ranked[0]["pair"],cached_ranked[0].get("confidence"))
+        return cached_ranked[0]
+    log.info("FINAL_CANDIDATE_NONE raw=%d top=%d reviewed=%d require_live=%s",
+             len(raw),len(top),len(reviewed),require_live_price)
+    return None
 
 async def result_watch(key):
     s=BRAIN.active_signals.get(key)
@@ -659,7 +696,7 @@ async def cycle_loop():
         # Refresh the selected quote about 2 seconds before the user-facing
         # signal deadline. This keeps the final send path fast and guarantees
         # the entry price is recent without waiting at target time.
-        pre_quote_at=signal_at-2.0
+        pre_quote_at=signal_at-4.0
         if candidate:
             await asyncio.sleep(max(0,pre_quote_at-time.time()))
             try:
