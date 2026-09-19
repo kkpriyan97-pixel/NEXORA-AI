@@ -340,16 +340,15 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
     if require_live_price:
         live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
         if not live_raw:
-            # Retry the broker tick subscription for the strongest candidates.
+            # Do not call the library tick-resubscription API here: the deployed
+            # OlympTrade library sends events 12/280, which the broker currently
+            # rejects with invalid_request. Use the read-only short-interval
+            # quote snapshot instead; it is timestamped locally and never
+            # fabricates a price.
             retry_pairs=[x["pair"] for x in raw[:8]]
-            await ensure_candidate_ticks(retry_pairs)
-            live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
-            # If no qualified asset has a fresh tick, obtain a read-only
-            # short-interval quote snapshot rather than fabricating a price.
-            if not live_raw:
-                await ensure_candidate_quotes(retry_pairs)
-                live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),QUOTE_SNAPSHOT_MAX_AGE)]
-            log.info("LIVE_PRICE_GUARD qualified=%d fresh=%d retried=%d",
+            await ensure_candidate_quotes(retry_pairs)
+            live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),QUOTE_SNAPSHOT_MAX_AGE)]
+            log.info("LIVE_PRICE_GUARD qualified=%d fresh=%d snapshot_requested=%d",
                      len(raw),len(live_raw),len(retry_pairs))
         if not live_raw:
             return None
@@ -441,80 +440,149 @@ async def result_watch(key):
     log.info("RESULT pair=%s result=%s exit=%s cooldown=%s",rec["pair"],rec["result"],rec["exit_price"],rec["result"]=="LOSS")
 
 async def cycle_loop():
-    # Exactly one decision cycle at a time. The final 30 seconds are a live
-    # evaluation window; the entry is captured only at the exact 5-minute boundary.
+    # Internal analysis starts 75s before the 5-minute boundary.
+    # The user-facing signal is emitted exactly 30s before entry.
+    # No signal is ever emitted at/after the entry boundary.
+    PRE_ANALYSIS_LEAD=75.0
+    SIGNAL_LEAD=30.0
     last_target=0
+
+    async def send_cycle_signal(candidate,target):
+        if not candidate or not BRAIN.can_send_cycle_signal():
+            return False
+
+        p=candidate["pair"]
+        # Refresh the selected quote before the 30s signal deadline.
+        await ensure_candidate_quotes([p])
+        now=time.time()
+        if not has_fresh_live_price(p,now,QUOTE_SNAPSHOT_MAX_AGE):
+            log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=quote_not_fresh",
+                     int(target//300),p)
+            return False
+
+        entry=STATE["prices"].get(p,(None,None))[0]
+        if entry is None:
+            log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=price_missing",
+                     int(target//300),p)
+            return False
+
+        confidence=int(candidate.get("confidence") or 0)
+        if confidence < 90:
+            log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=confidence_%s",
+                     int(target//300),p,confidence)
+            return False
+
+        ts=target-SIGNAL_LEAD
+        if time.time() > ts+0.25:
+            log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=deadline_passed",
+                     int(target//300),p)
+            return False
+
+        s=BRAIN.mark_signal_sent(
+            pair=p,display_name=candidate["display_name"],
+            direction=candidate["direction"],expiry_minutes=candidate["expiry_minutes"],
+            entry_price=entry,entry_ts=target,
+            entry_candle_ts=candidate["entry_candle_ts"],
+            strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence
+        )
+        key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
+        msg=(f"━━━━━━━━━━━━━━━━━━━━\\n🎯 CANDICE AI • LIVE MARKET\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
+             f"📊 ASSET: {s.display_name} ({s.pair})\\n➡️ DIRECTION: {s.direction}\\n\\n"
+             f"🕒 SIGNAL: {time.strftime('%H:%M:%S',time.localtime(ts))} UAE\\n"
+             f"🎯 TARGET: {time.strftime('%H:%M:%S',time.localtime(target))} UAE\\n"
+             f"⏳ SIGNAL COUNTDOWN: 00:30\\n\\n⏱️ EXPIRY: {s.expiry_minutes} MIN\\n"
+             f"💰 ENTRY: {s.entry_price}\\n\\n📈 15M TREND: {s.trend_15m}\\n"
+             f"🕯️ 1M STRUCTURE: {s.structure_1m}\\n🧠 STRATEGY: {s.strategy}\\n"
+             f"🎯 CONFIDENCE: {s.confidence}%\\n🟢 ACCOUNT: DEMO\\n\\n🧠 {s.reason}\\n━━━━━━━━━━━━━━━━━━━━")
+        log.info(
+            "FINAL_SIGNAL cycle=%s pair=%s direction=%s confidence=%s price_source=%s "
+            "signal_utc=%s target_utc=%s lead_seconds=%.3f",
+            int(target//300),s.pair,s.direction,s.confidence,
+            STATE["price_source"].get(s.pair,"unknown"),
+            time.strftime("%H:%M:%S.%f",time.gmtime(ts))[:-3],
+            time.strftime("%H:%M:%S.%f",time.gmtime(target))[:-3],
+            target-time.time()
+        )
+        asyncio.create_task(telegram_background(msg,f"{s.cycle_id}:{s.pair}:{s.entry_ts}"))
+        asyncio.create_task(result_watch(key))
+        return True
+
     while True:
-        now=time.time(); target=(int(now)//300+1)*300
-        if target<=last_target: target=last_target+300
-        start=target-30
-        await asyncio.sleep(max(0,start-time.time()))
-        log.info("CYCLE_WINDOW_START cycle=%s start_utc=%s target_utc=%s start_uae=%s target_uae=%s",int(target//300),time.strftime("%H:%M:%S",time.gmtime(start)),time.strftime("%H:%M:%S",time.gmtime(target)),time.strftime("%H:%M:%S",time.gmtime(start+4*3600)),time.strftime("%H:%M:%S",time.gmtime(target+4*3600)))
-        BRAIN.start_cycle(int(target//300)); STATE["cycle"]=int(target//300); last_target=target
+        now=time.time()
+        target=(int(now)//300+1)*300
+        if target<=last_target:
+            target=last_target+300
+        analysis_start=target-PRE_ANALYSIS_LEAD
+        signal_at=target-SIGNAL_LEAD
+
+        await asyncio.sleep(max(0,analysis_start-time.time()))
+        cycle_id=int(target//300)
+        BRAIN.start_cycle(cycle_id)
+        STATE["cycle"]=cycle_id
+        last_target=target
+        log.info(
+            "CYCLE_WINDOW_START cycle=%s analysis_start_utc=%s signal_utc=%s target_utc=%s "
+            "analysis_start_uae=%s signal_uae=%s target_uae=%s",
+            cycle_id,
+            time.strftime("%H:%M:%S",time.gmtime(analysis_start)),
+            time.strftime("%H:%M:%S",time.gmtime(signal_at)),
+            time.strftime("%H:%M:%S",time.gmtime(target)),
+            time.strftime("%H:%M:%S",time.gmtime(analysis_start+4*3600)),
+            time.strftime("%H:%M:%S",time.gmtime(signal_at+4*3600)),
+            time.strftime("%H:%M:%S",time.gmtime(target+4*3600))
+        )
+
         candidate=None
-        while time.time()<target:
-            await refresh_candles()
+        # Use the 45s before the signal deadline for analysis. Once the deadline
+        # is reached, stop recomputing so no slow AI/provider call can push the
+        # signal past the required 30s lead time.
+        while time.time() < signal_at-0.75:
             try:
-                new_candidate=await asyncio.wait_for(final_candidate(require_live_price=True),timeout=max(1.0,target-time.time()))
-                # Never erase a valid completed review because a later provider
-                # attempt timed out. Keep the strongest valid candidate until
-                # the exact entry boundary.
+                await refresh_candles()
+            except Exception as e:
+                log.warning("CYCLE_CANDLE_REFRESH_FAILED cycle=%s type=%s message=%s",
+                            cycle_id,type(e).__name__,str(e)[:160])
+            remaining=max(0,signal_at-time.time())
+            if remaining <= 0.75:
+                break
+            try:
+                new_candidate=await asyncio.wait_for(
+                    final_candidate(require_live_price=True),
+                    timeout=max(0.75,remaining-0.20)
+                )
                 if new_candidate is not None:
                     candidate=new_candidate
             except asyncio.TimeoutError:
-                log.warning("CYCLE_FINAL_EVALUATION_TIMEOUT cycle=%s remaining=%.2f",
-                            target//300,max(0,target-time.time()))
-            await asyncio.sleep(min(2,max(0,target-time.time())))
-        # Exact target: keep the last completed decision and capture the live tick price.
-        last_candidate=candidate
-        try:
-            await asyncio.wait_for(refresh_candles(),timeout=1.0)
-        except asyncio.TimeoutError:
-            log.warning("CYCLE_TARGET_CANDLE_REFRESH_TIMEOUT cycle=%s",target//300)
-        except Exception as e:
-            log.warning("CYCLE_TARGET_CANDLE_REFRESH_FAILED cycle=%s type=%s message=%s",target//300,type(e).__name__,str(e)[:120])
-        try:
-            boundary_candidate=await asyncio.wait_for(final_candidate(use_cached_only=True,require_live_price=True),timeout=0.8)
-            if boundary_candidate is not None:
-                candidate=boundary_candidate
-            else:
-                # Never carry a stale candidate across the exact boundary.
-                candidate=None
-        except asyncio.TimeoutError:
-            log.warning("CYCLE_TARGET_FINAL_CHECK_TIMEOUT cycle=%s",target//300)
-            candidate=None
-        except Exception as e:
-            log.exception("CYCLE_TARGET_FINAL_CHECK_FAILED cycle=%s type=%s message=%s",target//300,type(e).__name__,str(e)[:160])
-            candidate=None
-        if candidate and BRAIN.can_send_cycle_signal():
+                log.warning("CYCLE_PRE_SIGNAL_EVALUATION_TIMEOUT cycle=%s remaining=%.2f",
+                            cycle_id,max(0,signal_at-time.time()))
+            await asyncio.sleep(min(2.0,max(0,signal_at-time.time())))
+
+        # Refresh the chosen quote shortly before the signal deadline, then wait
+        # for the exact target-30s timestamp.
+        if candidate:
             try:
-                p=candidate["pair"]; entry=STATE["prices"].get(p,(None,None))[0]
-                if not has_fresh_live_price(p,target,LIVE_TICK_MAX_AGE):
-                    raise RuntimeError(
-                        f"Fresh live entry price unavailable for {p} "
-                        f"age={live_price_age(p,target)}")
-                confidence=int(candidate.get("confidence") or 0)
-                if confidence < 90:
-                    raise ValueError(f"Final candidate confidence below threshold: {confidence}")
-                ts=target-30
-                s=BRAIN.mark_signal_sent(pair=p,display_name=candidate["display_name"],direction=candidate["direction"],expiry_minutes=candidate["expiry_minutes"],entry_price=entry,entry_ts=target,entry_candle_ts=candidate["entry_candle_ts"],strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence)
-                key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
-                msg=(f"━━━━━━━━━━━━━━━━━━━━\\n🎯 CANDICE AI • LIVE MARKET\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
-                     f"📊 ASSET: {s.display_name} ({s.pair})\\n➡️ DIRECTION: {s.direction}\\n\\n"
-                     f"🕒 SIGNAL: {time.strftime('%H:%M:%S',time.localtime(ts))} UAE\\n"
-                     f"🎯 TARGET: {time.strftime('%H:%M:%S',time.localtime(target))} UAE\\n"
-                     f"⏳ SIGNAL COUNTDOWN: 00:30\\n\\n⏱️ EXPIRY: {s.expiry_minutes} MIN\\n"
-                     f"💰 ENTRY: {s.entry_price}\\n\\n📈 15M TREND: {s.trend_15m}\\n"
-                     f"🕯️ 1M STRUCTURE: {s.structure_1m}\\n🧠 STRATEGY: {s.strategy}\\n"
-                     f"🎯 CONFIDENCE: {s.confidence}%\\n🟢 ACCOUNT: DEMO\\n\\n🧠 {s.reason}\\n━━━━━━━━━━━━━━━━━━━━")
-                log.info("FINAL_SIGNAL cycle=%s pair=%s direction=%s confidence=%s price_source=%s",target//300,s.pair,s.direction,s.confidence,STATE["price_source"].get(s.pair,"unknown"))
-                asyncio.create_task(telegram_background(msg,f"{s.cycle_id}:{s.pair}:{s.entry_ts}"))
-                asyncio.create_task(result_watch(key))
+                await ensure_candidate_quotes([candidate["pair"]])
             except Exception as e:
-                log.exception("FINAL_SIGNAL_BUILD_FAILED cycle=%s type=%s message=%s",target//300,type(e).__name__,str(e)[:160])
-        else:
-            log.info("NO_VALID_FINAL_SETUP cycle=%s reason=no_fresh_qualified_candidate",target//300)
-        await asyncio.sleep(0.5)
+                log.warning("CYCLE_PRE_SIGNAL_QUOTE_REFRESH_FAILED cycle=%s type=%s message=%s",
+                            cycle_id,type(e).__name__,str(e)[:120])
+
+        await asyncio.sleep(max(0,signal_at-time.time()))
+        sent=False
+        if candidate and time.time() <= signal_at+0.20:
+            try:
+                sent=await send_cycle_signal(candidate,target)
+            except Exception as e:
+                log.exception("FINAL_SIGNAL_BUILD_FAILED cycle=%s type=%s message=%s",
+                              cycle_id,type(e).__name__,str(e)[:160])
+
+        if not sent:
+            log.info("NO_VALID_FINAL_SETUP cycle=%s reason=no_candidate_ready_30s_before_entry",
+                     cycle_id)
+
+        # Keep the loop aligned to the next 5-minute boundary. Result tracking
+        # uses the stored exact entry timestamp, so no extra boundary evaluation
+        # is performed here.
+        await asyncio.sleep(max(0,target+0.25-time.time()))
 
 async def market_worker():
     global CLIENT
@@ -574,9 +642,11 @@ async def market_worker():
             real_n=sum(a["mode"]=="REAL" for a in assets); otc_n=sum(a["mode"]=="OTC" for a in assets)
             log.info("FLEX_UNIVERSE_SOURCE event=182 source_count=%d open_real=%d open_otc=%d open_total=%d",len(source),real_n,otc_n,len(assets))
             log.info("ALL_FLEX_OPEN_ASSETS_READY count=%d",len(assets))
-            for a in assets:
-                try:await client.market.subscribe_ticks(a["pair"])
-                except Exception as e:log.debug("TICK_SUBSCRIBE_FAILED %s %s",a["pair"],e)
+            # Do not bulk-call MarketAPI.subscribe_ticks(). The current broker
+            # endpoint rejects its event-12/280 requests. Live event-1 ticks
+            # already arrive from the authenticated session; missing quotes are
+            # handled by the read-only snapshot fallback in final_candidate().
+            log.info("TICK_SUBSCRIPTION_MODE disabled_reason=broker_event_12_280_rejected")
             await refresh_candles(force=True)
             while True:await asyncio.sleep(30)
         except Exception as e:
