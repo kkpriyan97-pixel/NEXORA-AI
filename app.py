@@ -426,6 +426,24 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
             return None
         snap=snapshot_from_asset(asset,closed,price,now)
         cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
+
+        # Candice Brain is the PRIMARY decision engine. External LLM providers
+        # are validation only and must never block a qualified local setup.
+        # This prevents an OpenAI/Gemini quota outage from deleting the
+        # 30-second signal window.
+        local_confidence=int(x.get("confidence") or 0)
+        if local_confidence>=90:
+            y=x.copy()
+            y.update({
+                "confidence":local_confidence,
+                "reason":x.get("reason") or "Candice local Brain verified closed-candle evidence",
+                "ai_provider":"CANDICE_LOCAL_BRAIN_PRIMARY"
+            })
+            CANDIDATE_CACHE[cache_key]=(time.time(),y.copy())
+            log.info("BRAIN_PRIMARY_CANDIDATE pair=%s confidence=%s strategy=%s",
+                     x["pair"],local_confidence,x.get("strategy"))
+            return y
+
         cached=AI_REVIEW_CACHE.get(cache_key)
         ttl=AI_REVIEW_TTL if cached and cached[1] else AI_REVIEW_FAIL_TTL
         if cached and time.time()-cached[0] < ttl:
