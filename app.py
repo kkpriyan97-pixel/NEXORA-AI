@@ -108,6 +108,11 @@ def build_assets(client,raw):
         seen.add(p)
 
         title=display_name(x) or p
+        # Olymptrade's Quickler asset uses ticker ULTRA_X. Keep the
+        # platform-facing name in Candice's asset universe instead of exposing
+        # the internal ticker as if it were a different asset.
+        if p.upper() == "ULTRA_X":
+            title = "Quickler"
         v=prof.get(p,x.get("profitability",0))
         try: profitability=int(v)
         except Exception: profitability=0
