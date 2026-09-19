@@ -23,7 +23,7 @@ AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=20.0
 AI_REVIEW_FAIL_TTL=20.0
 AI_PROVIDER_COOLDOWN={}
-AI_REVIEW_TIMEOUT=6.5
+AI_REVIEW_TIMEOUT=2.4
 CLIENT=None
 LOCK=asyncio.Lock()
 
@@ -214,6 +214,20 @@ async def final_candidate(use_cached_only=False):
         if d and int(d.get("confidence",0))>=90:
             y=x.copy()
             y.update({"confidence":int(d["confidence"]),"reason":d.get("reason") or x["reason"],"ai_provider":d.get("provider")})
+            return y
+        # When every external LLM provider is unavailable, preserve the live
+        # evidence-first Candice Brain decision instead of losing the whole
+        # 5-minute cycle. This fallback never bypasses the 90% Brain threshold,
+        # the live-candle evidence, the 15m conflict gate, or DEMO/read-only mode.
+        if not use_cached_only and not d and int(x.get("confidence") or 0) >= 90:
+            y=x.copy()
+            y.update({
+                "confidence":int(x.get("confidence") or 0),
+                "reason":x.get("reason") or "Candice local Brain verified live market evidence",
+                "ai_provider":"CANDICE_LOCAL_BRAIN"
+            })
+            log.warning("AI_EXTERNAL_FALLBACK_LOCAL pair=%s confidence=%s strategy=%s",
+                        x["pair"],x.get("confidence"),x.get("strategy"))
             return y
         return None
 
