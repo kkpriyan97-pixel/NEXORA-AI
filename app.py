@@ -23,7 +23,7 @@ AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=20.0
 AI_REVIEW_FAIL_TTL=20.0
 AI_PROVIDER_COOLDOWN={}
-AI_REVIEW_TIMEOUT=3.5
+AI_REVIEW_TIMEOUT=6.5
 CLIENT=None
 LOCK=asyncio.Lock()
 
@@ -185,7 +185,7 @@ async def final_candidate():
     # AI reviews the strongest technical candidates in parallel. Sequential reviews
     # consumed the final 40-second window (3-4 seconds per provider call), so one
     # candidate could reach the target while the remaining reviews were still running.
-    top=raw[:5]
+    top=raw[:3]
     now=time.time()
     reviewed=[]
 
