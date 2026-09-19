@@ -397,8 +397,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
         cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
         cached=AI_REVIEW_CACHE.get(cache_key)
         ttl=AI_REVIEW_TTL if cached and cached[1] else AI_REVIEW_FAIL_TTL
-        if cached and time.time()-cached[0] < ttl:
-            d=cached[1]
+        if cached and time.time()-cached[0] < ttl:            d=cached[1]
         elif use_cached_only:
             d=None
         else:
@@ -448,14 +447,18 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
             log.warning("AI_REVIEW_TASK_FAILED pair=%s type=%s message=%s",x["pair"],type(r).__name__,str(r)[:120])
         elif r:
             reviewed.append(r)
-    ranked=rank_signal_candasync def result_watch(key):
+    ranked=rank_signal_candidates(reviewed)
+    if require_live_price:
+        ranked=[x for x in ranked if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
+    return ranked[0] if ranked else None
+
+async def result_watch(key):
     s=BRAIN.active_signals.get(key)
     if not s:return
     await asyncio.sleep(max(0,s.expiry_minutes*60-(time.time()-s.entry_ts)))
 
-    # Never use the entry-time cached quote as the expiry quote. The previous
-    # implementation could read the same stale price at expiry and misclassify
-    # a real WIN/LOSS as TIE. Request a fresh broker snapshot at expiry.
+    # Never use the entry-time cached quote as the expiry quote.
+    # Request a fresh broker snapshot at the actual expiry boundary.
     expiry_price=None
     expiry_source=""
     client=CLIENT
@@ -487,8 +490,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
                 expiry_price=float(rec[0])
                 expiry_source="fresh_tick"
 
-    # Never invent a TIE from a stale price. Retry until a fresh expiry quote
-    # is available instead.
+    # Never invent a TIE from stale data. Wait for a genuinely fresh expiry price.
     if expiry_price is None:
         log.warning(
             "RESULT_PENDING_NO_FRESH_EXPIRY_PRICE pair=%s entry=%s",
@@ -503,17 +505,17 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
     label=rec["display_name"]
     icon={"WIN":"🟢","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
     await telegram(
-        f"━━━━━━━━━━━━━━━━━━━━\\n🎯 CANDICE AI RESULT\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
-        f"📊 ASSET: {label}\\n"
-        f"➡️ DIRECTION: {rec['direction']}\\n\\n"
-        f"💰 ENTRY: {rec['entry_price']}\\n"
-        f"💰 EXIT: {rec['exit_price']}\\n"
-        f"⏱️ EXPIRY: {rec['expiry_minutes']} MIN\\n\\n"
-        f"{icon} {rec['result']}\\n\\n"
-        f"🧠 STRATEGY: {rec['strategy']}\\n"
-        f"📈 15M TREND: {rec['trend_15m']}\\n"
-        f"🕯️ 1M STRUCTURE: {rec['structure_1m']}\\n\\n"
-        f"🧠 Brain learning recorded\\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n🎯 CANDICE AI RESULT\n━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 ASSET: {label}\n"
+        f"➡️ DIRECTION: {rec['direction']}\n\n"
+        f"💰 ENTRY: {rec['entry_price']}\n"
+        f"💰 EXIT: {rec['exit_price']}\n"
+        f"⏱️ EXPIRY: {rec['expiry_minutes']} MIN\n\n"
+        f"{icon} {rec['result']}\n\n"
+        f"🧠 STRATEGY: {rec['strategy']}\n"
+        f"📈 15M TREND: {rec['trend_15m']}\n"
+        f"🕯️ 1M STRUCTURE: {rec['structure_1m']}\n\n"
+        f"🧠 Brain learning recorded\n"
         f"━━━━━━━━━━━━━━━━━━━━"
     )
     log.info(
@@ -521,8 +523,6 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
         rec["pair"],rec["result"],rec["entry_price"],rec["exit_price"],
         expiry_source,rec["result"]=="LOSS"
     )
-']}\n\n🧠 Brain learning recorded\n━━━━━━━━━━━━━━━━━━━━")
-    log.info("RESULT pair=%s result=%s exit=%s cooldown=%s",rec["pair"],rec["result"],rec["exit_price"],rec["result"]=="LOSS")
 
 async def cycle_loop():
     # Internal analysis starts 75s before the 5-minute boundary.
@@ -797,8 +797,7 @@ async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def health(reader,writer):
     try:
-        raw=await reader.read(65536)
-        head,_,body=raw.partition(b"\r\n\r\n")
+        raw=await reader.read(65536)        head,_,body=raw.partition(b"\r\n\r\n")
         first=head.split(b"\r\n",1)[0].decode("latin1","ignore")
         parts=first.split(" ")
         path=parts[1] if len(parts)>1 else "/"
