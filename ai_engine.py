@@ -78,7 +78,11 @@ def build_ai_request(snapshot: MarketSnapshot) -> dict[str, Any]:
         "market": {
             "price": snapshot.price,
             "timestamp": snapshot.timestamp,
-            "candles": snapshot.candles,
+            "candles": [
+                {"t": c.get("t"), "open": c.get("open"), "high": c.get("high"), "low": c.get("low"), "close": c.get("close")}
+                for c in snapshot.candles[-20:]
+                if isinstance(c, dict)
+            ],
         },
         "required_output": {
             "direction": "UP or DOWN",
