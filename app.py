@@ -142,7 +142,7 @@ async def telegram(text, chat_id=None):
         return False
     try:
         async with httpx.AsyncClient(timeout=8) as h:
-            r=await h.post(f"https://api.telegram.org/bot{token}/sendMessage",json={"chat_id":chat,"text":text})
+            r=await h.post(f"https://api.telegram.org/bot{token}/sendMessage",json={"chat_id":chat,"text":text,"parse_mode":"HTML"})
             if r.status_code >= 400:
                 try: detail=r.json()
                 except Exception: detail={"description":r.text[:200]}
@@ -512,14 +512,20 @@ async def cycle_loop():
             strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence
         )
         key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
-        msg=(f"━━━━━━━━━━━━━━━━━━━━\\n🎯 CANDICE AI • LIVE MARKET\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
-             f"📊 ASSET: {s.display_name}\\n➡️ DIRECTION: {s.direction}\\n\\n"
-             f"🕒 SIGNAL: {time.strftime('%H:%M:%S',time.localtime(ts))} UAE\\n"
-             f"🎯 TARGET: {time.strftime('%H:%M:%S',time.localtime(target))} UAE\\n"
-             f"⏳ SIGNAL COUNTDOWN: 00:30\\n\\n⏱️ EXPIRY: {s.expiry_minutes} MIN\\n"
-             f"💰 ENTRY: {s.entry_price}\\n\\n📈 15M TREND: {s.trend_15m}\\n"
-             f"🕯️ 1M STRUCTURE: {s.structure_1m}\\n🧠 STRATEGY: {s.strategy}\\n"
-             f"🎯 CONFIDENCE: {s.confidence}%\\n🟢 ACCOUNT: DEMO\\n\\n🧠 {s.reason}\\n━━━━━━━━━━━━━━━━━━━━")
+        msg=(f"🚨 CANDICE AI SIGNAL\\n\\n"
+             f"👋 Market setup detected!\\n\\n"
+             f"📊 {s.display_name}\\n\\n"
+             f"<b>{'🔻 DOWN' if s.direction.upper() == 'DOWN' else '🟢 UP'}</b>\\n"
+             f"<b>⏱️ {s.expiry_minutes} MIN EXPIRY</b>\\n\\n"
+             f"🕒 {time.strftime('%H:%M:%S',time.localtime(ts))} UAE\\n"
+             f"🎯 Entry → {time.strftime('%H:%M:%S',time.localtime(target))}\\n\\n"
+             f"💰 {s.entry_price}\\n"
+             f"🎯 Confidence → {s.confidence}%\\n\\n"
+             f"📈 Trend → {s.trend_15m}\\n"
+             f"🕯️ Structure → {s.structure_1m}\\n"
+             f"🧠 Strategy → {s.strategy}\\n\\n"
+             f"🟢 DEMO • READ ONLY\\n"
+             f"🤖 CANDICE BRAIN")
         log.info(
             "FINAL_SIGNAL cycle=%s pair=%s direction=%s confidence=%s price_source=%s "
             "signal_utc=%s target_utc=%s lead_seconds=%.3f",
