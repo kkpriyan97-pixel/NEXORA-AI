@@ -129,6 +129,15 @@ async def telegram(text, chat_id=None):
     except Exception as e:
         log.warning("TELEGRAM_SEND_FAILED type=%s message=%s",type(e).__name__,str(e)[:200]);return False
 
+async def telegram_background(text_msg,label):
+    try:
+        sent=await asyncio.wait_for(telegram(text_msg),timeout=5.0)
+        log.info("TELEGRAM_SIGNAL_DELIVERY label=%s sent=%s",label,sent)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("TELEGRAM_SIGNAL_DELIVERY_FAILED label=%s type=%s message=%s",label,type(e).__name__,str(e)[:160])
+
 async def on_tick(message):
     for t in message.get("d",[]) or []:
         if not isinstance(t,dict):continue
@@ -268,7 +277,7 @@ async def result_watch(key):
     log.info("RESULT pair=%s result=%s exit=%s cooldown=%s",rec["pair"],rec["result"],rec["exit_price"],rec["result"]=="LOSS")
 
 async def cycle_loop():
-    # Exactly one decision cycle at a time. The final 40 seconds are a live
+    # Exactly one decision cycle at a time. The final 30 seconds are a live
     # evaluation window; the entry is captured only at the exact 5-minute boundary.
     last_target=0
     while True:
@@ -292,10 +301,15 @@ async def cycle_loop():
                 log.warning("CYCLE_FINAL_EVALUATION_TIMEOUT cycle=%s remaining=%.2f",
                             target//300,max(0,target-time.time()))
             await asyncio.sleep(min(2,max(0,target-time.time())))
-        # Exact target: refresh price/candles once more, then use fresh tick price.
-        await refresh_candles()
+        # Exact target: keep the last completed decision and capture the live tick price.
+        last_candidate=candidate
         try:
-            last_candidate=candidate
+            await asyncio.wait_for(refresh_candles(),timeout=1.0)
+        except asyncio.TimeoutError:
+            log.warning("CYCLE_TARGET_CANDLE_REFRESH_TIMEOUT cycle=%s",target//300)
+        except Exception as e:
+            log.warning("CYCLE_TARGET_CANDLE_REFRESH_FAILED cycle=%s type=%s message=%s",target//300,type(e).__name__,str(e)[:120])
+        try:
             boundary_candidate=await asyncio.wait_for(final_candidate(use_cached_only=True),timeout=0.8)
             if boundary_candidate is not None:
                 candidate=boundary_candidate
@@ -304,11 +318,19 @@ async def cycle_loop():
         except asyncio.TimeoutError:
             log.warning("CYCLE_TARGET_FINAL_CHECK_TIMEOUT cycle=%s",target//300)
             candidate=last_candidate
+        except Exception as e:
+            log.exception("CYCLE_TARGET_FINAL_CHECK_FAILED cycle=%s type=%s message=%s",target//300,type(e).__name__,str(e)[:160])
+            candidate=last_candidate
         if candidate and BRAIN.can_send_cycle_signal():
-            p=candidate["pair"]; entry=STATE["prices"].get(p,(None,None))[0]
-            if entry is not None:
+            try:
+                p=candidate["pair"]; entry=STATE["prices"].get(p,(None,None))[0]
+                if entry is None:
+                    raise RuntimeError(f"Live entry price unavailable for {p}")
+                confidence=int(candidate.get("confidence") or 0)
+                if confidence < 90:
+                    raise ValueError(f"Final candidate confidence below threshold: {confidence}")
                 ts=target
-                s=BRAIN.mark_signal_sent(pair=p,display_name=candidate["display_name"],direction=candidate["direction"],expiry_minutes=candidate["expiry_minutes"],entry_price=entry,entry_ts=ts,entry_candle_ts=candidate["entry_candle_ts"],strategy=candidate["strategy"],reason=candidate["reason"],confidence=candidate["confidence"])
+                s=BRAIN.mark_signal_sent(pair=p,display_name=candidate["display_name"],direction=candidate["direction"],expiry_minutes=candidate["expiry_minutes"],entry_price=entry,entry_ts=ts,entry_candle_ts=candidate["entry_candle_ts"],strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence)
                 key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
                 msg=(f"━━━━━━━━━━━━━━━━━━━━\\n🎯 CANDICE AI • LIVE MARKET\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
                      f"📊 ASSET: {s.display_name} ({s.pair})\\n➡️ DIRECTION: {s.direction}\\n\\n"
@@ -318,8 +340,11 @@ async def cycle_loop():
                      f"💰 ENTRY: {s.entry_price}\\n\\n📈 15M TREND: {s.trend_15m}\\n"
                      f"🕯️ 1M STRUCTURE: {s.structure_1m}\\n🧠 STRATEGY: {s.strategy}\\n"
                      f"🎯 CONFIDENCE: {s.confidence}%\\n🟢 ACCOUNT: DEMO\\n\\n🧠 {s.reason}\\n━━━━━━━━━━━━━━━━━━━━")
-                await telegram(msg); asyncio.create_task(result_watch(key))
-                log.info("FINAL_SIGNAL cycle=%s pair=%s direction=%s confidence=%s",target//300,p,s.direction,s.confidence)
+                log.info("FINAL_SIGNAL cycle=%s pair=%s direction=%s confidence=%s",target//300,s.pair,s.direction,s.confidence)
+                asyncio.create_task(telegram_background(msg,f"{s.cycle_id}:{s.pair}:{s.entry_ts}"))
+                asyncio.create_task(result_watch(key))
+            except Exception as e:
+                log.exception("FINAL_SIGNAL_BUILD_FAILED cycle=%s type=%s message=%s",target//300,type(e).__name__,str(e)[:160])
         else:
             log.info("NO_VALID_FINAL_SETUP cycle=%s",target//300)
         await asyncio.sleep(0.5)
