@@ -202,9 +202,17 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
     # AI reviews the strongest technical candidates in parallel. Sequential reviews
     # consumed the final 40-second window (3-4 seconds per provider call), so one
     # candidate could reach the target while the remaining reviews were still running.
-    # Review a wider qualified pool in parallel so a missing/stale live price on
-    # the strongest asset does not consume the 30-second signal window.
-    top=raw[:9]
+    # When a live price is required, prioritize only currently fresh-tick
+    # candidates before spending the final 30-second window on AI review.
+    # This guarantees that a stale top-ranked asset cannot block the next
+    # qualified asset that has a usable live price.
+    if require_live_price:
+        live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),5.0)]
+        if not live_raw:
+            return None
+        top=live_raw[:20]
+    else:
+        top=raw[:20]
     now=time.time()
     reviewed=[]
 
@@ -327,7 +335,8 @@ async def cycle_loop():
             if boundary_candidate is not None:
                 candidate=boundary_candidate
             else:
-                candidate=last_candidate
+                # Never carry a stale candidate across the exact boundary.
+                candidate=None
         except asyncio.TimeoutError:
             log.warning("CYCLE_TARGET_FINAL_CHECK_TIMEOUT cycle=%s",target//300)
             candidate=None
@@ -342,14 +351,14 @@ async def cycle_loop():
                 confidence=int(candidate.get("confidence") or 0)
                 if confidence < 90:
                     raise ValueError(f"Final candidate confidence below threshold: {confidence}")
-                ts=target
-                s=BRAIN.mark_signal_sent(pair=p,display_name=candidate["display_name"],direction=candidate["direction"],expiry_minutes=candidate["expiry_minutes"],entry_price=entry,entry_ts=ts,entry_candle_ts=candidate["entry_candle_ts"],strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence)
+                ts=target-30
+                s=BRAIN.mark_signal_sent(pair=p,display_name=candidate["display_name"],direction=candidate["direction"],expiry_minutes=candidate["expiry_minutes"],entry_price=entry,entry_ts=target,entry_candle_ts=candidate["entry_candle_ts"],strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence)
                 key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
                 msg=(f"━━━━━━━━━━━━━━━━━━━━\\n🎯 CANDICE AI • LIVE MARKET\\n━━━━━━━━━━━━━━━━━━━━\\n\\n"
                      f"📊 ASSET: {s.display_name} ({s.pair})\\n➡️ DIRECTION: {s.direction}\\n\\n"
                      f"🕒 SIGNAL: {time.strftime('%H:%M:%S',time.localtime(ts))} UAE\\n"
                      f"🎯 TARGET: {time.strftime('%H:%M:%S',time.localtime(target))} UAE\\n"
-                     f"⏳ SIGNAL COUNTDOWN: 00:00\\n\\n⏱️ EXPIRY: {s.expiry_minutes} MIN\\n"
+                     f"⏳ SIGNAL COUNTDOWN: 00:30\\n\\n⏱️ EXPIRY: {s.expiry_minutes} MIN\\n"
                      f"💰 ENTRY: {s.entry_price}\\n\\n📈 15M TREND: {s.trend_15m}\\n"
                      f"🕯️ 1M STRUCTURE: {s.structure_1m}\\n🧠 STRATEGY: {s.strategy}\\n"
                      f"🎯 CONFIDENCE: {s.confidence}%\\n🟢 ACCOUNT: DEMO\\n\\n🧠 {s.reason}\\n━━━━━━━━━━━━━━━━━━━━")
