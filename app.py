@@ -300,11 +300,38 @@ async def ensure_candidate_quotes(pairs):
         log.info("QUOTE_SNAPSHOT_REFRESH requested=%d received=%d",len(unique),fetched)
     return fetched
 
-async def refresh_candles(force=False):
+async def _candle_epoch(c):
+    """Return candle timestamp in epoch seconds, accepting seconds or milliseconds."""
+    try:
+        v=float(c.get("time",c.get("t")))
+        if v>10000000000: v/=1000.0
+        return v
+    except Exception:
+        return None
+
+def _closed_candles(candles,reference_ts=None):
+    """Keep only completed 1-minute candles; never analyze the live candle."""
+    boundary=(int(time.time() if reference_ts is None else reference_ts)//60)*60
+    out=[]
+    for c in candles or []:
+        ts=_candle_epoch(c)
+        if ts is not None and ts < boundary:
+            out.append(c)
+    return out
+
+def _candle_data_stale(pair,reference_ts=None):
+    now=time.time() if reference_ts is None else float(reference_ts)
+    closed=_closed_candles(STATE["candles"].get(pair,[]),now)
+    if not closed:
+        return True
+    ts=_candle_epoch(closed[-1])
+    return ts is None or (now-ts)>75.0
+
+def refresh_candles(force=False):
     client=CLIENT;assets=list(STATE["assets"])
     if not client:return
     now=time.time()
-    due=[a for a in assets if force or now-CANDLE_FETCH_LAST.get(a["pair"],0)>=CANDLE_FETCH_INTERVAL]
+    due=[a for a in assets if force or now-CANDLE_FETCH_LAST.get(a["pair"],0)>=CANDLE_FETCH_INTERVAL or _candle_data_stale(a["pair"],now)]
     async def one(a):
         p=a["pair"]
         if not a.get("signal_eligible",True):
@@ -335,13 +362,15 @@ async def refresh_candles(force=False):
         if not a.get("signal_eligible",True):
             continue
         p=a["pair"];price=STATE["prices"].get(p,(None,None))[0]
-        an=analyze_asset(a,STATE["candles"].get(p,[]),price)
+        closed=_closed_candles(STATE["candles"].get(p,[]),time.time())
+        an=analyze_asset(a,closed,price)
         if an:
             an["profitability"]=a["profitability"];STATE["analyses"][p]=an
         else:STATE["analyses"].pop(p,None)
-    log.info("LIVE_ANALYSIS_REFRESH assets=%d signal_eligible=%d fetched=%d qualified=%d",
+    stale_count=sum(1 for a in assets if a.get("signal_eligible",True) and _candle_data_stale(a["pair"],time.time()))
+    log.info("LIVE_ANALYSIS_REFRESH assets=%d signal_eligible=%d fetched=%d stale=%d qualified=%d",
              len(assets),sum(1 for a in assets if a.get("signal_eligible",True)),
-             len(due),len(STATE["analyses"]))
+             len(due),stale_count,len(STATE["analyses"]))
 
 def has_fresh_live_price(pair,reference_ts=None,max_age=LIVE_TICK_MAX_AGE):
     rec=STATE["prices"].get(pair)
@@ -404,7 +433,10 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
         asset=next((a for a in eligible if a["pair"]==x["pair"]),None)
         if not asset:
             return None
-        snap=snapshot_from_asset(asset,cs,price,now)
+        closed=_closed_candles(cs,now)
+        if len(closed)<45:
+            return None
+        snap=snapshot_from_asset(asset,closed,price,now)
         cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
         cached=AI_REVIEW_CACHE.get(cache_key)
         ttl=AI_REVIEW_TTL if cached and cached[1] else AI_REVIEW_FAIL_TTL
@@ -898,22 +930,3 @@ async def configure_telegram_webhook():
         log.warning("TELEGRAM_NOT_CONFIGURED"); return
     url=os.getenv("TELEGRAM_WEBHOOK_URL","https://priyanithan-zflv.onrender.com/telegram/webhook").strip()
     secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
-    try:
-        payload={"url":url}
-        if secret: payload["secret_token"]=secret
-        async with httpx.AsyncClient(timeout=10) as h:
-            await h.post(f"https://api.telegram.org/bot{token}/deleteWebhook",json={"drop_pending_updates":False})
-            r=await h.post(f"https://api.telegram.org/bot{token}/setWebhook",json=payload)
-            r.raise_for_status()
-            info=await h.get(f"https://api.telegram.org/bot{token}/getWebhookInfo")
-            try: data=info.json().get("result",{})
-            except Exception: data={}
-            log.info("TELEGRAM_WEBHOOK_READY url=%s pending=%s last_error=%s",data.get("url",""),data.get("pending_update_count",0),str(data.get("last_error_message",""))[:160])
-    except Exception as e:
-        log.warning("TELEGRAM_WEBHOOK_SETUP_FAILED %s",e)
-
-async def main():
-    port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
-    await configure_telegram_webhook()
-    await asyncio.gather(market_worker(),cycle_loop(),server.serve_forever())
-if __name__=="__main__":asyncio.run(main())
