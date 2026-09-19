@@ -25,6 +25,8 @@ STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{
 CANDLE_FETCH_SEM=asyncio.Semaphore(2)
 CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
+CANDLE_FETCH_RETRIES=3
+CANDLE_FETCH_RETRY_DELAY=0.25
 TICK_RESUB_SEM=asyncio.Semaphore(3)
 TICK_RESUB_TIMEOUT=1.5
 LIVE_TICK_MAX_AGE=5.0
@@ -330,36 +332,82 @@ async def refresh_candles(force=False):
     if not client:return
     now=time.time()
     due=[a for a in assets if force or now-CANDLE_FETCH_LAST.get(a["pair"],0)>=CANDLE_FETCH_INTERVAL or _candle_data_stale(a["pair"],now)]
+
     async def one(a):
         p=a["pair"]
         if not a.get("signal_eligible",True):return
         async with CANDLE_FETCH_SEM:
-            try:
-                await asyncio.sleep(0.35)
-                cs=await client.market.get_candles(p,size=60,count=60)
-                normalized=[]
-                if isinstance(cs,list):
-                    for item in cs:
-                        if isinstance(item,dict) and isinstance(item.get("candles"),list):normalized.extend(x for x in item["candles"] if isinstance(x,dict))
-                        elif isinstance(item,dict) and any(k in item for k in ("open","o","high","h","low","l","close","c")):normalized.append(item)
-                if normalized:
-                    try:normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
-                    except Exception:pass
-                    STATE["candles"][p]=normalized
-                CANDLE_FETCH_LAST[p]=time.time()
-            except Exception as e:
-                log.warning("CANDLE_REFRESH_THROTTLED_OR_FAILED pair=%s %s",p,e);CANDLE_FETCH_LAST[p]=time.time()
-    await asyncio.gather(*(one(a) for a in due))
+            last_reason="unknown"
+            for attempt in range(1,CANDLE_FETCH_RETRIES+1):
+                try:
+                    await asyncio.sleep(0.15 if attempt==1 else CANDLE_FETCH_RETRY_DELAY)
+                    cs=await asyncio.wait_for(
+                        client.market.get_candles(p,size=60,count=60),
+                        timeout=2.0
+                    )
+                    normalized=[]
+                    if isinstance(cs,list):
+                        for item in cs:
+                            if isinstance(item,dict) and isinstance(item.get("candles"),list):
+                                normalized.extend(x for x in item["candles"] if isinstance(x,dict))
+                            elif isinstance(item,dict) and any(k in item for k in ("open","o","high","h","low","l","close","c")):
+                                normalized.append(item)
+                    if normalized:
+                        try:normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
+                        except Exception:pass
+
+                        # Never replace a good live candle set with an older broker
+                        # response. The broker can occasionally return a cached
+                        # candle page even though the websocket session is live.
+                        reference=time.time()
+                        closed=_closed_candles(normalized,reference)
+                        newest=_candle_epoch(closed[-1]) if closed else None
+                        age=(reference-newest) if newest is not None else None
+                        if newest is not None and age is not None and 0 <= age <= 75.0 and len(closed)>=45:
+                            STATE["candles"][p]=normalized
+                            CANDLE_FETCH_LAST[p]=time.time()
+                            if attempt>1:
+                                log.info("CANDLE_REFRESH_RECOVERED pair=%s attempt=%d closed=%d newest_age=%.1f",
+                                         p,attempt,len(closed),age)
+                            return
+                        last_reason=f"stale_response closed={len(closed)} newest_age={age}"
+                    else:
+                        last_reason="empty_response"
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    last_reason=f"{type(e).__name__}:{str(e)[:100]}"
+                if attempt<CANDLE_FETCH_RETRIES:
+                    await asyncio.sleep(CANDLE_FETCH_RETRY_DELAY)
+
+            # Keep the previous good dataset instead of overwriting it with stale
+            # data. Mark the fetch due again so the next cycle retries promptly.
+            CANDLE_FETCH_LAST[p]=0.0
+            log.warning("CANDLE_REFRESH_REJECTED pair=%s attempts=%d reason=%s",
+                        p,CANDLE_FETCH_RETRIES,last_reason)
+
+    await asyncio.gather(*(one(a) for a in due),return_exceptions=True)
+
+    reference=time.time()
     for a in assets:
         if not a.get("signal_eligible",True):continue
-        p=a["pair"];price=STATE["prices"].get(p,(None,None))[0]
-        closed=_closed_candles(STATE["candles"].get(p,[]),time.time())
+        p=a["pair"]
+        price=STATE["prices"].get(p,(None,None))[0]
+        closed=_closed_candles(STATE["candles"].get(p,[]),reference)
         an=analyze_asset(a,closed,price)
-        if an:an["profitability"]=a["profitability"];STATE["analyses"][p]=an
-        else:STATE["analyses"].pop(p,None)
-    stale_count=sum(1 for a in assets if a.get("signal_eligible",True) and _candle_data_stale(a["pair"],time.time()))
+        if an:
+            an["profitability"]=a["profitability"]
+            STATE["analyses"][p]=an
+        else:
+            STATE["analyses"].pop(p,None)
+
+    stale_count=sum(
+        1 for a in assets
+        if a.get("signal_eligible",True) and _candle_data_stale(a["pair"],reference)
+    )
     log.info("LIVE_ANALYSIS_REFRESH assets=%d signal_eligible=%d fetched=%d stale=%d qualified=%d",
-             len(assets),sum(1 for a in assets if a.get("signal_eligible",True)),len(due),stale_count,len(STATE["analyses"]))
+             len(assets),sum(1 for a in assets if a.get("signal_eligible",True)),
+             len(due),stale_count,len(STATE["analyses"]))
 
 def has_fresh_live_price(pair,reference_ts=None,max_age=LIVE_TICK_MAX_AGE):
     rec=STATE["prices"].get(pair)
@@ -384,10 +432,18 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
         a for a in BRAIN.filter_candidates(STATE["assets"])
         if a.get("signal_eligible",True)
     ]
-    raw=[STATE["analyses"][a["pair"]].copy() for a in eligible if a["pair"] in STATE["analyses"]]
-    raw=[BRAIN.adaptive_candidate(x) for x in raw]
-    raw=rank_signal_candidates(raw)
-    if not raw:return None
+    analyzed=[STATE["analyses"][a["pair"]].copy() for a in eligible if a["pair"] in STATE["analyses"]]
+    adapted=[BRAIN.adaptive_candidate(x) for x in analyzed]
+    raw=rank_signal_candidates(adapted)
+    if not raw:
+        if adapted:
+            top_debug=max(adapted,key=lambda x:(int(x.get("confidence") or 0),float(x.get("market_quality") or 0)))
+            log.info("CANDIDATE_GATE_REJECTED analyzed=%d top_pair=%s top_confidence=%s top_quality=%s strategy=%s",
+                     len(adapted),top_debug.get("pair"),top_debug.get("confidence"),
+                     top_debug.get("market_quality"),top_debug.get("strategy"))
+        else:
+            log.info("CANDIDATE_GATE_REJECTED analyzed=0 reason=no_closed_candle_setup")
+        return None
     # AI reviews the strongest technical candidates in parallel. Sequential reviews
     # consumed the final 40-second window (3-4 seconds per provider call), so one
     # candidate could reach the target while the remaining reviews were still running.
