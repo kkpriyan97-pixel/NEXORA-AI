@@ -29,6 +29,8 @@ class ActiveSignal:
     pattern:str=""
     trend_15m:str=""
     structure_1m:str=""
+    self_strategy:str=""
+    self_strategy_version:str=""
 
 @dataclass
 class BrainState:
@@ -97,7 +99,7 @@ class BrainState:
             entry_candle_ts=kw["entry_candle_ts"],strategy=str(kw.get("strategy","")),
             reason=str(kw.get("reason","")),confidence=int(kw.get("confidence",0)),
             pattern=str(kw.get("pattern","")),trend_15m=str(kw.get("trend_15m","")),
-            structure_1m=str(kw.get("structure_1m","")))
+            structure_1m=str(kw.get("structure_1m","")),self_strategy=str(kw.get("self_strategy","")),self_strategy_version=str(kw.get("self_strategy_version","")))
         self.active_signals[f"{s.cycle_id}:{s.pair}:{s.entry_ts}"]=s
         return s
 
@@ -155,7 +157,8 @@ class BrainState:
             "entry_price":s.entry_price,"exit_price":float(exit_price),
             "entry_ts":s.entry_ts,"result_ts":now,"strategy":s.strategy,
             "pattern":s.pattern,"trend_15m":s.trend_15m,
-            "structure_1m":s.structure_1m,"reason":s.reason,
+            "structure_1m":s.structure_1m,"self_strategy":s.self_strategy,
+            "self_strategy_version":s.self_strategy_version,"reason":s.reason,
             "confidence":s.confidence,"result":result
         }
         self.learn(rec)
