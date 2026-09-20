@@ -81,7 +81,7 @@ TICK_RESUB_TIMEOUT=1.5
 LIVE_TICK_MAX_AGE=5.0
 QUOTE_SNAPSHOT_MAX_AGE=6.0
 QUOTE_SNAPSHOT_REFRESH=3.5
-QUOTE_SNAPSHOT_SEM=asyncio.Semaphore(8)
+QUOTE_SNAPSHOT_SEM=asyncio.Semaphore(32)
 QUOTE_SNAPSHOT_LAST={}
 AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=90.0
@@ -297,17 +297,18 @@ async def scan_account_live_feed(batch_size=16):
     ACCOUNT_LIVE_SCAN_CURSOR=(start+batch_size)%len(pairs)
 
     now=time.time()
-    requested=[]
-    for pair in batch:
-        if not has_fresh_live_price(pair,now,LIVE_TICK_MAX_AGE):
-            requested.append(pair)
+    # Refresh the entire account universe on every live-feed pass. The previous
+    # freshness-gated request list refreshed only a rotating subset, so each asset
+    # could wait ~20s before its next snapshot while the freshness gate was 6s.
+    # That produced persistent missing coverage even though snapshot calls worked.
+    requested=list(batch)
 
     fetched=0
     async def one(pair):
         nonlocal fetched
         async with QUOTE_SNAPSHOT_SEM:
             try:
-                snap=await asyncio.wait_for(client.market.get_live_snapshot(pair),timeout=1.4)
+                snap=await asyncio.wait_for(client.market.get_live_snapshot(pair),timeout=1.2)
                 if not snap or snap.get("price") is None:
                     return
                 received=time.time()
@@ -1294,7 +1295,7 @@ async def main():
     await load_persistent_learning()
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
-    await asyncio.gather(market_worker(),account_live_feed_worker(),account_tick_subscription_worker(),cycle_loop(),server.serve_forever())
+    await asyncio.gather(market_worker(),account_live_feed_worker(),cycle_loop(),server.serve_forever())
 if __name__=="__main__":asyncio.run(main())
 
 
