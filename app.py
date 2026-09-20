@@ -297,8 +297,7 @@ def extract_identity_fields(value):
         if isinstance(v,dict):
             for k,val in v.items():
                 if k in keys:
-                    try:
-                        out[f"{path}.{k}"]=int(val)
+                    try:                        out[f"{path}.{k}"]=int(val)
                     except (TypeError,ValueError):
                         pass
                 if isinstance(val,(dict,list)):
@@ -598,7 +597,6 @@ async def pin_account_tick_pairs(pairs,ttl=12.0):
     until=time.time()+float(ttl)
     for p in targets:
         ACCOUNT_TICK_PINNED[p]=until
-
     current=set(ACCOUNT_TICK_SUBSCRIBED)
     for p in list(current):
         if p not in targets:
@@ -897,8 +895,7 @@ async def refresh_candles(force=False):
                         reference=time.time()
                         closed=_closed_candles(normalized,reference)
                         newest=_candle_epoch(closed[-1]) if closed else None
-                        closed_at=_candle_closed_at(closed[-1]) if closed else None
-                        age=(reference-closed_at) if closed_at is not None else None
+                        closed_at=_candle_closed_at(closed[-1]) if closed else None                        age=(reference-closed_at) if closed_at is not None else None
                         if newest is not None and age is not None and 0 <= age <= 75.0 and len(closed)>=45:
                             STATE["candles"][p]=normalized
                             CANDLE_FETCH_LAST[p]=time.time()
@@ -1197,7 +1194,6 @@ async def result_watch(key):
     expiry_price=None
     expiry_source=""
     client=CLIENT
-
     for attempt in range(1,5):
         try:
             if client:
@@ -1386,22 +1382,33 @@ async def cycle_loop():
         )
 
         candidate=None
-        # Refresh closed-candle analysis at most once per UTC minute. The previous
-        # loop refreshed all 28 assets every ~2s; stale broker responses then
-        # consumed the entire pre-signal window and the valid candidate never
-        # reached the exact 30s send point.
-        refreshed_minute=None
-        # Use the pre-signal window for analysis, but never let repeated candle
-        # fetches block the exact 30-second signal deadline.
-        while time.time() < signal_at-0.75:
-            current_minute=int(time.time())//60
-            if refreshed_minute != current_minute:
-                try:
-                    await refresh_candles()
-                    refreshed_minute=current_minute
-                except Exception as e:
-                    log.warning("CYCLE_CANDLE_REFRESH_FAILED cycle=%s type=%s message=%s",
-                                cycle_id,type(e).__name__,str(e)[:160])
+        # Three full-account scans are intentional: the account has many assets,
+        # and one snapshot can miss a setup that forms a few seconds later.
+        # Scan 1 = 75s before entry, Scan 2 = 50s, Scan 3 = 32s.
+        # Each pass forces a fresh closed-candle refresh across the entire
+        # authenticated account asset universe before ranking candidates.
+        scan_plan=(
+            ("SCAN_1",target-75.0),
+            ("SCAN_2",target-50.0),
+            ("SCAN_3",target-32.0),
+        )
+        for scan_name,scan_at in scan_plan:
+            await asyncio.sleep(max(0,scan_at-time.time()))
+            if time.time() >= signal_at:
+                break
+            try:
+                await refresh_candles(force=True)
+                log.info(
+                    "ACCOUNT_FULL_SCAN cycle=%s scan=%s assets=%d analyzed=%d seconds_to_signal=%.2f",
+                    cycle_id,scan_name,len(STATE["assets"]),len(STATE["analyses"]),
+                    max(0,signal_at-time.time())
+                )
+            except Exception as e:
+                log.warning(
+                    "ACCOUNT_FULL_SCAN_FAILED cycle=%s scan=%s type=%s message=%s",
+                    cycle_id,scan_name,type(e).__name__,str(e)[:160]
+                )
+
             remaining=max(0,signal_at-time.time())
             if remaining <= 0.75:
                 break
@@ -1412,26 +1419,45 @@ async def cycle_loop():
                 )
                 if new_candidate is not None:
                     candidate=new_candidate
+                    log.info(
+                        "SCAN_CANDIDATE_SELECTED cycle=%s scan=%s pair=%s confidence=%s strategy=%s expiry=%s",
+                        cycle_id,scan_name,new_candidate.get("pair"),
+                        new_candidate.get("confidence"),new_candidate.get("strategy"),
+                        new_candidate.get("expiry_minutes")
+                    )
+                else:
+                    log.info(
+                        "SCAN_COMPLETE cycle=%s scan=%s candidate=none analyzed=%d",
+                        cycle_id,scan_name,len(STATE["analyses"])
+                    )
             except asyncio.TimeoutError:
-                log.warning("CYCLE_PRE_SIGNAL_EVALUATION_TIMEOUT cycle=%s remaining=%.2f",
-                            cycle_id,max(0,signal_at-time.time()))
-            await asyncio.sleep(min(2.0,max(0,signal_at-time.time())))
+                log.warning(
+                    "SCAN_EVALUATION_TIMEOUT cycle=%s scan=%s remaining=%.2f",
+                    cycle_id,scan_name,max(0,signal_at-time.time())
+                )
 
-        # final_candidate(require_live_price=True) already checked the quote freshness.
-        # Avoid another blocking network request here so the exact 30-second deadline
-        # remains deterministic.
+        # Give the third scan's candidate the final live-price check without
+        # performing another full network/candle refresh at the exact deadline.
         await asyncio.sleep(max(0,signal_at-time.time()))
         sent=False
         if candidate and time.time() <= signal_at+0.20:
             try:
                 sent=await send_cycle_signal(candidate,target)
             except Exception as e:
-                log.exception("FINAL_SIGNAL_BUILD_FAILED cycle=%s type=%s message=%s",
-                              cycle_id,type(e).__name__,str(e)[:160])
+                log.exception(
+                    "FINAL_SIGNAL_BUILD_FAILED cycle=%s type=%s message=%s",
+                    cycle_id,type(e).__name__,str(e)[:160]
+                )
 
         if not sent:
-            log.info("NO_VALID_FINAL_SETUP cycle=%s reason=no_candidate_ready_30s_before_entry",
-                     cycle_id)
+            # This is an internal diagnostic only. It is never sent as a member
+            # notification. We keep the strict evidence gate rather than inventing
+            # a direction or fake confidence when all three account scans fail
+            # to produce a valid live setup.
+            log.info(
+                "THREE_SCAN_NO_QUALIFIED_SETUP cycle=%s scans=3 analyzed=%d",
+                cycle_id,len(STATE["analyses"])
+            )
 
         # Keep the loop aligned to the next 5-minute boundary. Result tracking
         # uses the stored exact entry timestamp, so no extra boundary evaluation
@@ -1497,8 +1523,7 @@ async def market_worker():
         try:
             STATE["status"]="connecting"
             # Network geolocation is diagnostic only and can be rate-limited;
-            # it must never block authenticated market connectivity.
-            await client.start()
+            # it must never block authenticated market connectivity.            await client.start()
             STATE["status"]="connected"
             await client.initialize_session()
 
@@ -1741,5 +1766,4 @@ async def main():
     await configure_telegram_webhook()
     await asyncio.gather(market_worker(),account_tick_subscription_worker(),account_live_feed_worker(),cycle_loop(),server.serve_forever())
 if __name__=="__main__":asyncio.run(main())
-
 
