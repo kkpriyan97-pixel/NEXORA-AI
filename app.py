@@ -79,6 +79,10 @@ CANDLE_GOOD_ONCE=set()
 TICK_RESUB_SEM=asyncio.Semaphore(3)
 TICK_RESUB_TIMEOUT=1.5
 LIVE_TICK_MAX_AGE=5.0
+# Rolling coverage window for the account-wide rotating live feed. The broker
+# only exposes a small number of simultaneous tick subscriptions, so an asset
+# can be live-covered without having a fresh tick at every one-second audit.
+LIVE_TICK_COVERAGE_MAX_AGE=60.0
 QUOTE_SNAPSHOT_MAX_AGE=6.0
 QUOTE_SNAPSHOT_REFRESH=3.5
 QUOTE_SNAPSHOT_SEM=asyncio.Semaphore(32)
@@ -366,9 +370,12 @@ async def scan_account_live_feed():
     now=time.time()
     total=len(assets)
     fresh=sum(1 for a in assets if has_fresh_live_price(a["pair"],now,LIVE_TICK_MAX_AGE))
-    missing=total-fresh
-    log.info("ACCOUNT_LIVE_FEED_SCAN source=authenticated_websocket:event_1 assets=%d fresh_tick=%d missing=%d",
-             total,fresh,missing)
+    recent=sum(1 for a in assets if has_fresh_live_price(a["pair"],now,LIVE_TICK_COVERAGE_MAX_AGE))
+    missing=total-recent
+    log.info(
+        "ACCOUNT_LIVE_FEED_SCAN source=authenticated_websocket:event_1 assets=%d fresh_tick=%d recent_tick=%d recent_missing=%d",
+        total,fresh,recent,missing
+    )
 
 
 async def account_live_feed_worker():
@@ -461,7 +468,10 @@ async def ensure_account_tick_subscriptions():
     client=CLIENT
     if not client or not client.connection.is_connected:
         return
-    assets=[a for a in list(STATE["assets"]) if a.get("signal_eligible",True) and a.get("pair")]
+    # Live-feed coverage must include every account asset. Signal eligibility is
+    # a Brain decision-layer concern and must not remove an asset from the
+    # authenticated market-data rotation.
+    assets=[a for a in list(STATE["assets"]) if a.get("pair")]
     if not assets:
         return
 
@@ -610,9 +620,16 @@ async def ensure_candidate_quotes(pairs):
     if not client or not pairs:
         return 0
     await ensure_candidate_ticks(pairs)
-    await asyncio.sleep(0.20)
-    fresh=sum(1 for p in pairs if has_fresh_live_price(p,time.time(),LIVE_TICK_MAX_AGE))
-    log.info("LIVE_PRICE_EVENT1_REFRESH requested=%d fresh=%d",len(set(pairs)),fresh)
+    unique=list(dict.fromkeys(str(p) for p in pairs if p))
+    deadline=time.time()+2.0
+    fresh=0
+    while time.time()<deadline:
+        now=time.time()
+        fresh=sum(1 for p in unique if has_fresh_live_price(p,now,LIVE_TICK_MAX_AGE))
+        if fresh>=min(len(unique),ACCOUNT_TICK_MAX_SLOTS):
+            break
+        await asyncio.sleep(0.10)
+    log.info("LIVE_PRICE_EVENT1_REFRESH requested=%d fresh=%d",len(unique),fresh)
     return fresh
 
 
