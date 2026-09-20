@@ -559,7 +559,7 @@ def analyze_asset(asset, candles, price=None):
         f"EMA_gap={ema_gap_norm:.2f}ATR | EMA_slope={ema_slope_norm:.2f}ATR | "
         f"structure_q={structure_quality[expected]:.2f} | body={body_ratio:.2f} | "
         f"efficiency={_efficiency(v, 8):.2f} | pattern={pattern} | "
-        f"Donchian30={dc["state"]}/{("EXPANDING" if dc["expansion"] else "FLAT")} | "
+        f"Donchian30={dc['state']}/{('EXPANDING' if dc['expansion'] else 'FLAT')} | "
         f"Stoch14,3,3={stoch_k:.1f}/{stoch_d:.1f}/{stoch_cross} | "
         f"volatility={volatility_ratio:.2f} | support={support:.6g} | resistance={resistance:.6g}"
     )
