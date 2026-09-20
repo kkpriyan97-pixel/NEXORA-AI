@@ -787,7 +787,7 @@ async def cycle_loop():
              f"🤖 CANDICE BRAIN")
         log.info(
             "FINAL_SIGNAL cycle=%s pair=%s direction=%s strategy=%s confidence=%s price_source=%s "
-            "trend=%s structure=%s pattern=%s expiry=%s entry_candle=%s signal_utc=%s target_utc=%s lead_seconds=%.3f",
+            "trend=%s structure=%s pattern=%s self_strategy=%s self_version=%s expiry=%s entry_candle=%s signal_utc=%s target_utc=%s lead_seconds=%.3f",
             int(target//300),s.pair,s.direction,s.strategy or "UNKNOWN",s.confidence,
             STATE["price_source"].get(s.pair,"unknown"),
             s.trend_15m or "UNKNOWN",s.structure_1m or "UNKNOWN",s.pattern or "UNKNOWN",
@@ -1065,3 +1065,5 @@ async def main():
     await configure_telegram_webhook()
     await asyncio.gather(market_worker(),cycle_loop(),server.serve_forever())
 if __name__=="__main__":asyncio.run(main())
+
+
