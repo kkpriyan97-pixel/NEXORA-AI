@@ -683,6 +683,19 @@ def live_price_age(pair,reference_ts=None):
 
 async def final_candidate(use_cached_only=False,require_live_price=False):
     BRAIN.prune_expired_cooldowns()
+
+    # Hard account boundary: Brain may select/analyze an asset only after the
+    # authenticated OlympTrade account-scoped asset feed is ready.
+    if not CLIENT or STATE.get("account_group") != "demo" or not STATE.get("account_id"):
+        log.info("BRAIN_ACCOUNT_GATE blocked=account_not_ready")
+        return None
+    if STATE.get("feed_source") not in {
+        "authenticated_websocket:event_182",
+        "authenticated_websocket:event_183",
+    }:
+        log.info("BRAIN_ACCOUNT_GATE blocked=non_account_feed source=%s",
+                 STATE.get("feed_source"))
+        return None
     eligible=[
         a for a in BRAIN.filter_candidates(STATE["assets"])
         if a.get("signal_eligible",True)
@@ -948,7 +961,7 @@ async def cycle_loop():
         # Keep this send path non-blocking so the 30s signal deadline is not
         # consumed by another network request.
         now=time.time()
-        if not has_fresh_live_price(p,now,QUOTE_SNAPSHOT_MAX_AGE):
+        if not has_fresh_live_price(p,now,LIVE_TICK_MAX_AGE):
             log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=quote_not_fresh",
                      int(target//300),p)
             return False
