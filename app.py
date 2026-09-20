@@ -60,6 +60,187 @@ async def save_persistent_learning():
         log.warning("LEARNING_STATE_SAVE_FAILED type=%s message=%s",type(e).__name__,str(e)[:180])
 BRAIN=BrainState()
 UAE_TZ=ZoneInfo("Asia/Dubai")
+AI_REVIEW_QUEUE_POLL_SECONDS=2.0
+AI_REVIEW_QUEUE_STALE_SECONDS=600.0
+AI_REVIEW_QUEUE_RETRY_DELAYS=(5,15,30,60,120,300)
+
+
+async def ensure_ai_review_queue_table():
+    if not LEARNING_DB_URL:
+        log.error("AI_REVIEW_QUEUE_DB_REQUIRED")
+        return False
+    try:
+        import psycopg
+        def init():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candice_ai_review_queue (
+                            review_id TEXT PRIMARY KEY,
+                            record JSONB NOT NULL,
+                            attempts INTEGER NOT NULL DEFAULT 0,
+                            status TEXT NOT NULL DEFAULT 'PENDING',
+                            next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            last_error TEXT,
+                            last_provider TEXT,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            completed_at TIMESTAMPTZ
+                        )
+                    """)
+                    cur.execute("""
+                        UPDATE candice_ai_review_queue
+                        SET status='PENDING',next_attempt_at=NOW(),updated_at=NOW()
+                        WHERE status='PROCESSING'
+                          AND updated_at < NOW() - INTERVAL '10 minutes'
+                    """)
+                db.commit()
+        await asyncio.to_thread(init)
+        log.info("AI_REVIEW_QUEUE_READY")
+        return True
+    except Exception as e:
+        log.error("AI_REVIEW_QUEUE_INIT_FAILED type=%s message=%s",
+                  type(e).__name__,str(e)[:180])
+        return False
+
+async def enqueue_ai_review(review_id,rec):
+    if not LEARNING_DB_URL:
+        log.error("AI_REVIEW_QUEUE_ENQUEUE_FAILED review_id=%s reason=db_not_configured",review_id)
+        return False
+    try:
+        import psycopg
+        payload=json.dumps(rec,separators=(",",":"),ensure_ascii=False)
+        def put():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO candice_ai_review_queue(review_id,record)
+                        VALUES(%s,%s::jsonb)
+                        ON CONFLICT(review_id) DO NOTHING
+                    """,(review_id,payload))
+                db.commit()
+        await asyncio.to_thread(put)
+        log.info("AI_REVIEW_ENQUEUED review_id=%s pair=%s result=%s",
+                 review_id,rec.get("pair"),rec.get("result"))
+        return True
+    except Exception as e:
+        log.error("AI_REVIEW_QUEUE_ENQUEUE_FAILED review_id=%s type=%s message=%s",
+                  review_id,type(e).__name__,str(e)[:180])
+        return False
+
+async def claim_ai_review():
+    if not LEARNING_DB_URL:
+        return None
+    try:
+        import psycopg
+        def claim():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        SELECT review_id,record,attempts
+                        FROM candice_ai_review_queue
+                        WHERE status='PENDING' AND next_attempt_at <= NOW()
+                        ORDER BY created_at
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    """)
+                    row=cur.fetchone()
+                    if not row:
+                        db.commit()
+                        return None
+                    review_id,record,attempts=row
+                    next_attempt=int(attempts or 0)+1
+                    cur.execute("""
+                        UPDATE candice_ai_review_queue
+                        SET status='PROCESSING',attempts=%s,updated_at=NOW()
+                        WHERE review_id=%s
+                    """,(next_attempt,review_id))
+                db.commit()
+                return str(review_id),record,next_attempt
+        return await asyncio.to_thread(claim)
+    except Exception as e:
+        log.warning("AI_REVIEW_QUEUE_CLAIM_FAILED type=%s message=%s",
+                    type(e).__name__,str(e)[:160])
+        return None
+
+async def complete_ai_review(review_id,provider):
+    if not LEARNING_DB_URL: return False
+    try:
+        import psycopg
+        def done():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        UPDATE candice_ai_review_queue
+                        SET status='COMPLETED',last_provider=%s,
+                            completed_at=NOW(),updated_at=NOW()
+                        WHERE review_id=%s
+                    """,(provider,review_id))
+                db.commit()
+        await asyncio.to_thread(done)
+        return True
+    except Exception as e:
+        log.warning("AI_REVIEW_QUEUE_COMPLETE_FAILED review_id=%s type=%s message=%s",
+                    review_id,type(e).__name__,str(e)[:160])
+        return False
+
+async def retry_ai_review(review_id,attempts,error):
+    if not LEARNING_DB_URL: return False
+    delay=AI_REVIEW_QUEUE_RETRY_DELAYS[
+        min(max(int(attempts)-1,0),len(AI_REVIEW_QUEUE_RETRY_DELAYS)-1)
+    ]
+    next_at=datetime.now(timezone.utc)+timedelta(seconds=delay)
+    try:
+        import psycopg
+        def retry():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        UPDATE candice_ai_review_queue
+                        SET status='PENDING',next_attempt_at=%s,last_error=%s,updated_at=NOW()
+                        WHERE review_id=%s
+                    """,(next_at,str(error)[:500],review_id))
+                db.commit()
+        await asyncio.to_thread(retry)
+        return True
+    except Exception as e:
+        log.warning("AI_REVIEW_QUEUE_RETRY_SAVE_FAILED review_id=%s type=%s message=%s",
+                    review_id,type(e).__name__,str(e)[:160])
+        return False
+
+async def ai_review_worker():
+    while True:
+        try:
+            item=await claim_ai_review()
+            if not item:
+                await asyncio.sleep(AI_REVIEW_QUEUE_POLL_SECONDS)
+                continue
+            review_id,rec,attempts=item
+            log.info("AI_REVIEW_WORKER_STARTED review_id=%s attempt=%s pair=%s",
+                     review_id,attempts,rec.get("pair"))
+            try:
+                review=await review_result_with_fallback(rec)
+                review["review_id"]=review_id
+                BRAIN.apply_ai_review(rec,review)
+                await save_persistent_learning()
+                if not await complete_ai_review(review_id,review.get("provider","external")):
+                    raise RuntimeError("queue completion update failed")
+                log.info("AI_REVIEW_WORKER_COMPLETED review_id=%s pair=%s result=%s provider=%s attempt=%s",
+                         review_id,rec.get("pair"),rec.get("result"),
+                         review.get("provider","external"),attempts)
+            except Exception as e:
+                saved=await retry_ai_review(review_id,attempts,e)
+                delay=AI_REVIEW_QUEUE_RETRY_DELAYS[
+                    min(max(int(attempts)-1,0),len(AI_REVIEW_QUEUE_RETRY_DELAYS)-1)
+                ]
+                log.warning("AI_REVIEW_WORKER_RETRY review_id=%s pair=%s attempt=%s saved=%s error=%s next_retry_seconds=%s",
+                            review_id,rec.get("pair"),attempts,saved,str(e)[:180],delay)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("AI_REVIEW_WORKER_ERROR type=%s message=%s",
+                          type(e).__name__,str(e)[:180])
+            await asyncio.sleep(AI_REVIEW_QUEUE_POLL_SECONDS)
 
 # Secure member access: one admin-generated code grants all MB* IDs for 24h.
 ACCESS_TTL=timedelta(hours=24)
@@ -1312,49 +1493,10 @@ async def result_watch(key):
 
     rec=BRAIN.finish_signal(key,expiry_price)
 
-    # Mandatory post-result learning pass. This runs after every completed
-    # signal, before the learning state is persisted, so the next cycle can
-    # reuse the lesson at the same asset/context. If the external AI provider
-    # is unavailable, a deterministic evidence-only audit still records the
-    # key contradiction/confirmation.
-    post_review=None
-    try:
-        post_review=await asyncio.wait_for(review_result_with_fallback(rec),timeout=4.0)
-    except Exception as e:
-        log.warning("AI_POST_RESULT_REVIEW_TIMEOUT_OR_ERROR pair=%s type=%s message=%s",
-                    rec["pair"],type(e).__name__,str(e)[:140])
-
-    if not post_review:
-        ind=dict(rec.get("indicator_context") or {})
-        conflicts=[]
-        trend=str(rec.get("trend_15m") or "").upper()
-        direction=str(rec.get("direction") or "").upper()
-        bb=str(ind.get("bollinger_signal") or "").upper()
-        if trend in {"UP","DOWN"} and direction!=trend:
-            conflicts.append("signal direction disagreed with 15m trend")
-        if bb in {"UP","DOWN"} and direction!=bb:
-            conflicts.append("signal direction disagreed with Bollinger 30,2.2")
-        if rec["result"]=="LOSS" and conflicts:
-            lesson=" | ".join(conflicts)
-            post_review={"lesson":lesson,
-                         "reuse":"Re-check the conflicting evidence before accepting the same setup again.",
-                         "evidence":lesson,"provider":"deterministic-fallback"}
-        elif rec["result"]=="LOSS":
-            post_review={"lesson":"Completed setup ended in LOSS; preserve the exact context for future comparison.",
-                         "reuse":"Require stronger confirmation before reusing the same context.",
-                         "evidence":"No single stored contradiction was available.",
-                         "provider":"deterministic-fallback"}
-        else:
-            post_review={"lesson":"Completed outcome recorded as evidence for this exact market context.",
-                         "reuse":"Compare the same context against future outcomes before increasing its influence.",
-                         "evidence":"Outcome and stored indicators were captured.",
-                         "provider":"deterministic-fallback"}
-
-    BRAIN.apply_ai_review(rec,post_review)
-    log.info("POST_RESULT_AI_LESSON pair=%s result=%s provider=%s lesson=%s reuse=%s",
-             rec["pair"],rec["result"],post_review.get("provider","internal"),
-             str(post_review.get("lesson") or "")[:220],
-             str(post_review.get("reuse") or "")[:180])
+    # Result classification is complete. Never block result delivery on an external
+    # AI provider; enqueue the full evidence for durable History-AI processing.
+    review_id=f"{rec['cycle_id']}:{rec['pair']}:{rec['entry_ts']}"
+    await enqueue_ai_review(review_id,rec)
     await save_persistent_learning()
     batch_summary=BRAIN.consume_batch_summary()
     if batch_summary:
@@ -1931,8 +2073,9 @@ async def configure_telegram_webhook():
 
 async def main():
     await load_persistent_learning()
+    await ensure_ai_review_queue_table()
     await ensure_access_table()
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
-    await asyncio.gather(market_worker(),account_tick_subscription_worker(),account_live_feed_worker(),cycle_loop(),server.serve_forever())
+    await asyncio.gather(market_worker(),account_tick_subscription_worker(),account_live_feed_worker(),cycle_loop(),ai_review_worker(),server.serve_forever())
 if __name__=="__main__":asyncio.run(main())
