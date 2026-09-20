@@ -246,6 +246,34 @@ class BrainState:
             x["expiry_minutes"]=self.choose_expiry(pair,strategy,direction,float(x.get("market_quality") or 0))
         return x
 
+
+    def export_learning(self):
+        return {
+            "total_results": self.total_results,
+            "asset_stats": self.asset_stats,
+            "strategy_stats": self.strategy_stats,
+            "self_strategy_stats": self.self_strategy_stats,
+            "expiry_stats": {str(k): v for k, v in self.expiry_stats.items()},
+            "stats": {"|".join(map(str,k)): v for k,v in self.stats.items()},
+            "pattern_stats": self.pattern_stats,
+            "context_stats": self.context_stats,
+        }
+
+    def import_learning(self, data):
+        if not isinstance(data, dict): return
+        self.total_results=int(data.get("total_results",0) or 0)
+        self.asset_stats=dict(data.get("asset_stats") or {})
+        self.strategy_stats=dict(data.get("strategy_stats") or {})
+        self.self_strategy_stats=dict(data.get("self_strategy_stats") or {})
+        self.expiry_stats={int(k):v for k,v in (data.get("expiry_stats") or {}).items()}
+        rebuilt={}
+        for k,v in (data.get("stats") or {}).items():
+            parts=str(k).split("|",3)
+            if len(parts)==4: rebuilt[(parts[0],parts[1],parts[2],int(parts[3]))]=v
+        self.stats=rebuilt
+        self.pattern_stats=dict(data.get("pattern_stats") or {})
+        self.context_stats=dict(data.get("context_stats") or {})
+
     def prune_expired_cooldowns(self,now=None):
         now=utc_now() if now is None else now
         for p,u in list(self.cooldown_until.items()):
