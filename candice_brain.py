@@ -1,6 +1,7 @@
 """Candice Brain: evidence-first multi-strategy, multi-timeframe market analysis."""
 from __future__ import annotations
 from math import isfinite
+from self_strategy import discover as discover_self_strategy
 
 EXPIRIES=(1,2,3,4,5,10,15)
 
@@ -90,6 +91,15 @@ def analyze_asset(asset,candles,price=None):
         if strategy=="PRICE_ACTION" and ((direction=="UP" and body>0) or (direction=="DOWN" and body<0)):s+=8
         return round(min(100,s),2)
 
+    # Market-derived self-strategy discovery. This is an additive layer:
+    # the original evidence scoring remains intact; the discovered profile only
+    # boosts a strategy when the current closed-candle regime supports it.
+    self_profile=discover_self_strategy(
+        trend=trend,structure=s1,rsi_value=rr,momentum=momentum,atr_value=aa,
+        volatility_ratio=volatility_ratio,breakout_up=breakout_up,
+        breakout_down=breakout_down,near_support=near_support,
+        near_resistance=near_resistance,pattern=pattern
+    )
     candidates=[]
     specs=[
         ("TREND_FOLLOWING",5),("MOMENTUM",2),("PULLBACK",2),("BREAKOUT",1),
@@ -98,7 +108,11 @@ def analyze_asset(asset,candles,price=None):
     for strategy,default_expiry in specs:
         for direction in ("UP","DOWN"):
             sc=score(direction,strategy)
-            if sc>=45:candidates.append({"direction":direction,"strategy":strategy,"score":sc,"expiry_minutes":default_expiry})
+            if strategy==self_profile["strategy"]:
+                sc=min(100.0,sc+self_profile["strength"])
+            if sc>=45:
+                candidates.append({"direction":direction,"strategy":strategy,"score":round(sc,2),
+                                   "expiry_minutes":default_expiry,"self_strategy_version":self_profile["version"]})
 
     # Higher-timeframe conflict is a rejection, not an automatic opposite signal.
     valid=[x for x in candidates if not (trend=="UP" and x["direction"]=="DOWN")
@@ -117,7 +131,7 @@ def analyze_asset(asset,candles,price=None):
         "direction":best["direction"],"confidence":confidence,
         "strategy":best["strategy"],"expiry_minutes":best["expiry_minutes"],
         "pattern":pattern,"trend_15m":trend,"structure_1m":s1,
-        "market_quality":best["score"],"reason":reason,
+        "market_quality":best["score"],"reason":reason,\n        "self_strategy_version":best.get("self_strategy_version",""),
         "entry_candle_ts":last["time"],"price":p,
         "support":support,"resistance":resistance,"atr":aa,
         "momentum":momentum,"volatility_ratio":volatility_ratio,
