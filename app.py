@@ -10,7 +10,7 @@ from olymptrade_ws.olympconfig import parameters
 from brain_rules import BrainState,rank_signal_candidates
 from candice_brain import analyze_asset
 from ai_engine import snapshot_from_asset
-from ai_router import analyze_with_fallback
+from ai_router import analyze_with_fallback,review_result_with_fallback
 
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -1311,6 +1311,50 @@ async def result_watch(key):
         return
 
     rec=BRAIN.finish_signal(key,expiry_price)
+
+    # Mandatory post-result learning pass. This runs after every completed
+    # signal, before the learning state is persisted, so the next cycle can
+    # reuse the lesson at the same asset/context. If the external AI provider
+    # is unavailable, a deterministic evidence-only audit still records the
+    # key contradiction/confirmation.
+    post_review=None
+    try:
+        post_review=await asyncio.wait_for(review_result_with_fallback(rec),timeout=4.0)
+    except Exception as e:
+        log.warning("AI_POST_RESULT_REVIEW_TIMEOUT_OR_ERROR pair=%s type=%s message=%s",
+                    rec["pair"],type(e).__name__,str(e)[:140])
+
+    if not post_review:
+        ind=dict(rec.get("indicator_context") or {})
+        conflicts=[]
+        trend=str(rec.get("trend_15m") or "").upper()
+        direction=str(rec.get("direction") or "").upper()
+        bb=str(ind.get("bollinger_signal") or "").upper()
+        if trend in {"UP","DOWN"} and direction!=trend:
+            conflicts.append("signal direction disagreed with 15m trend")
+        if bb in {"UP","DOWN"} and direction!=bb:
+            conflicts.append("signal direction disagreed with Bollinger 30,2.2")
+        if rec["result"]=="LOSS" and conflicts:
+            lesson=" | ".join(conflicts)
+            post_review={"lesson":lesson,
+                         "reuse":"Re-check the conflicting evidence before accepting the same setup again.",
+                         "evidence":lesson,"provider":"deterministic-fallback"}
+        elif rec["result"]=="LOSS":
+            post_review={"lesson":"Completed setup ended in LOSS; preserve the exact context for future comparison.",
+                         "reuse":"Require stronger confirmation before reusing the same context.",
+                         "evidence":"No single stored contradiction was available.",
+                         "provider":"deterministic-fallback"}
+        else:
+            post_review={"lesson":"Completed outcome recorded as evidence for this exact market context.",
+                         "reuse":"Compare the same context against future outcomes before increasing its influence.",
+                         "evidence":"Outcome and stored indicators were captured.",
+                         "provider":"deterministic-fallback"}
+
+    BRAIN.apply_ai_review(rec,post_review)
+    log.info("POST_RESULT_AI_LESSON pair=%s result=%s provider=%s lesson=%s reuse=%s",
+             rec["pair"],rec["result"],post_review.get("provider","internal"),
+             str(post_review.get("lesson") or "")[:220],
+             str(post_review.get("reuse") or "")[:180])
     await save_persistent_learning()
     batch_summary=BRAIN.consume_batch_summary()
     if batch_summary:
