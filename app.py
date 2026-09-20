@@ -271,20 +271,28 @@ async def sync_account_assets(client, reason="periodic"):
     return True
 
 async def on_asset_update(message):
-    """Apply broker-pushed account asset changes (event 183) without rescanning a global catalog."""
+    """Apply event-183 updates only to assets already admitted by the account-scoped scan."""
     raw=message.get("d") if isinstance(message,dict) else None
     if not isinstance(raw,list) or not raw:
         return
-    assets=build_assets(CLIENT,raw)
-    if not assets:
+    incoming=build_assets(CLIENT,raw)
+    if not incoming:
         return
     current={a["pair"]:a for a in STATE["assets"]}
-    for a in assets:
-        current[a["pair"]]=a
+    updated=0
+    ignored=0
+    for a in incoming:
+        p=a["pair"]
+        if p in current:
+            current[p]=a
+            updated+=1
+        else:
+            # event 183 is an update stream, not an authority to widen the account universe.
+            ignored+=1
     STATE["assets"]=list(current.values())
     STATE["feed_source"]="authenticated_websocket:event_183"
-    log.info("ACCOUNT_ASSET_FEED_UPDATE source=authenticated_websocket:event_183 incoming=%d visible=%d",
-             len(assets),len(STATE["assets"]))
+    log.info("ACCOUNT_ASSET_FEED_UPDATE source=authenticated_websocket:event_183 updated=%d ignored_unknown=%d visible=%d",
+             updated,ignored,len(STATE["assets"]))
 
 
 async def scan_account_live_feed():
