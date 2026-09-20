@@ -98,6 +98,12 @@ AI_REVIEW_TIMEOUT=2.4
 ACCOUNT_LIVE_SCAN_BATCH=16
 ACCOUNT_LIVE_SCAN_INTERVAL=5.0
 ACCOUNT_LIVE_SCAN_CURSOR=0
+# Account-wide event-1 tick subscription manager. Subscriptions are read-only;
+# the worker only requests market quotes and never places/modifies trades.
+ACCOUNT_TICK_SUB_SEM=8
+ACCOUNT_TICK_SUB_RETRY=60.0
+ACCOUNT_TICK_SUBSCRIBED=set()
+ACCOUNT_TICK_LAST_ATTEMPT={}
 CLIENT=None
 LOCK=asyncio.Lock()
 
@@ -332,6 +338,60 @@ async def account_live_feed_worker():
             log.warning("ACCOUNT_LIVE_FEED_WORKER_ERROR type=%s message=%s",type(e).__name__,str(e)[:160])
         await asyncio.sleep(ACCOUNT_LIVE_SCAN_INTERVAL)
 
+async def ensure_account_tick_subscriptions():
+    """Subscribe each signal-eligible account asset to the authenticated event-1 quote stream."""
+    client=CLIENT
+    if not client or not client.connection.is_connected:
+        return
+    assets=[a for a in list(STATE["assets"]) if a.get("signal_eligible",True) and a.get("pair")]
+    now=time.time()
+    pairs=[]
+    for a in assets:
+        p=a["pair"]
+        if p in ACCOUNT_TICK_SUBSCRIBED:
+            continue
+        if now-ACCOUNT_TICK_LAST_ATTEMPT.get(p,0.0) < ACCOUNT_TICK_SUB_RETRY:
+            continue
+        ACCOUNT_TICK_LAST_ATTEMPT[p]=now
+        pairs.append(p)
+    if not pairs:
+        return
+
+    accepted=0
+    rejected=[]
+    async def one(pair):
+        nonlocal accepted
+        async with ACCOUNT_TICK_SUB_SEM:
+            try:
+                await asyncio.wait_for(client.market.subscribe_ticks(pair),timeout=6.0)
+                ACCOUNT_TICK_SUBSCRIBED.add(pair)
+                accepted+=1
+                log.info("ACCOUNT_TICK_SUBSCRIBE pair=%s status=accepted",pair)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                rejected.append((pair,type(e).__name__,str(e)[:120]))
+                log.warning("ACCOUNT_TICK_SUBSCRIBE pair=%s status=rejected type=%s message=%s",
+                            pair,type(e).__name__,str(e)[:120])
+
+    await asyncio.gather(*(one(p) for p in pairs),return_exceptions=True)
+    log.info("ACCOUNT_TICK_SUBSCRIBE_BATCH requested=%d accepted=%d rejected=%d active=%d",
+             len(pairs),accepted,len(rejected),len(ACCOUNT_TICK_SUBSCRIBED))
+    if rejected:
+        log.info("ACCOUNT_TICK_SUBSCRIBE_REJECTED sample=%s",rejected[:12])
+
+async def account_tick_subscription_worker():
+    while True:
+        try:
+            if CLIENT and CLIENT.connection.is_connected:
+                await ensure_account_tick_subscriptions()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("ACCOUNT_TICK_SUBSCRIPTION_WORKER_ERROR type=%s message=%s",
+                        type(e).__name__,str(e)[:160])
+        await asyncio.sleep(5.0)
+
 async def telegram(text, chat_id=None):
     token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
     chat=str(chat_id or STATE.get("telegram_chat_id") or os.getenv("TELEGRAM_CHAT_ID","")).strip()
@@ -525,7 +585,7 @@ async def refresh_candles(force=False):
                 try:
                     await asyncio.sleep(0.15 if attempt==1 else CANDLE_FETCH_RETRY_DELAY)
                     cs=await asyncio.wait_for(
-                        client.market.get_candles(p,size=60,count=60),
+                        client.market.get_candles(p,size=60,count=60,solid=False),
                         timeout=2.0
                     )
                     normalized=[]
@@ -798,7 +858,7 @@ async def result_watch(key):
         try:
             if client:
                 raw=await asyncio.wait_for(
-                    client.market.get_candles(s.pair,size=60,count=60),
+                    client.market.get_candles(s.pair,size=60,count=60,solid=False),
                     timeout=2.0
                 )
                 normalized=[]
@@ -1060,7 +1120,10 @@ async def market_worker():
     while True:
         token=os.getenv("OLYMPTRADE_ACCESS_TOKEN","").strip()
         if not token:STATE["status"]="waiting_for_token";await asyncio.sleep(30);continue
-        client=OlympTradeClient(access_token=token,log_raw_messages=False);CLIENT=client;client.register_callback(parameters.E_TICK_UPDATE,on_tick)
+        client=OlympTradeClient(access_token=token,log_raw_messages=False);CLIENT=client
+        ACCOUNT_TICK_SUBSCRIBED.clear()
+        ACCOUNT_TICK_LAST_ATTEMPT.clear()
+        client.register_callback(parameters.E_TICK_UPDATE,on_tick)
         try:
             STATE["status"]="connecting"
             await audit_outbound_network()
@@ -1115,11 +1178,11 @@ async def market_worker():
             log.info("ACCOUNT_ASSET_SOURCE account_id=%s source_count=%d open_real=%d open_otc=%d open_total=%d",
                      client.account_id,len(assets),real_n,otc_n,len(assets))
             log.info("ALL_ACCOUNT_OPEN_ASSETS_READY count=%d",len(assets))
-            # Do not bulk-call MarketAPI.subscribe_ticks(). The current broker
-            # session has rejected the bulk event-12/280 path. Event-1 ticks are
-            # preferred when delivered; the rotating read-only snapshot scanner
-            # fills missing live quotes without changing Brain timing.
-            log.info("TICK_SUBSCRIPTION_MODE event1_preferred snapshot_fallback=ON")
+            # Individual event-12 subscriptions are managed by the dedicated
+            # read-only worker below. Event-1 ticks are preferred when delivered;
+            # the snapshot scanner remains a timestamped fallback for assets
+            # that do not emit an event-1 tick.
+            log.info("TICK_SUBSCRIPTION_MODE account_event12_worker snapshot_fallback=ON")
             await refresh_candles(force=True)
             last_asset_sync=time.time()
             while True:
@@ -1212,7 +1275,7 @@ async def main():
     await load_persistent_learning()
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
-    await asyncio.gather(market_worker(),account_live_feed_worker(),cycle_loop(),server.serve_forever())
+    await asyncio.gather(market_worker(),account_live_feed_worker(),account_tick_subscription_worker(),cycle_loop(),server.serve_forever())
 if __name__=="__main__":asyncio.run(main())
 
 
