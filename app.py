@@ -1176,52 +1176,93 @@ async def market_worker():
                 len(demo_accounts),demo_accounts
             )
 
-            # The library's initialize_session() preserves an explicit account
-            # selection. Require that selected identity to be exactly the
-            # configured demo account; never silently switch to another ID.
+            # The configured OlympTrade ID can be either the trading-account
+            # ID or the authenticated user/profile ID. The current session
+            # exposes the configured value as e:110.id while e:55 carries the
+            # actual demo trading-account ID. Resolve that relationship instead
+            # of treating it as a token mismatch.
             selected_account_id=client.account_id
             try:
                 selected_account_id=int(selected_account_id) if selected_account_id is not None else None
             except (TypeError,ValueError):
                 selected_account_id=None
+
             if selected_account_id != expected_account_id or str(client.account_group or "").lower() != "demo":
                 STATE["account_id"]=None
                 STATE["account_group"]="demo"
-                STATE["status"]="account_token_mismatch"
+                STATE["status"]="account_identity_unresolved"
                 log.error(
-                    "TOKEN_ACCOUNT_SELECTION_FAILED expected_account_id=%s selected_account_id=%s selected_group=%s balance_accounts=%s",
+                    "TOKEN_ACCOUNT_SELECTION_FAILED expected_id=%s selected_id=%s selected_group=%s balance_accounts=%s",
                     expected_account_id,selected_account_id,client.account_group,demo_accounts
                 )
                 raise RuntimeError(
-                    f"Authenticated session selected account {selected_account_id!r}, expected {expected_account_id}"
+                    f"Authenticated session did not preserve configured identity {expected_account_id}"
                 )
 
-            # Keep the requested account fixed. The definitive account test is
-            # now the authenticated account-scoped asset endpoint (e:182): if
-            # this account cannot return assets, the session is not usable for
-            # Candice and no fallback account is permitted.
-            client.account_id=expected_account_id
+            resolved_account_id=expected_account_id
+            identity_match=False
+            user_identity_hits=[]
+            for msg in client.get_cached_events(parameters.E_USER_INFO):
+                data=msg.get("d") if isinstance(msg,dict) else None
+                records=data if isinstance(data,list) else [data]
+                for rec in records:
+                    if not isinstance(rec,dict):
+                        continue
+                    for key in ("id","user_id","userId","uid"):
+                        value=rec.get(key)
+                        try:
+                            if value is not None and int(value)==expected_account_id:
+                                identity_match=True
+                                user_identity_hits.append(key)
+                        except (TypeError,ValueError):
+                            pass
+
+            if expected_account_id not in demo_accounts and identity_match:
+                # e:110 confirms the configured ID belongs to this authenticated
+                # session, while e:55 provides the real demo trading account.
+                # Only resolve automatically when exactly one demo account is
+                # exposed; this prevents choosing an arbitrary account.
+                if len(demo_accounts)==1:
+                    resolved_account_id=demo_accounts[0]
+                    log.info(
+                        "ACCOUNT_ID_RESOLVED profile_id=%s demo_account_id=%s source=e110_identity_plus_e55_demo",
+                        expected_account_id,resolved_account_id
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Authenticated identity {expected_account_id} maps to multiple demo accounts {demo_accounts}"
+                    )
+            elif expected_account_id not in demo_accounts:
+                log.error(
+                    "TOKEN_ID_NOT_FOUND expected_id=%s e110_identity_match=%s demo_accounts=%s",
+                    expected_account_id,identity_match,demo_accounts
+                )
+                raise RuntimeError(
+                    f"Configured identity {expected_account_id} is neither a demo account nor the authenticated user identity"
+                )
+
+            client.account_id=resolved_account_id
             client.account_group="demo"
-            STATE["account_id"]=expected_account_id
+            STATE["account_id"]=resolved_account_id
             STATE["account_group"]="demo"
             STATE["status"]="authenticated_account_selected"
             log.info(
-                "DEMO_ACCOUNT_SELECTED account_id=%s group=demo source=authenticated_session",
-                client.account_id
+                "DEMO_ACCOUNT_SELECTED configured_id=%s account_id=%s group=demo source=authenticated_session",
+                expected_account_id,client.account_id
             )
 
             if not await sync_account_assets(client,reason="initial"):
                 STATE["status"]="account_asset_api_failed"
                 log.error(
-                    "TOKEN_ACCOUNT_ASSET_VALIDATION_FAILED account_id=%s balance_accounts=%s",
-                    expected_account_id,demo_accounts
+                    "TOKEN_ACCOUNT_ASSET_VALIDATION_FAILED configured_id=%s account_id=%s balance_accounts=%s",
+                    expected_account_id,client.account_id,demo_accounts
                 )
                 raise RuntimeError(
-                    f"Authenticated account asset scan returned no usable assets for {expected_account_id}"
+                    f"Authenticated demo account asset scan returned no usable assets for {client.account_id}"
                 )
             log.info(
-                "TOKEN_ACCOUNT_ASSET_VALIDATED account_id=%s source=authenticated_websocket:event_182 asset_count=%d",
-                client.account_id,len(STATE["assets"])
+                "TOKEN_ACCOUNT_ASSET_VALIDATED configured_id=%s account_id=%s source=authenticated_websocket:event_182 asset_count=%d",
+                expected_account_id,client.account_id,len(STATE["assets"])
             )
             STATE["status"]="live_read_only"
             assets=list(STATE["assets"])
