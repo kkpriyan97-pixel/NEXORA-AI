@@ -121,6 +121,22 @@ def analyze_asset(asset,candles,price=None):
     best=max(valid,key=lambda x:x["score"])
     if best["score"]<78:return None
 
+    # Five-minute exposure needs stronger confirmation than the shorter setups.
+    # A 5m expiry is allowed only when the 15m trend, 1m structure, momentum,
+    # and the last closed-candle direction all agree. This prevents a single
+    # strong score from turning an internally mixed setup into a 5m signal.
+    if best["expiry_minutes"]==5:
+        expected=best["direction"]
+        structure_ok=(expected=="UP" and s1=="BULLISH") or (expected=="DOWN" and s1=="BEARISH")
+        trend_ok=(trend==expected)
+        momentum_ok=(momentum>0 if expected=="UP" else momentum<0)
+        candle_ok=(
+            (expected=="UP" and pattern in {"BULLISH_CANDLE","BULLISH_REJECTION","NEUTRAL"}) or
+            (expected=="DOWN" and pattern in {"BEARISH_CANDLE","BEARISH_REJECTION","NEUTRAL"})
+        )
+        if not (trend_ok and structure_ok and momentum_ok and candle_ok and best["score"]>=86):
+            return None
+
     confidence=min(99,int(best["score"]+8))
     reason=(f"{best['strategy']} | 15m={trend} | 1m={s1} | RSI={rr:.1f} | "
             f"momentum={momentum:.6g} | ATR={aa:.6g} | support={support:.6g} | "
