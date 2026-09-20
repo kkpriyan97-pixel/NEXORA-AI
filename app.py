@@ -64,6 +64,7 @@ AI_REVIEW_QUEUE_POLL_SECONDS=2.0
 AI_REVIEW_QUEUE_STALE_SECONDS=600.0
 AI_REVIEW_QUEUE_RETRY_DELAYS=(5,15,30,60,120,300)
 RESULT_WATCH_QUEUE_STALE_SECONDS=600.0
+ACCOUNT_TICK_CONTROL_LOCK=asyncio.Lock()
 
 
 async def ensure_ai_review_queue_table():
@@ -1018,31 +1019,32 @@ def _tick_pinned_pairs():
     return [p for p,until in ACCOUNT_TICK_PINNED.items() if float(until)>now]
 
 async def pin_account_tick_pairs(pairs,ttl=12.0):
-    """Pin up to the broker's four live-tick slots for the final candidate window."""
+    """Pin final candidate tick slots atomically against the rotation worker."""
     global ACCOUNT_TICK_LAST_ROTATION
-    unique=[]
-    seen=set()
-    for p in pairs or []:
-        p=str(p or "")
-        if p and p not in seen:
-            seen.add(p);unique.append(p)
-    targets=unique[:ACCOUNT_TICK_MAX_SLOTS]
-    until=time.time()+float(ttl)
-    for p in targets:
-        ACCOUNT_TICK_PINNED[p]=until
-    current=set(ACCOUNT_TICK_SUBSCRIBED)
-    for p in list(current):
-        if p not in targets:
-            await _unsubscribe_account_tick(p)
+    async with ACCOUNT_TICK_CONTROL_LOCK:
+        unique=[]
+        seen=set()
+        for p in pairs or []:
+            p=str(p or "")
+            if p and p not in seen:
+                seen.add(p);unique.append(p)
+        targets=unique[:ACCOUNT_TICK_MAX_SLOTS]
+        until=time.time()+float(ttl)
+        for p in targets:
+            ACCOUNT_TICK_PINNED[p]=until
+        current=set(ACCOUNT_TICK_SUBSCRIBED)
+        for p in list(current):
+            if p not in targets:
+                await _unsubscribe_account_tick(p)
 
-    for p in targets:
-        if p not in ACCOUNT_TICK_SUBSCRIBED:
-            await _subscribe_account_tick(p)
+        for p in targets:
+            if p not in ACCOUNT_TICK_SUBSCRIBED:
+                await _subscribe_account_tick(p)
 
-    ACCOUNT_TICK_LAST_ROTATION=time.time()
-    log.info("ACCOUNT_TICK_PIN targets=%s active=%s ttl=%.1f",
-             targets,sorted(ACCOUNT_TICK_SUBSCRIBED),float(ttl))
-    return sum(1 for p in targets if p in ACCOUNT_TICK_SUBSCRIBED)
+        ACCOUNT_TICK_LAST_ROTATION=time.time()
+        log.info("ACCOUNT_TICK_PIN targets=%s active=%s ttl=%.1f",
+                 targets,sorted(ACCOUNT_TICK_SUBSCRIBED),float(ttl))
+        return sum(1 for p in targets if p in ACCOUNT_TICK_SUBSCRIBED)
 
 async def ensure_account_tick_subscriptions():
     """Rotate the authenticated event-1 tick slots across the exact account asset universe.
@@ -1062,38 +1064,41 @@ async def ensure_account_tick_subscriptions():
     if not assets:
         return
 
-    pinned=_tick_pinned_pairs()
-    if pinned:
-        # During the final decision window, keep the pinned candidate assets live.
-        await pin_account_tick_pairs(pinned,ttl=max(1.0,max(ACCOUNT_TICK_PINNED[p]-time.time() for p in pinned)))
-        return
+    async with ACCOUNT_TICK_CONTROL_LOCK:
+        pinned=_tick_pinned_pairs()
+        if pinned:
+            # pin_account_tick_pairs() owns this same lock and already made the
+            # pinned subscriptions live. Never run normal rotation while a
+            # final candidate is pinned; doing so could unsubscribe it between
+            # the final-candidate pin and the signal deadline.
+            return
 
-    now=time.time()
-    if now-ACCOUNT_TICK_LAST_ROTATION < ACCOUNT_TICK_ROTATE_INTERVAL:
-        return
+        now=time.time()
+        if now-ACCOUNT_TICK_LAST_ROTATION < ACCOUNT_TICK_ROTATE_INTERVAL:
+            return
 
-    pairs=[str(a["pair"]) for a in assets]
-    n=len(pairs)
-    start=ACCOUNT_TICK_ROTATE_CURSOR % n
-    targets=[pairs[(start+i) % n] for i in range(min(ACCOUNT_TICK_MAX_SLOTS,n))]
-    ACCOUNT_TICK_ROTATE_CURSOR=(start+len(targets)) % n
+        pairs=[str(a["pair"]) for a in assets]
+        n=len(pairs)
+        start=ACCOUNT_TICK_ROTATE_CURSOR % n
+        targets=[pairs[(start+i) % n] for i in range(min(ACCOUNT_TICK_MAX_SLOTS,n))]
+        ACCOUNT_TICK_ROTATE_CURSOR=(start+len(targets)) % n
 
-    # Free existing slots first; event 13 is the authenticated tick unsubscribe.
-    for p in list(ACCOUNT_TICK_SUBSCRIBED):
-        if p not in targets:
-            await _unsubscribe_account_tick(p)
+        # Free existing slots first; event 13 is the authenticated tick unsubscribe.
+        for p in list(ACCOUNT_TICK_SUBSCRIBED):
+            if p not in targets:
+                await _unsubscribe_account_tick(p)
 
-    accepted=0
-    for p in targets:
-        if p in ACCOUNT_TICK_SUBSCRIBED:
-            continue
-        if await _subscribe_account_tick(p):
-            accepted+=1
-        await asyncio.sleep(ACCOUNT_TICK_SUB_DELAY)
+        accepted=0
+        for p in targets:
+            if p in ACCOUNT_TICK_SUBSCRIBED:
+                continue
+            if await _subscribe_account_tick(p):
+                accepted+=1
+            await asyncio.sleep(ACCOUNT_TICK_SUB_DELAY)
 
-    ACCOUNT_TICK_LAST_ROTATION=now
-    log.info("ACCOUNT_TICK_SLOT_ROTATION targets=%s accepted=%d active=%d cursor=%d",
-             targets,accepted,len(ACCOUNT_TICK_SUBSCRIBED),ACCOUNT_TICK_ROTATE_CURSOR)
+        ACCOUNT_TICK_LAST_ROTATION=now
+        log.info("ACCOUNT_TICK_SLOT_ROTATION targets=%s accepted=%d active=%d cursor=%d",
+                 targets,accepted,len(ACCOUNT_TICK_SUBSCRIBED),ACCOUNT_TICK_ROTATE_CURSOR)
 
 async def account_tick_subscription_worker():
     while True:
