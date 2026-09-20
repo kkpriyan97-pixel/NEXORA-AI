@@ -498,7 +498,7 @@ async def ensure_account_tick_subscriptions():
     log.info("ACCOUNT_TICK_SLOT_ROTATION targets=%s accepted=%d active=%d cursor=%d",
              targets,accepted,len(ACCOUNT_TICK_SUBSCRIBED),ACCOUNT_TICK_ROTATE_CURSOR)
 
-async def account_tick_subscription_worker():async def account_tick_subscription_worker():
+async def account_tick_subscription_worker():
     while True:
         try:
             if CLIENT and CLIENT.connection.is_connected:
