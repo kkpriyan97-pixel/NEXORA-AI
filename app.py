@@ -67,6 +67,7 @@ ACCESS_CODE_TTL=timedelta(hours=24)
 ACCESS_CODE_DIGITS=10
 ADMIN_TELEGRAM_ID=os.getenv("ADMIN_TELEGRAM_ID","").strip()
 ADMIN_EMAIL=os.getenv("ADMIN_EMAIL","").strip()
+MAKE_ACCESS_CODE_WEBHOOK=os.getenv("MAKE_ACCESS_CODE_WEBHOOK","").strip()
 RESEND_API_KEY=os.getenv("RESEND_API_KEY","").strip()
 ACCESS_CODE_FROM_EMAIL=os.getenv("ACCESS_CODE_FROM_EMAIL","").strip()
 
@@ -111,14 +112,39 @@ async def audit_access(event,actor=None):
     except Exception as e: log.warning("ACCESS_AUDIT_FAILED type=%s",type(e).__name__)
 
 async def send_access_code_email(code):
-    if not (RESEND_API_KEY and ADMIN_EMAIL and ACCESS_CODE_FROM_EMAIL):
+    if not ADMIN_EMAIL:
         log.error("ACCESS_EMAIL_NOT_CONFIGURED"); return False
     try:
-        payload={"from":ACCESS_CODE_FROM_EMAIL,"to":[ADMIN_EMAIL],"subject":"NEXORA-AI Admin Access Code",
-                 "text":f"NEXORA-AI 24-hour member access code:\n\n{code}\n\nUse /mbaccess CODE from your Admin Telegram only."}
+        subject="NEXORA-AI Admin Access Code"
+        text=f"NEXORA-AI 24-hour member access code:\n\n{code}\n\nUse /mbaccess CODE from your Admin Telegram only."
+        if MAKE_ACCESS_CODE_WEBHOOK:
+            payload={
+                "type":"nexora_access_code",
+                "code":str(code),
+                "to":[ADMIN_EMAIL],
+                "subject":subject,
+                "text":text,
+            }
+            async with httpx.AsyncClient(timeout=10) as h:
+                r=await h.post(
+                    MAKE_ACCESS_CODE_WEBHOOK,
+                    headers={"Content-Type":"application/json"},
+                    json=payload,
+                )
+                r.raise_for_status()
+            log.info("ACCESS_EMAIL_SENT via=make_webhook")
+            return True
+        if not (RESEND_API_KEY and ACCESS_CODE_FROM_EMAIL):
+            log.error("ACCESS_EMAIL_NOT_CONFIGURED"); return False
+        payload={"from":ACCESS_CODE_FROM_EMAIL,"to":[ADMIN_EMAIL],"subject":subject,"text":text}
         async with httpx.AsyncClient(timeout=10) as h:
-            r=await h.post("https://api.resend.com/emails",headers={"Authorization":f"Bearer {RESEND_API_KEY}","Content-Type":"application/json"},json=payload)
+            r=await h.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization":f"Bearer {RESEND_API_KEY}","Content-Type":"application/json"},
+                json=payload,
+            )
             r.raise_for_status()
+        log.info("ACCESS_EMAIL_SENT via=resend")
         return True
     except Exception as e:
         log.error("ACCESS_EMAIL_SEND_FAILED type=%s message=%s",type(e).__name__,str(e)[:160]); return False
