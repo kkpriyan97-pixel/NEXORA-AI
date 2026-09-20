@@ -146,13 +146,15 @@ def screenshot_asset_allowed(x):
 
 def is_flex_time_asset(x):
     if not isinstance(x,dict): return False
-    # The broker response may contain products that are not part of the
-    # screenshot-verified Flex-Time universe. Do not let those enter Candice.
-    return screenshot_asset_allowed(x)
+    # The authenticated account asset feed is the source of truth.
+    # Do not apply the old screenshot allow-list here: the user wants every
+    # asset currently available on the Olymp Trade account to be visible to
+    # Candice, using the account-facing name exactly as returned.
+    return True
 
 def build_assets(client,raw):
-    # raw is still required for current account availability, but the allowed
-    # universe is intersected with the user's screenshot-verified OPEN assets.
+    # Account-scoped assets are authoritative. Keep every currently available
+    # asset, while preserving the exact account-facing display name.
     prof={}
     for x in raw or []:
         if not isinstance(x,dict): continue
@@ -171,8 +173,10 @@ def build_assets(client,raw):
         if x.get("disabled") is True or x.get("locked") is True or x.get("locked_trading") is True:
             continue
         seen.add(p)
+        # Preserve the exact name shown by the authenticated account.
+        # Only fall back to the internal pair when the broker provides no
+        # human-readable account-facing name.
         title=display_name(x) or p
-        if p.upper()=="ULTRA_X": title="Quickler"
         v=prof.get(p,x.get("profitability",0))
         try: profitability=int(v)
         except Exception: profitability=0
@@ -188,9 +192,11 @@ def build_assets(client,raw):
             "mode":"OTC" if "_OTC" in p.upper() else "REAL",
             "trading_mode":"FLEX_TIME","signal_eligible":not quickler
         })
-    log.info("SCREENSHOT_ASSET_FILTER raw=%d accepted=%d rejected=%d",len(raw or []),len(out),len(rejected))
+    log.info("ACCOUNT_ASSET_FILTER raw=%d accepted=%d rejected=%d",len(raw or []),len(out),len(rejected))
     if rejected:
-        log.info("SCREENSHOT_ASSET_REJECTED sample=%s",rejected[:25])
+        log.info("ACCOUNT_ASSET_REJECTED sample=%s",rejected[:25])
+    # Audit the exact account-facing names that Candice accepted.
+    log.info("ACCOUNT_ASSET_NAMES %s",[a["display_name"] for a in out])
     return out
 
 async def telegram(text, chat_id=None):
