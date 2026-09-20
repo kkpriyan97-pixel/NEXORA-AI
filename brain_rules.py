@@ -45,6 +45,7 @@ class BrainState:
     stats:dict[tuple[str,str,str,int],dict[str,float]]=field(default_factory=dict)
     asset_stats:dict[str,dict[str,float]]=field(default_factory=dict)
     strategy_stats:dict[str,dict[str,float]]=field(default_factory=dict)
+    self_strategy_stats:dict[str,dict[str,float]]=field(default_factory=dict)
     expiry_stats:dict[int,dict[str,float]]=field(default_factory=dict)
     # Pattern/context memory is a second-stage learning layer. It only
     # influences ranking after enough observations exist, so early outcomes
@@ -133,6 +134,8 @@ class BrainState:
         weight=max(0.25,0.985 ** min(self.total_results,200))
         self._record_bucket(self._bucket(self.asset_stats,pair),result,weight)
         self._record_bucket(self._bucket(self.strategy_stats,strategy),result,weight)
+        self_strategy=str(rec.get("self_strategy","") or "UNKNOWN")
+        self._record_bucket(self._bucket(self.self_strategy_stats,self_strategy),result,weight)
         self._record_bucket(self._bucket(self.expiry_stats,expiry),result,weight)
         key=(pair,strategy,str(rec.get("direction","")),expiry)
         self._record_bucket(self._bucket(self.stats,key),result,weight)
@@ -181,7 +184,7 @@ class BrainState:
         ):
             b=self.stats.get(key)
             if b and b.get("n",0)>=2: vals.append(float(b.get("weighted",0)))
-        for store,key in ((self.asset_stats,pair),(self.strategy_stats,strategy),(self.expiry_stats,expiry)):
+        for store,key in ((self.asset_stats,pair),(self.strategy_stats,strategy),(self.self_strategy_stats,strategy),(self.expiry_stats,expiry)):
             b=store.get(key)
             if b and b.get("n",0)>=2: vals.append(float(b.get("weighted",0)))
 
@@ -225,13 +228,20 @@ class BrainState:
         x=dict(c)
         pair=str(x.get("pair","")); strategy=str(x.get("strategy",""))
         direction=str(x.get("direction","")).upper()
+        self_strategy=str(x.get("self_strategy") or strategy)
         x["learning_bonus"]=round(self.learning_bonus(
             pair,strategy,int(x.get("expiry_minutes") or 0),direction,
             str(x.get("pattern") or ""),str(x.get("trend_15m") or ""),
             str(x.get("structure_1m") or "")
         ),2)
-        x["market_quality"]=max(0.0,min(100.0,float(x.get("market_quality") or 0)+x["learning_bonus"]))
-        x["confidence"]=max(0,min(99,int(x.get("confidence") or 0)+int(round(x["learning_bonus"]))))
+        self_bucket=self.self_strategy_stats.get(self_strategy,{})
+        self_n=float(self_bucket.get("n",0) or 0)
+        self_bonus=0.0
+        if self_n>=2:
+            self_bonus=max(-4.0,min(4.0,float(self_bucket.get("weighted",0) or 0)*1.25))
+        x["self_learning_bonus"]=round(self_bonus,2)
+        x["market_quality"]=max(0.0,min(100.0,float(x.get("market_quality") or 0)+x["learning_bonus"]+self_bonus))
+        x["confidence"]=max(0,min(99,int(x.get("confidence") or 0)+int(round(x["learning_bonus"]+self_bonus))))
         if pair and strategy:
             x["expiry_minutes"]=self.choose_expiry(pair,strategy,direction,float(x.get("market_quality") or 0))
         return x
