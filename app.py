@@ -602,7 +602,9 @@ async def ensure_candidate_ticks(pairs):
             seen.add(p);unique.append(p)
     # Pin the strongest candidates so the broker's limited event-1 slots are
     # dedicated to the exact assets needed for the final signal boundary.
-    return await pin_account_tick_pairs(unique,ttl=12.0)async def ensure_candidate_quotes(pairs):
+    return await pin_account_tick_pairs(unique,ttl=12.0)
+
+async def ensure_candidate_quotes(pairs):
     """Refresh candidate quotes from the authenticated event-1 stream, never from a snapshot API."""
     client=CLIENT
     if not client or not pairs:
