@@ -1224,9 +1224,10 @@ async def market_worker():
                         break
 
                 log.error(
-                    "AUTH_IDENTITY_AUDIT expected=%s event55=%s event110=%s event55_records=%s target_hits=%s",
-                    expected_account_id,event55_identity,event110_identity,event55_records,target_hits
+                    "AUTH_IDENTITY_FIELDS expected=%s event55=%s event110=%s",
+                    expected_account_id,event55_identity,event110_identity
                 )
+                log.error("AUTH_TARGET_ID_PRESENT=%s hit_count=%d", bool(target_hits), len(target_hits))
                 log.error(
                     "TOKEN_ACCOUNT_BINDING_FAILED expected_account_id=%s exposed_demo_accounts=%s",
                     expected_account_id,demo_accounts
