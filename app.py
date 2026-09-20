@@ -109,12 +109,12 @@ CLIENT=None
 LOCK=asyncio.Lock()
 
 def extract_account_ids(value, group="demo"):
-    """Collect account IDs from authenticated session/account event payloads without logging secrets."""
+    """Collect account IDs from authenticated account/balance payloads without logging secrets."""
     found=[]
     def walk(v):
         if isinstance(v,dict):
-            g=v.get("group")
-            aid=v.get("account_id")
+            g=v.get("group",v.get("account_group",v.get("accountGroup")))
+            aid=v.get("account_id",v.get("accountId"))
             if aid is not None and (g is None or str(g).lower()==str(group).lower()):
                 try: found.append(int(aid))
                 except Exception: pass
@@ -1107,39 +1107,47 @@ async def market_worker():
     while True:
         token=os.getenv("OLYMPTRADE_ACCESS_TOKEN","").strip()
         if not token:STATE["status"]="waiting_for_token";await asyncio.sleep(30);continue
-        client=OlympTradeClient(access_token=token,log_raw_messages=False);CLIENT=client
+        try:
+            expected_account_id=int(os.getenv("OLYMPTRADE_ACCOUNT_ID","128175463").strip())
+        except (TypeError,ValueError):
+            STATE["status"]="invalid_account_id"
+            log.error("INVALID_OLYMPTRADE_ACCOUNT_ID")
+            await asyncio.sleep(30)
+            continue
+        # Bind the intended demo account at client construction time and let
+        # the library validate it against the authenticated e:55 session.
+        client=OlympTradeClient(
+            access_token=token,
+            log_raw_messages=False,
+            account_id=expected_account_id,
+            account_group="demo",
+        )
+        CLIENT=client
         ACCOUNT_TICK_SUBSCRIBED.clear()
         ACCOUNT_TICK_LAST_ATTEMPT.clear()
         client.register_callback(parameters.E_TICK_UPDATE,on_tick)
         client.register_callback(parameters.E_ASSET_PROFITABILITY_UPDATE,on_asset_update)
         try:
             STATE["status"]="connecting"
-            await audit_outbound_network()
+            # Network geolocation is diagnostic only and can be rate-limited;
+            # it must never block authenticated market connectivity.
             await client.start()
             STATE["status"]="connected"
-            # Complete browser-like session initialization so authenticated account
-            # metadata and startup subscriptions are settled.
-            try:
-                await client.initialize_session()
-            except Exception as e:
-                log.warning("SESSION_INIT_FAILED type=%s message=%s",type(e).__name__,str(e)[:160])
+            await client.initialize_session()
 
-            expected_account_id=int(os.getenv("OLYMPTRADE_ACCOUNT_ID","128175463").strip())
-
-            # The broker's unsolicited event-55/account-info caches are the
-            # authoritative account universe for this access token. Collect ALL
-            # demo account IDs rather than silently taking the first one.
+            # e:55 is the authenticated account/balance source. Do not use the
+            # speculative e:1068 request as an identity oracle.
             event55_accounts=[]
-            for msg in client.get_cached_events(55):
+            for msg in client.get_cached_events(parameters.E_BALANCE_UPDATE):
                 event55_accounts.extend(extract_account_ids(msg,"demo"))
+            if not event55_accounts:
+                event55_accounts.extend(
+                    extract_account_ids(client.current_balance,"demo")
+                )
 
-            event1068_accounts=[]
-            for msg in client.get_cached_events(1068):
-                event1068_accounts.extend(extract_account_ids(msg,"demo"))
-
-            demo_accounts=sorted(set(event55_accounts+event1068_accounts))
+            demo_accounts=sorted(set(event55_accounts))
             log.info(
-                "TOKEN_DEMO_ACCOUNTS_EXPOSED source=event55,event1068 count=%d ids=%s",
+                "TOKEN_DEMO_ACCOUNTS_EXPOSED source=event55 count=%d ids=%s",
                 len(demo_accounts),demo_accounts
             )
 
@@ -1152,14 +1160,18 @@ async def market_worker():
                 STATE["account_group"]="demo"
                 STATE["status"]="account_token_mismatch"
                 raise RuntimeError(
-                    f"Access token does not expose configured demo account {expected_account_id}"
+                    f"Authenticated session does not expose configured demo account {expected_account_id}"
                 )
 
             client.account_id=expected_account_id
             client.account_group="demo"
             STATE["account_id"]=expected_account_id
             STATE["account_group"]="demo"
-            log.info("DEMO_ACCOUNT_SELECTED account_id=%s source=authenticated_session_verified",client.account_id)
+            STATE["status"]="authenticated_account_verified"
+            log.info(
+                "DEMO_ACCOUNT_SELECTED account_id=%s group=demo source=event55_verified",
+                client.account_id
+            )
 
             if not await sync_account_assets(client,reason="initial"):
                 raise RuntimeError("Authenticated account asset scan returned no usable assets")
