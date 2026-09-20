@@ -1227,7 +1227,27 @@ async def market_worker():
                     "AUTH_IDENTITY_FIELDS expected=%s event55=%s event110=%s",
                     expected_account_id,event55_identity,event110_identity
                 )
+                target_record_context=[]
+                for msg in client.get_cached_events(parameters.E_BALANCE_UPDATE):
+                    data=msg.get("d") if isinstance(msg,dict) else None
+                    if isinstance(data,list):
+                        for idx,rec in enumerate(data):
+                            if not isinstance(rec,dict):
+                                continue
+                            matches=[]
+                            for k,val in rec.items():
+                                if str(val)==str(expected_account_id):
+                                    matches.append(str(k))
+                            if matches:
+                                target_record_context.append({
+                                    "index":idx,
+                                    "account_id":rec.get("account_id",rec.get("accountId")),
+                                    "group":rec.get("group",rec.get("account_group",rec.get("accountGroup"))),
+                                    "matched_keys":matches,
+                                    "keys":sorted(str(k) for k in rec.keys())
+                                })
                 log.error("AUTH_TARGET_ID_PRESENT=%s hit_count=%d", bool(target_hits), len(target_hits))
+                log.error("AUTH_TARGET_RECORD_CONTEXT %s", target_record_context[:10])
                 log.error(
                     "TOKEN_ACCOUNT_BINDING_FAILED expected_account_id=%s exposed_demo_accounts=%s",
                     expected_account_id,demo_accounts
