@@ -236,8 +236,16 @@ class BrainState:
 
         # 5m is never learned globally. It is available only to a dedicated
         # trend-following gate that has already passed the closed-candle checks.
-        if strategy=="TREND_FOLLOWING" and allow_5m and float(live_quality)>=94:
-            allowed=tuple(list(allowed)+[5])
+        # 5m requires asset+strategy+direction-specific historical support.
+        # This deliberately prevents the old global 5m drift from returning:
+        # the current technical setup must qualify AND the same pair/strategy/
+        # direction must have enough completed 5m evidence with a positive rate.
+        if strategy=="TREND_FOLLOWING" and allow_5m and float(live_quality)>=95:
+            b5=self.stats.get((str(pair),strategy,direction,5))
+            n5=float(b5.get("n",0) or 0) if b5 else 0.0
+            rate5=self._rate(b5) if b5 else 0.0
+            if n5>=6 and rate5>=0.58:
+                allowed=tuple(list(allowed)+[5])
 
         candidates=[]
         for e in allowed:
