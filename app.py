@@ -1323,7 +1323,8 @@ async def cycle_loop():
             trend_15m=str(candidate.get("trend_15m") or ""),
             structure_1m=str(candidate.get("structure_1m") or ""),
             self_strategy=str(candidate.get("self_strategy") or ""),
-            self_strategy_version=str(candidate.get("self_strategy_version") or "")
+            self_strategy_version=str(candidate.get("self_strategy_version") or ""),
+            indicator_context=dict(candidate.get("indicators") or {})
         )
         key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
         msg=(f"🚨 CANDICE AI SIGNAL\n\n"
