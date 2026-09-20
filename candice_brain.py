@@ -52,6 +52,56 @@ def rsi(v, n=14):
     return 100.0 if al == 0 else 100 - (100 / (1 + ag / al))
 
 
+def stochastic(cs, k_period=14, d_period=3, slowing=3):
+    """Stochastic %K/%D using the chart settings shown by the user: 14/3/3."""
+    if len(cs) < k_period + slowing + d_period:
+        return 50.0, 50.0, "NEUTRAL"
+    raw=[]
+    for i in range(k_period, len(cs)+1):
+        w=cs[i-k_period:i]
+        hi=max(x["high"] for x in w)
+        lo=min(x["low"] for x in w)
+        den=max(hi-lo,1e-12)
+        raw.append(100.0*(cs[i-1]["close"]-lo)/den)
+    smooth=[]
+    for i in range(slowing, len(raw)+1):
+        smooth.append(sum(raw[i-slowing:i])/slowing)
+    if not smooth:
+        return 50.0,50.0,"NEUTRAL"
+    k=smooth[-1]
+    d=sum(smooth[-d_period:])/min(d_period,len(smooth))
+    prev_k=smooth[-2] if len(smooth)>=2 else k
+    prev_d=(sum(smooth[-d_period-1:-1])/min(d_period,len(smooth)-1)
+            if len(smooth)>=2 else d)
+    cross="BULLISH_CROSS" if prev_k<=prev_d and k>d else "BEARISH_CROSS" if prev_k>=prev_d and k<d else "NEUTRAL"
+    return k,d,cross
+
+
+def donchian(cs, period=30):
+    """Donchian Channel 30: prior-channel breakout plus channel-width regime."""
+    if len(cs) < period + 2:
+        return {"upper":0.0,"lower":0.0,"middle":0.0,"width_norm":0.0,
+                "state":"INSUFFICIENT","expansion":False,"breakout_up":False,"breakout_down":False}
+    prior=cs[-period-1:-1]
+    upper=max(x["high"] for x in prior)
+    lower=min(x["low"] for x in prior)
+    middle=(upper+lower)/2.0
+    last=cs[-1]
+    width=max(upper-lower,0.0)
+    prev_prior=cs[-period-2:-2]
+    prev_upper=max(x["high"] for x in prev_prior)
+    prev_lower=min(x["low"] for x in prev_prior)
+    prev_width=max(prev_upper-prev_lower,0.0)
+    expansion=width>prev_width*1.03
+    state="BREAKOUT_UP" if last["close"]>upper else "BREAKOUT_DOWN" if last["close"]<lower else "INSIDE"
+    return {
+        "upper":upper,"lower":lower,"middle":middle,
+        "width_norm":width/max(abs(last["close"]),1e-12),
+        "state":state,"expansion":expansion,
+        "breakout_up":state=="BREAKOUT_UP","breakout_down":state=="BREAKOUT_DOWN",
+    }
+
+
 def atr(cs, n=14):
     if len(cs) < 2:
         return 0.0
@@ -178,10 +228,20 @@ def analyze_asset(asset, candles, price=None):
     resistance = max(c["high"] for c in cs[-20:-1])
     support = min(c["low"] for c in cs[-20:-1])
 
-    breakout_up = p > resistance and body > 0
-    breakout_down = p < support and body < 0
-    breakout_distance_up = (p - resistance) / max(aa, 1e-12)
-    breakout_distance_down = (support - p) / max(aa, 1e-12)
+    dc = donchian(cs,30)
+    stoch_k, stoch_d, stoch_cross = stochastic(cs,14,3,3)
+    dc_breakout_up = bool(dc["breakout_up"] and body > 0)
+    dc_breakout_down = bool(dc["breakout_down"] and body < 0)
+    breakout_up = bool((p > resistance and body > 0) or dc_breakout_up)
+    breakout_down = bool((p < support and body < 0) or dc_breakout_down)
+    breakout_distance_up = max((p - resistance) / max(aa, 1e-12),
+                               (p - dc["upper"]) / max(aa, 1e-12))
+    breakout_distance_down = max((support - p) / max(aa, 1e-12),
+                                 (dc["lower"] - p) / max(aa, 1e-12))
+    stoch_bull = stoch_k > stoch_d and stoch_k >= 50
+    stoch_bear = stoch_k < stoch_d and stoch_k <= 50
+    stoch_oversold = stoch_k <= 20
+    stoch_overbought = stoch_k >= 80
 
     near_support = (p - support) <= max(aa * 0.35, 1e-12)
     near_resistance = (resistance - p) <= max(aa * 0.35, 1e-12)
@@ -235,7 +295,9 @@ def analyze_asset(asset, candles, price=None):
             active = breakout_up if direction == "UP" else breakout_down
             distance = breakout_distance_up if direction == "UP" else breakout_distance_down
             prior_inside = prev <= resistance if direction == "UP" else prev >= support
-            if not active or distance < 0.08 or body_ratio < 0.45 or not prior_inside:
+            dc_confirm = (direction == "UP" and (dc_breakout_up or dc["expansion"])) or (direction == "DOWN" and (dc_breakout_down or dc["expansion"]))
+            stoch_confirm = (direction == "UP" and stoch_bull) or (direction == "DOWN" and stoch_bear)
+            if not active or distance < 0.08 or body_ratio < 0.45 or not prior_inside or not dc_confirm:
                 return -1.0
             s = 62.0
             s += 10 if distance >= 0.15 else 4
@@ -244,6 +306,8 @@ def analyze_asset(asset, candles, price=None):
             s += 6 if slope_ok else 0
             s += 5 if aligned_recent(direction) >= 2 else 0
             s += 4 if structure_ok else 0
+            s += 4 if stoch_confirm else 0
+            s += 4 if dc["expansion"] else 0
             return min(96.0, s)
 
         if strategy == "PULLBACK":
@@ -265,7 +329,8 @@ def analyze_asset(asset, candles, price=None):
             rejection = bullish_rejection if direction == "UP" else bearish_rejection
             location = near_support if direction == "UP" else near_resistance
             trend_weak = trend == "SIDEWAYS" or trend_persistence <= 1
-            if not extreme or not rejection or not location:
+            stoch_reversal = (direction == "UP" and (stoch_oversold or stoch_cross == "BULLISH_CROSS")) or (direction == "DOWN" and (stoch_overbought or stoch_cross == "BEARISH_CROSS"))
+            if not extreme or not rejection or not location or not stoch_reversal:
                 return -1.0
             s = 62.0
             s += 10 if trend_weak else 3
@@ -273,6 +338,7 @@ def analyze_asset(asset, candles, price=None):
             s += 8 if momentum_norm < 0.35 else 0
             s += 6 if body_ratio >= 0.30 else 0
             s += 5 if slope_ok else 0
+            s += 5 if ((direction == "UP" and stoch_bull) or (direction == "DOWN" and stoch_bear)) else 0
             return min(94.0, s)
 
         if strategy == "MEAN_REVERSION":
@@ -280,7 +346,8 @@ def analyze_asset(asset, candles, price=None):
             location = near_support if direction == "UP" else near_resistance
             weak_momentum = momentum_norm < 0.35
             rejection = bullish_rejection if direction == "UP" else bearish_rejection
-            if not extreme or not location or not weak_momentum:
+            stoch_mean = (direction == "UP" and stoch_oversold) or (direction == "DOWN" and stoch_overbought)
+            if not extreme or not location or not weak_momentum or not stoch_mean:
                 return -1.0
             s = 64.0
             s += 10 if trend == "SIDEWAYS" else 0
@@ -313,6 +380,8 @@ def analyze_asset(asset, candles, price=None):
                 return -1.0
             if (direction == "UP" and rr >= 73) or (direction == "DOWN" and rr <= 27):
                 return -1.0
+            if (direction == "UP" and not stoch_bull) or (direction == "DOWN" and not stoch_bear):
+                return -1.0
             s = 60.0
             s += 10 if momentum_norm >= 0.50 else 5
             s += 8 if body_ratio >= 0.60 else 3
@@ -320,6 +389,7 @@ def analyze_asset(asset, candles, price=None):
             s += 6 if trend_ok else 0
             s += 5 if structure_ok else 0
             s += 4 if slope_ok else 0
+            s += 5 if ((direction == "UP" and stoch_bull) or (direction == "DOWN" and stoch_bear)) else 0
             return min(95.0, s)
 
         if strategy == "VOLATILITY":
@@ -333,6 +403,8 @@ def analyze_asset(asset, candles, price=None):
             s += 7 if body_ratio >= 0.60 else 3
             s += 5 if trend_ok else 0
             s += 5 if structure_ok else 0
+            s += 4 if dc["expansion"] else 0
+            s += 4 if ((direction == "UP" and stoch_bull) or (direction == "DOWN" and stoch_bear)) else 0
             return min(94.0, s)
 
         if strategy == "TREND_FOLLOWING":
@@ -350,6 +422,8 @@ def analyze_asset(asset, candles, price=None):
                 return -1.0
             if (direction == "UP" and rr >= 74) or (direction == "DOWN" and rr <= 26):
                 return -1.0
+            if (direction == "UP" and not stoch_bull) or (direction == "DOWN" and not stoch_bear):
+                return -1.0
 
             s = 56.0
             s += 10 if trend_persistence == 3 else 5
@@ -360,6 +434,8 @@ def analyze_asset(asset, candles, price=None):
             s += 6 if aligned_recent(direction) >= 2 else 0
             s += 4 if rsi_supports(direction) else 0
             s += 4 if _efficiency(v, 8) >= 0.45 else 0
+            s += 5 if ((direction == "UP" and stoch_bull) or (direction == "DOWN" and stoch_bear)) else 0
+            s += 4 if dc["expansion"] else 0
 
             # Late-trend warning: a directionally aligned trend is less useful
             # when price is pressing directly into the opposing 20-bar level.
@@ -389,6 +465,11 @@ def analyze_asset(asset, candles, price=None):
         body_ratio=body_ratio,
         structure_quality=structure_quality,
         efficiency=_efficiency(v, 8),
+        donchian_state=dc["state"],
+        donchian_expansion=dc["expansion"],
+        stochastic_k=stoch_k,
+        stochastic_d=stoch_d,
+        stochastic_cross=stoch_cross,
     )
 
     strategies = (
@@ -452,6 +533,8 @@ def analyze_asset(asset, candles, price=None):
         and _efficiency(v, 8) >= 0.45
         and aligned_recent(expected) >= 2
         and body_ratio >= 0.55
+        and ((expected == "UP" and stoch_bull) or (expected == "DOWN" and stoch_bear))
+        and dc["expansion"]
         and not ((expected == "UP" and rr >= 72) or (expected == "DOWN" and rr <= 28))
         and not ((expected == "UP" and near_resistance and not breakout_up) or
                  (expected == "DOWN" and near_support and not breakout_down))
@@ -476,6 +559,8 @@ def analyze_asset(asset, candles, price=None):
         f"EMA_gap={ema_gap_norm:.2f}ATR | EMA_slope={ema_slope_norm:.2f}ATR | "
         f"structure_q={structure_quality[expected]:.2f} | body={body_ratio:.2f} | "
         f"efficiency={_efficiency(v, 8):.2f} | pattern={pattern} | "
+        f"Donchian30={dc["state"]}/{("EXPANDING" if dc["expansion"] else "FLAT")} | "
+        f"Stoch14,3,3={stoch_k:.1f}/{stoch_d:.1f}/{stoch_cross} | "
         f"volatility={volatility_ratio:.2f} | support={support:.6g} | resistance={resistance:.6g}"
     )
 
@@ -513,6 +598,19 @@ def analyze_asset(asset, candles, price=None):
         "trend_persistence": trend_persistence,
         "structure_quality": structure_quality[expected],
         "efficiency": _efficiency(v, 8),
+        "indicators": {
+            "donchian_period": 30,
+            "donchian_state": dc["state"],
+            "donchian_expansion": dc["expansion"],
+            "donchian_upper": dc["upper"],
+            "donchian_lower": dc["lower"],
+            "donchian_middle": dc["middle"],
+            "stochastic_k": round(stoch_k,2),
+            "stochastic_d": round(stoch_d,2),
+            "stochastic_cross": stoch_cross,
+            "stochastic_oversold": stoch_oversold,
+            "stochastic_overbought": stoch_overbought,
+        },
         "evidence": {
             "trend": trend,
             "trend_persistence": trend_persistence,
@@ -529,5 +627,10 @@ def analyze_asset(asset, candles, price=None):
             "near_resistance": near_resistance,
             "pattern": pattern,
             "recent_aligned_candles": aligned_recent(expected),
+            "donchian_state": dc["state"],
+            "donchian_expansion": dc["expansion"],
+            "stochastic_k": stoch_k,
+            "stochastic_d": stoch_d,
+            "stochastic_cross": stoch_cross,
         },
     }
