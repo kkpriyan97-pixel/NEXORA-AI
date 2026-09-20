@@ -101,7 +101,7 @@ ACCOUNT_LIVE_SCAN_CURSOR=0
 # Account-wide event-1 tick subscription manager. Subscriptions are read-only;
 # the worker only requests market quotes and never places/modifies trades.
 ACCOUNT_TICK_SUB_SEM=asyncio.Semaphore(4)
-ACCOUNT_TICK_SUB_BATCH=8
+ACCOUNT_TICK_SUB_BATCH=16
 ACCOUNT_TICK_SUB_RETRY=900.0
 ACCOUNT_TICK_SUBSCRIBED=set()
 ACCOUNT_TICK_LAST_ATTEMPT={}
@@ -419,7 +419,7 @@ async def account_tick_subscription_worker():
         except Exception as e:
             log.warning("ACCOUNT_TICK_SUBSCRIPTION_WORKER_ERROR type=%s message=%s",
                         type(e).__name__,str(e)[:160])
-        await asyncio.sleep(5.0)
+        await asyncio.sleep(2.0)
 
 async def telegram(text, chat_id=None):
     token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
@@ -714,11 +714,11 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
             # rejects with invalid_request. Use the read-only short-interval
             # quote snapshot instead; it is timestamped locally and never
             # fabricates a price.
-            retry_pairs=[x["pair"] for x in raw[:8]]
+            retry_pairs=[x["pair"] for x in raw[:16]]
             await ensure_candidate_quotes(retry_pairs)
-            live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),QUOTE_SNAPSHOT_MAX_AGE)]
-            log.info("LIVE_PRICE_GUARD qualified=%d fresh=%d snapshot_requested=%d",
-                     len(raw),len(live_raw),len(retry_pairs))
+            live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
+            log.info("LIVE_PRICE_GUARD source=authenticated_event1 requested=%d fresh=%d",
+                     len(retry_pairs),len(live_raw))
         if not live_raw:
             return None
         top=live_raw[:20]
@@ -840,7 +840,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
             continue
         if int(candidate.get("confidence") or 0) < 90:
             continue
-        if require_live_price and not has_fresh_live_price(candidate["pair"],now_cache,QUOTE_SNAPSHOT_MAX_AGE):
+        if require_live_price and not has_fresh_live_price(candidate["pair"],now_cache,LIVE_TICK_MAX_AGE):
             continue
         cached_candidates.append(candidate.copy())
     cached_ranked=rank_signal_candidates(cached_candidates)
@@ -1270,6 +1270,7 @@ async def market_worker():
             log.info("ACCOUNT_ASSET_SOURCE account_id=%s source_count=%d open_real=%d open_otc=%d open_total=%d",
                      client.account_id,len(assets),real_n,otc_n,len(assets))
             log.info("ALL_ACCOUNT_OPEN_ASSETS_READY count=%d",len(assets))
+            await ensure_account_tick_subscriptions()
             # Individual event-12 subscriptions are managed by the dedicated
             # read-only worker below. Event-1 ticks are preferred when delivered;
             # the snapshot scanner remains a timestamped fallback for assets
@@ -1367,7 +1368,7 @@ async def main():
     await load_persistent_learning()
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
-    await asyncio.gather(market_worker(),account_live_feed_worker(),cycle_loop(),server.serve_forever())
+    await asyncio.gather(market_worker(),account_tick_subscription_worker(),account_live_feed_worker(),cycle_loop(),server.serve_forever())
 if __name__=="__main__":asyncio.run(main())
 
 
