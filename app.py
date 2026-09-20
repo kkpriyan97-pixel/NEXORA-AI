@@ -1091,6 +1091,42 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
 async def result_watch(key):
     s=BRAIN.active_signals.get(key)
     if not s:return
+
+    # The alert is sent 30s before the entry boundary. The old code incorrectly
+    # used that pre-entry reference as the actual entry price, which could
+    # reverse the WIN/LOSS classification and then poison persistent learning.
+    await asyncio.sleep(max(0,s.entry_ts-time.time()))
+
+    entry_price=None
+    entry_source=""
+    entry_deadline=time.time()+8.0
+    while time.time()<entry_deadline and entry_price is None:
+        rec=STATE["prices"].get(s.pair)
+        if rec and rec[0] is not None and has_fresh_live_price(s.pair,time.time(),LIVE_TICK_MAX_AGE):
+            try:
+                entry_price=float(rec[0])
+                entry_source=STATE["price_source"].get(s.pair,"tick")
+                break
+            except (TypeError,ValueError):
+                pass
+        try:
+            await ensure_candidate_quotes([s.pair])
+        except Exception as e:
+            log.warning("ACTUAL_ENTRY_REFRESH_FAILED pair=%s type=%s message=%s",
+                        s.pair,type(e).__name__,str(e)[:120])
+        await asyncio.sleep(0.10)
+
+    if entry_price is None:
+        # Never feed a 30s-old reference price back into Brain learning.
+        log.warning("ACTUAL_ENTRY_UNAVAILABLE pair=%s target=%s reason=no_fresh_authenticated_price",
+                    s.pair,s.entry_ts)
+        return
+
+    s.entry_price=entry_price
+    log.info("ACTUAL_ENTRY_CAPTURED pair=%s entry=%.12g source=%s entry_ts=%s",
+             s.pair,s.entry_price,entry_source,
+             datetime.fromtimestamp(s.entry_ts,tz=timezone.utc).strftime("%H:%M:%S"))
+
     await asyncio.sleep(max(0,s.expiry_minutes*60-(time.time()-s.entry_ts)))
 
     # Result verification is based only on a completed candle.
@@ -1210,6 +1246,8 @@ async def cycle_loop():
         s=BRAIN.mark_signal_sent(
             pair=p,display_name=candidate["display_name"],
             direction=candidate["direction"],expiry_minutes=candidate["expiry_minutes"],
+            # This is the pre-entry reference shown in the alert. The actual
+            # entry price is captured at target by result_watch().
             entry_price=entry,entry_ts=target,
             entry_candle_ts=candidate["entry_candle_ts"],
             strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence,
@@ -1227,7 +1265,7 @@ async def cycle_loop():
              f"<b>⏱️ {s.expiry_minutes} MIN EXPIRY</b>\n\n"
              f"🕒 {uae_time(ts)} UAE\n"
              f"🎯 Entry → {uae_time(target)}\n\n"
-             f"💰 {s.entry_price}\n"
+             f"💰 Reference → {s.entry_price}\n"
              f"🎯 Confidence → {s.confidence}%\n\n"
              f"📈 Trend → {s.trend_15m or '—'}\n"
              f"🕯️ Structure → {s.structure_1m or '—'}\n"
