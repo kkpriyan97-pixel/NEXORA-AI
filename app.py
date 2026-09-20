@@ -101,11 +101,16 @@ ACCOUNT_LIVE_SCAN_CURSOR=0
 # Account-wide event-1 tick subscription manager. Subscriptions are read-only;
 # the worker only requests market quotes and never places/modifies trades.
 ACCOUNT_TICK_SUB_SEM=asyncio.Semaphore(1)
-ACCOUNT_TICK_SUB_BATCH=16
-ACCOUNT_TICK_SUB_RETRY=30.0
-ACCOUNT_TICK_SUB_DELAY=0.25
+ACCOUNT_TICK_SUB_BATCH=4
+ACCOUNT_TICK_SUB_RETRY=2.0
+ACCOUNT_TICK_SUB_DELAY=0.15
+ACCOUNT_TICK_MAX_SLOTS=4
+ACCOUNT_TICK_ROTATE_INTERVAL=2.0
 ACCOUNT_TICK_SUBSCRIBED=set()
 ACCOUNT_TICK_LAST_ATTEMPT={}
+ACCOUNT_TICK_PINNED={}
+ACCOUNT_TICK_ROTATE_CURSOR=0
+ACCOUNT_TICK_LAST_ROTATION=0.0
 CLIENT=None
 LOCK=asyncio.Lock()
 
@@ -377,53 +382,123 @@ async def account_live_feed_worker():
         await asyncio.sleep(1.0)
 
 
+async def _unsubscribe_account_tick(pair):
+    client=CLIENT
+    if not client or not pair:
+        return False
+    try:
+        await asyncio.wait_for(client.market.unsubscribe_ticks(pair),timeout=4.0)
+        ACCOUNT_TICK_SUBSCRIBED.discard(pair)
+        log.info("ACCOUNT_TICK_UNSUBSCRIBE pair=%s status=accepted",pair)
+        return True
+    except Exception as e:
+        log.warning("ACCOUNT_TICK_UNSUBSCRIBE pair=%s status=failed type=%s message=%s",
+                    pair,type(e).__name__,str(e)[:120])
+        return False
+
+async def _subscribe_account_tick(pair):
+    client=CLIENT
+    if not client or not pair:
+        return False
+    async with ACCOUNT_TICK_SUB_SEM:
+        try:
+            await asyncio.wait_for(client.market.subscribe_ticks(pair),timeout=6.0)
+            ACCOUNT_TICK_SUBSCRIBED.add(pair)
+            ACCOUNT_TICK_LAST_ATTEMPT[pair]=time.time()
+            log.info("ACCOUNT_TICK_SUBSCRIBE pair=%s status=accepted",pair)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            ACCOUNT_TICK_LAST_ATTEMPT[pair]=time.time()
+            log.warning("ACCOUNT_TICK_SUBSCRIBE pair=%s status=rejected type=%s message=%s",
+                        pair,type(e).__name__,str(e)[:120])
+            return False
+
+def _tick_pinned_pairs():
+    now=time.time()
+    expired=[p for p,until in ACCOUNT_TICK_PINNED.items() if float(until)<=now]
+    for p in expired:
+        ACCOUNT_TICK_PINNED.pop(p,None)
+    return [p for p,until in ACCOUNT_TICK_PINNED.items() if float(until)>now]
+
+async def pin_account_tick_pairs(pairs,ttl=12.0):
+    """Pin up to the broker's four live-tick slots for the final candidate window."""
+    global ACCOUNT_TICK_LAST_ROTATION
+    unique=[]
+    seen=set()
+    for p in pairs or []:
+        p=str(p or "")
+        if p and p not in seen:
+            seen.add(p);unique.append(p)
+    targets=unique[:ACCOUNT_TICK_MAX_SLOTS]
+    until=time.time()+float(ttl)
+    for p in targets:
+        ACCOUNT_TICK_PINNED[p]=until
+
+    current=set(ACCOUNT_TICK_SUBSCRIBED)
+    for p in list(current):
+        if p not in targets:
+            await _unsubscribe_account_tick(p)
+
+    for p in targets:
+        if p not in ACCOUNT_TICK_SUBSCRIBED:
+            await _subscribe_account_tick(p)
+
+    ACCOUNT_TICK_LAST_ROTATION=time.time()
+    log.info("ACCOUNT_TICK_PIN targets=%s active=%s ttl=%.1f",
+             targets,sorted(ACCOUNT_TICK_SUBSCRIBED),float(ttl))
+    return sum(1 for p in targets if p in ACCOUNT_TICK_SUBSCRIBED)
+
 async def ensure_account_tick_subscriptions():
-    """Subscribe each signal-eligible account asset to the authenticated event-1 quote stream."""
+    """Rotate the authenticated event-1 tick slots across the exact account asset universe.
+
+    The broker currently accepts only a small number of simultaneous per-connection
+    pair subscriptions (observed at four). Do not hammer the same connection with
+    requests for all 53 pairs; rotate the four live slots and pin final candidates.
+    """
+    global ACCOUNT_TICK_ROTATE_CURSOR, ACCOUNT_TICK_LAST_ROTATION
     client=CLIENT
     if not client or not client.connection.is_connected:
         return
     assets=[a for a in list(STATE["assets"]) if a.get("signal_eligible",True) and a.get("pair")]
-    now=time.time()
-    pairs=[]
-    for a in assets:
-        p=a["pair"]
-        if p in ACCOUNT_TICK_SUBSCRIBED:
-            continue
-        if now-ACCOUNT_TICK_LAST_ATTEMPT.get(p,0.0) < ACCOUNT_TICK_SUB_RETRY:
-            continue
-        ACCOUNT_TICK_LAST_ATTEMPT[p]=now
-        pairs.append(p)
-        if len(pairs)>=ACCOUNT_TICK_SUB_BATCH:
-            break
-    if not pairs:
+    if not assets:
         return
 
+    pinned=_tick_pinned_pairs()
+    if pinned:
+        # During the final decision window, keep the pinned candidate assets live.
+        await pin_account_tick_pairs(pinned,ttl=max(1.0,max(ACCOUNT_TICK_PINNED[p]-time.time() for p in pinned)))
+        return
+
+    now=time.time()
+    if now-ACCOUNT_TICK_LAST_ROTATION < ACCOUNT_TICK_ROTATE_INTERVAL:
+        return
+
+    pairs=[str(a["pair"]) for a in assets]
+    n=len(pairs)
+    start=ACCOUNT_TICK_ROTATE_CURSOR % n
+    targets=[pairs[(start+i) % n] for i in range(min(ACCOUNT_TICK_MAX_SLOTS,n))]
+    ACCOUNT_TICK_ROTATE_CURSOR=(start+len(targets)) % n
+
+    # Free existing slots first; event 13 is the authenticated tick unsubscribe.
+    for p in list(ACCOUNT_TICK_SUBSCRIBED):
+        if p not in targets:
+            await _unsubscribe_account_tick(p)
+
     accepted=0
-    rejected=[]
-    # Send one subscription at a time. Bursting parallel websocket requests
-    # causes broker-side invalid_request responses and leaves most assets
-    # without an event-1 live stream.
-    for pair in pairs:
-        async with ACCOUNT_TICK_SUB_SEM:
-            try:
-                await asyncio.wait_for(client.market.subscribe_ticks(pair),timeout=6.0)
-                ACCOUNT_TICK_SUBSCRIBED.add(pair)
-                accepted+=1
-                log.info("ACCOUNT_TICK_SUBSCRIBE pair=%s status=accepted",pair)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                rejected.append((pair,type(e).__name__,str(e)[:120]))
-                log.warning("ACCOUNT_TICK_SUBSCRIBE pair=%s status=rejected type=%s message=%s",
-                            pair,type(e).__name__,str(e)[:120])
+    for p in targets:
+        if p in ACCOUNT_TICK_SUBSCRIBED:
+            continue
+        if await _subscribe_account_tick(p):
+            accepted+=1
         await asyncio.sleep(ACCOUNT_TICK_SUB_DELAY)
 
-    log.info("ACCOUNT_TICK_SUBSCRIBE_BATCH requested=%d accepted=%d rejected=%d active=%d",
-             len(pairs),accepted,len(rejected),len(ACCOUNT_TICK_SUBSCRIBED))
-    if rejected:
-        log.info("ACCOUNT_TICK_SUBSCRIBE_REJECTED sample=%s",rejected[:12])
+    ACCOUNT_TICK_LAST_ROTATION=now
+    log.info("ACCOUNT_TICK_SLOT_ROTATION targets=%s accepted=%d active=%d cursor=%d",
+             targets,accepted,len(ACCOUNT_TICK_SUBSCRIBED),ACCOUNT_TICK_ROTATE_CURSOR)
 
-async def account_tick_subscription_worker():
+async def account_tick_subscription_worker():async def account_tick_subscription_worker():
     while True:
         try:
             if CLIENT and CLIENT.connection.is_connected:
@@ -517,32 +592,17 @@ def tick_received_at(pair):
 
 async def ensure_candidate_ticks(pairs):
     client=CLIENT
-    if not client or not pairs:return 0
+    if not client or not pairs:
+        return 0
     unique=[]
     seen=set()
     for p in pairs:
         p=str(p or "")
         if p and p not in seen:
             seen.add(p);unique.append(p)
-
-    successes=0
-    async def one(pair):
-        nonlocal successes
-        async with TICK_RESUB_SEM:
-            try:
-                await asyncio.wait_for(client.market.subscribe_ticks(pair),timeout=TICK_RESUB_TIMEOUT)
-                successes+=1
-            except Exception as e:
-                log.debug("TICK_RESUBSCRIBE_FAILED pair=%s type=%s message=%s",
-                          pair,type(e).__name__,str(e)[:120])
-
-    await asyncio.gather(*(one(p) for p in unique),return_exceptions=True)
-    if successes:
-        log.info("TICK_RESUBSCRIBE_ATTEMPT pairs=%d succeeded=%d",len(unique),successes)
-        await asyncio.sleep(0.15)
-    return successes
-
-async def ensure_candidate_quotes(pairs):
+    # Pin the strongest candidates so the broker's limited event-1 slots are
+    # dedicated to the exact assets needed for the final signal boundary.
+    return await pin_account_tick_pairs(unique,ttl=12.0)async def ensure_candidate_quotes(pairs):
     """Refresh candidate quotes from the authenticated event-1 stream, never from a snapshot API."""
     client=CLIENT
     if not client or not pairs:
