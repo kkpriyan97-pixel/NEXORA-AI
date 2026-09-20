@@ -96,13 +96,13 @@ AI_REVIEW_TIMEOUT=2.4
 # Rotating account-wide live quote scan. It does not touch Brain timing; it only
 # keeps current account prices warm for analysis/candidate selection.
 ACCOUNT_LIVE_SCAN_BATCH=16
-ACCOUNT_LIVE_SCAN_INTERVAL=5.0
+ACCOUNT_LIVE_SCAN_INTERVAL=1.0
 ACCOUNT_LIVE_SCAN_CURSOR=0
 # Account-wide event-1 tick subscription manager. Subscriptions are read-only;
 # the worker only requests market quotes and never places/modifies trades.
 ACCOUNT_TICK_SUB_SEM=asyncio.Semaphore(4)
 ACCOUNT_TICK_SUB_BATCH=8
-ACCOUNT_TICK_SUB_RETRY=60.0
+ACCOUNT_TICK_SUB_RETRY=900.0
 ACCOUNT_TICK_SUBSCRIBED=set()
 ACCOUNT_TICK_LAST_ATTEMPT={}
 CLIENT=None
