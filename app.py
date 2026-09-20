@@ -100,7 +100,8 @@ ACCOUNT_LIVE_SCAN_INTERVAL=5.0
 ACCOUNT_LIVE_SCAN_CURSOR=0
 # Account-wide event-1 tick subscription manager. Subscriptions are read-only;
 # the worker only requests market quotes and never places/modifies trades.
-ACCOUNT_TICK_SUB_SEM=8
+ACCOUNT_TICK_SUB_SEM=asyncio.Semaphore(4)
+ACCOUNT_TICK_SUB_BATCH=8
 ACCOUNT_TICK_SUB_RETRY=60.0
 ACCOUNT_TICK_SUBSCRIBED=set()
 ACCOUNT_TICK_LAST_ATTEMPT={}
@@ -354,6 +355,8 @@ async def ensure_account_tick_subscriptions():
             continue
         ACCOUNT_TICK_LAST_ATTEMPT[p]=now
         pairs.append(p)
+        if len(pairs)>=ACCOUNT_TICK_SUB_BATCH:
+            break
     if not pairs:
         return
 
@@ -374,7 +377,12 @@ async def ensure_account_tick_subscriptions():
                 log.warning("ACCOUNT_TICK_SUBSCRIBE pair=%s status=rejected type=%s message=%s",
                             pair,type(e).__name__,str(e)[:120])
 
-    await asyncio.gather(*(one(p) for p in pairs),return_exceptions=True)
+    results=await asyncio.gather(*(one(p) for p in pairs),return_exceptions=True)
+    for p,r in zip(pairs,results):
+        if isinstance(r,asyncio.CancelledError):
+            rejected.append((p,"CancelledError","subscription task cancelled"))
+        elif isinstance(r,BaseException):
+            rejected.append((p,type(r).__name__,str(r)[:120]))
     log.info("ACCOUNT_TICK_SUBSCRIBE_BATCH requested=%d accepted=%d rejected=%d active=%d",
              len(pairs),accepted,len(rejected),len(ACCOUNT_TICK_SUBSCRIBED))
     if rejected:
@@ -585,7 +593,7 @@ async def refresh_candles(force=False):
                 try:
                     await asyncio.sleep(0.15 if attempt==1 else CANDLE_FETCH_RETRY_DELAY)
                     cs=await asyncio.wait_for(
-                        client.market.get_candles(p,size=60,count=60,solid=False),
+                        client.market.get_candles(p,size=60,count=60),
                         timeout=2.0
                     )
                     normalized=[]
@@ -858,7 +866,7 @@ async def result_watch(key):
         try:
             if client:
                 raw=await asyncio.wait_for(
-                    client.market.get_candles(s.pair,size=60,count=60,solid=False),
+                    client.market.get_candles(s.pair,size=60,count=60),
                     timeout=2.0
                 )
                 normalized=[]
