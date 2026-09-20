@@ -1,5 +1,5 @@
-import asyncio,json,logging,os,time
-from datetime import datetime,timezone
+import asyncio,json,logging,os,time,secrets,hashlib,re
+from datetime import datetime,timezone,timedelta
 from zoneinfo import ZoneInfo
 from typing import Any
 from telegram import Update
@@ -60,6 +60,131 @@ async def save_persistent_learning():
         log.warning("LEARNING_STATE_SAVE_FAILED type=%s message=%s",type(e).__name__,str(e)[:180])
 BRAIN=BrainState()
 UAE_TZ=ZoneInfo("Asia/Dubai")
+
+# Secure member access: one admin-generated code grants all MB* IDs for 24h.
+ACCESS_TTL=timedelta(hours=24)
+ACCESS_CODE_TTL=timedelta(hours=24)
+ACCESS_CODE_DIGITS=10
+ADMIN_TELEGRAM_ID=os.getenv("ADMIN_TELEGRAM_ID","").strip()
+ADMIN_EMAIL=os.getenv("ADMIN_EMAIL","").strip()
+RESEND_API_KEY=os.getenv("RESEND_API_KEY","").strip()
+ACCESS_CODE_FROM_EMAIL=os.getenv("ACCESS_CODE_FROM_EMAIL","").strip()
+
+def configured_member_ids():
+    ids=set()
+    for key,value in os.environ.items():
+        if re.fullmatch(r"MB[1-9][0-9]*",key) and value.strip():
+            try: ids.add(int(value.strip()))
+            except ValueError: log.warning("MEMBER_ID_INVALID key=%s",key)
+    return ids
+
+def _access_code_hash(code): return hashlib.sha256(code.encode()).hexdigest()
+
+async def ensure_access_table():
+    if not LEARNING_DB_URL: log.error("MEMBER_ACCESS_DB_REQUIRED"); return False
+    try:
+        import psycopg
+        def init():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""CREATE TABLE IF NOT EXISTS nexora_member_access (
+                        id SMALLINT PRIMARY KEY, code_hash TEXT, code_expires_at TIMESTAMPTZ,
+                        access_expires_at TIMESTAMPTZ, granted_at TIMESTAMPTZ,
+                        granted_by BIGINT, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+                    cur.execute("""CREATE TABLE IF NOT EXISTS nexora_access_audit (
+                        id BIGSERIAL PRIMARY KEY, event TEXT NOT NULL, actor BIGINT,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
+                db.commit()
+        await asyncio.to_thread(init); return True
+    except Exception as e:
+        log.error("MEMBER_ACCESS_DB_INIT_FAILED type=%s message=%s",type(e).__name__,str(e)[:160]); return False
+
+async def audit_access(event,actor=None):
+    if not LEARNING_DB_URL: return
+    try:
+        import psycopg
+        def write():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur: cur.execute("INSERT INTO nexora_access_audit(event,actor) VALUES(%s,%s)",(event,actor))
+                db.commit()
+        await asyncio.to_thread(write)
+    except Exception as e: log.warning("ACCESS_AUDIT_FAILED type=%s",type(e).__name__)
+
+async def send_access_code_email(code):
+    if not (RESEND_API_KEY and ADMIN_EMAIL and ACCESS_CODE_FROM_EMAIL):
+        log.error("ACCESS_EMAIL_NOT_CONFIGURED"); return False
+    try:
+        payload={"from":ACCESS_CODE_FROM_EMAIL,"to":[ADMIN_EMAIL],"subject":"NEXORA-AI Admin Access Code",
+                 "text":f"NEXORA-AI 24-hour member access code:\n\n{code}\n\nUse /mbaccess CODE from your Admin Telegram only."}
+        async with httpx.AsyncClient(timeout=10) as h:
+            r=await h.post("https://api.resend.com/emails",headers={"Authorization":f"Bearer {RESEND_API_KEY}","Content-Type":"application/json"},json=payload)
+            r.raise_for_status()
+        return True
+    except Exception as e:
+        log.error("ACCESS_EMAIL_SEND_FAILED type=%s message=%s",type(e).__name__,str(e)[:160]); return False
+
+async def generate_member_access_code(actor):
+    if str(actor)!=ADMIN_TELEGRAM_ID or not await ensure_access_table(): return False
+    code="".join(str(secrets.randbelow(10)) for _ in range(ACCESS_CODE_DIGITS))
+    now=datetime.now(timezone.utc)
+    try:
+        import psycopg
+        def save():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""INSERT INTO nexora_member_access
+                    (id,code_hash,code_expires_at,access_expires_at,granted_at,granted_by)
+                    VALUES(1,%s,%s,NULL,NULL,%s)
+                    ON CONFLICT(id) DO UPDATE SET code_hash=EXCLUDED.code_hash,
+                    code_expires_at=EXCLUDED.code_expires_at,access_expires_at=NULL,
+                    granted_at=NULL,granted_by=EXCLUDED.granted_by,updated_at=NOW()""",
+                    (_access_code_hash(code),now+ACCESS_CODE_TTL,actor))
+                db.commit()
+        await asyncio.to_thread(save)
+        if await send_access_code_email(code):
+            await audit_access("CODE_GENERATED",int(actor))
+            log.info("MEMBER_ACCESS_CODE_GENERATED status=sent expires=%s",(now+ACCESS_CODE_TTL).isoformat()); return True
+        return False
+    except Exception as e:
+        log.error("MEMBER_ACCESS_CODE_SAVE_FAILED type=%s message=%s",type(e).__name__,str(e)[:160]); return False
+
+async def grant_member_access(actor,code):
+    if str(actor)!=ADMIN_TELEGRAM_ID:
+        await audit_access("UNAUTHORIZED_MBACCESS_ATTEMPT",int(actor) if str(actor).isdigit() else None); return "DENIED"
+    if not code or len(code)!=ACCESS_CODE_DIGITS or not code.isdigit(): return "INVALID"
+    if not configured_member_ids(): return "NO_MEMBERS"
+    if not await ensure_access_table(): return "DB_ERROR"
+    now=datetime.now(timezone.utc)
+    try:
+        import psycopg
+        def verify():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("SELECT code_hash,code_expires_at FROM nexora_member_access WHERE id=1"); row=cur.fetchone()
+                    if not row or not row[0] or not row[1] or row[1]<=now: return "EXPIRED"
+                    if not secrets.compare_digest(str(row[0]),_access_code_hash(code)): return "INVALID"
+                    cur.execute("UPDATE nexora_member_access SET access_expires_at=%s,granted_at=%s,granted_by=%s,updated_at=NOW() WHERE id=1",(now+ACCESS_TTL,now,actor))
+                    cur.execute("INSERT INTO nexora_access_audit(event,actor) VALUES(%s,%s)",("ACCESS_GRANTED",actor))
+                db.commit(); return "GRANTED"
+        result=await asyncio.to_thread(verify)
+        if result=="GRANTED": log.info("MEMBER_ACCESS_GRANTED member_count=%d expires=%s",len(configured_member_ids()),(now+ACCESS_TTL).isoformat())
+        return result
+    except Exception as e:
+        log.error("MEMBER_ACCESS_VERIFY_FAILED type=%s message=%s",type(e).__name__,str(e)[:160]); return "DB_ERROR"
+
+async def member_access_active(telegram_id):
+    if telegram_id not in configured_member_ids() or not LEARNING_DB_URL: return False
+    try:
+        import psycopg
+        now=datetime.now(timezone.utc)
+        def read():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("SELECT access_expires_at FROM nexora_member_access WHERE id=1"); row=cur.fetchone()
+                    return bool(row and row[0] and row[0]>now)
+        return await asyncio.to_thread(read)
+    except Exception: return False
+
 
 def uae_time(ts):
     return datetime.fromtimestamp(float(ts),tz=UAE_TZ).strftime("%H:%M:%S")
@@ -1405,11 +1530,36 @@ async def market_worker():
             CLIENT=None
 
 async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "✅ NEXORA AI is online.\\n\\n"
-        "Candice Brain: LIVE\\n"
-        "Mode: DEMO / Read-only"
-    )
+    msg=update.message
+    if not msg: return
+    uid=msg.from_user.id if msg.from_user else None
+    if uid is not None and str(uid)==ADMIN_TELEGRAM_ID:
+        await msg.reply_text("✅ NEXORA-AI Admin online. Use /mbcode to generate a 24-hour member code.")
+    elif uid is not None and await member_access_active(uid):
+        await msg.reply_text("✅ Access active. Signal + Result delivery is enabled.")
+    else:
+        await msg.reply_text("🔒 Member access is not active. Contact the administrator.")
+
+async def handle_telegram_command(msg):
+    if not msg: return
+    uid=msg.get("from",{}).get("id"); chat_id=(msg.get("chat") or {}).get("id")
+    txt=str(msg.get("text") or "").strip()
+    if uid is None or chat_id is None: return
+    cmd=txt.split()[0].lower() if txt else ""
+    if cmd=="/mbcode":
+        if str(uid)!=ADMIN_TELEGRAM_ID:
+            await audit_access("UNAUTHORIZED_MBCODE_ATTEMPT",int(uid)); await telegram("❌ Admin only.",chat_id=chat_id); return
+        ok=await generate_member_access_code(uid)
+        await telegram("✅ Code generated and sent to your admin email." if ok else "❌ Code generation failed.",chat_id=chat_id); return
+    if cmd=="/mbaccess":
+        parts=txt.split(maxsplit=1); code=parts[1].strip() if len(parts)==2 else ""
+        result=await grant_member_access(uid,code)
+        messages={"GRANTED":"✅ ACCESS VERIFICATION SUCCESS\n\nAll configured MB members now have access for 24 hours.","DENIED":"❌ Admin only.","INVALID":"❌ Invalid access code.","EXPIRED":"❌ Code expired or no active code.","NO_MEMBERS":"❌ No MB1/MB2/... member IDs configured.","DB_ERROR":"❌ Access system unavailable."}
+        await telegram(messages.get(result,"❌ Access verification failed."),chat_id=chat_id); return
+    if cmd=="/start":
+        await telegram("🔒 NEXORA-AI\n\nAccess is controlled by the administrator.",chat_id=chat_id)
+        return
+
 
 
 async def health(reader,writer):
@@ -1446,12 +1596,10 @@ async def health(reader,writer):
                 if chat_id is not None:
                     STATE["telegram_chat_id"]=chat_id
                     log.info("TELEGRAM_CHAT_ID_CAPTURED chat_id=%s",chat_id)
-                if txt.lower().startswith("/start") and chat_id is not None:
-                    sent=await telegram("✅ NEXORA AI is online.\n\nCandice Brain: LIVE\nMode: DEMO / Read-only", chat_id=chat_id)
-                    log.info("TELEGRAM_START_RECEIVED chat_id=%s sent=%s",chat_id,sent)
+                await handle_telegram_command(msg)
             except Exception as e:
                 log.warning("TELEGRAM_WEBHOOK_PARSE_FAILED %s",e)
-        body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"network":STATE.get("network",{})}).encode()
+        body_out=json.dumps({"service":"NEXORA-AI","status":"ok","read_only":True}).encode()
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"+body_out);await writer.drain()
     finally:writer.close()
 
@@ -1477,6 +1625,7 @@ async def configure_telegram_webhook():
 
 async def main():
     await load_persistent_learning()
+    await ensure_access_table()
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
     await asyncio.gather(market_worker(),account_tick_subscription_worker(),account_live_feed_worker(),cycle_loop(),server.serve_forever())
