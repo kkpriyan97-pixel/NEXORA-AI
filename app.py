@@ -1523,10 +1523,18 @@ async def market_worker():
         client.register_callback(parameters.E_ASSET_PROFITABILITY_UPDATE,on_asset_update)
         try:
             STATE["status"]="connecting"
-            # Network geolocation is diagnostic only and can be rate-limited;
-            # it must never block authenticated market connectivity.            await client.start()
+            # Let the websocket/auth handshake settle before the first
+            # application-level subscription. A deployment/re-authentication
+            # can otherwise drop the socket in the small window between
+            # websocket establishment and session initialization.
+            await client.start()
+            await asyncio.sleep(1.0)
+            if not client.connection.is_connected:
+                raise ConnectionError("WebSocket dropped during startup stabilization")
             STATE["status"]="connected"
             await client.initialize_session()
+            if not client.connection.is_connected:
+                raise ConnectionError("WebSocket dropped during session initialization")
 
             # IMPORTANT: e:55 is the balance/account-set feed, but its
             # account_id fields are not the only identity fields used by the
@@ -1660,7 +1668,12 @@ async def market_worker():
                     else:
                         log.warning("ACCOUNT_ASSET_SYNC_RETAINED count=%d",len(STATE["assets"]))
         except Exception as e:
-            STATE["status"]=("account_token_mismatch" if "Access token does not expose configured demo account" in str(e) else "error");log.exception("MARKET_WORKER_ERROR %s",e);await asyncio.sleep(30)
+            STATE["status"]=("account_token_mismatch" if "Access token does not expose configured demo account" in str(e) else "error")
+            log.exception("MARKET_WORKER_ERROR %s",e)
+            # Connection startup failures are retried quickly so a transient
+            # broker websocket drop cannot suppress the next signal cycle.
+            retry_delay=4 if "Not connected" in str(e) or "WebSocket dropped" in str(e) else 30
+            await asyncio.sleep(retry_delay)
         finally:
             try:await client.stop()
             except Exception:pass
