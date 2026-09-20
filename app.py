@@ -694,6 +694,36 @@ async def telegram(text, chat_id=None):
     except Exception as e:
         log.warning("TELEGRAM_SEND_FAILED type=%s message=%s",type(e).__name__,str(e)[:200]);return False
 
+async def send_learning_summary(summary):
+    if not summary:
+        return
+    lines=[
+        "📚 CANDICE BRAIN • 10-SIGNAL LEARNING SUMMARY",
+        "",
+        f"🧠 Learning Batch → #{summary.get('batch_no')}",
+        f"📊 Signals → {summary.get('signals',0)}",
+        f"🟢 WIN → {summary.get('wins',0)}",
+        f"🔴 LOSS → {summary.get('losses',0)}",
+        f"🟡 TIE → {summary.get('ties',0)}",
+        f"📈 Win Rate → {summary.get('win_rate',0):.1f}%",
+        "",
+        "🧠 BRAIN STRATEGY RESULTS"
+    ]
+    for name,b in sorted((summary.get("strategies") or {}).items(),key=lambda kv:(-kv[1].get("n",0),kv[0])):
+        lines.append(f"• {name}: {b.get('win',0)}W / {b.get('loss',0)}L / {b.get('tie',0)}T")
+    lines += ["","🧬 SELF STRATEGY RESULTS"]
+    for name,b in sorted((summary.get("self_strategies") or {}).items(),key=lambda kv:(-kv[1].get("n",0),kv[0])):
+        lines.append(f"• {name}: {b.get('win',0)}W / {b.get('loss',0)}L / {b.get('tie',0)}T")
+    lines += ["","⏱️ EXPIRY RESULTS"]
+    for name,b in sorted((summary.get("expiries") or {}).items(),key=lambda kv:int(kv[0])):
+        lines.append(f"• {name} MIN: {b.get('win',0)}W / {b.get('loss',0)}L / {b.get('tie',0)}T")
+    lines += ["","📖 WHAT BRAIN LEARNED"]
+    lines.extend(f"• {x}" for x in (summary.get("lessons") or []))
+    lines += ["","🔐 Learning scope → authenticated token account only",
+              "⏸️ Account cooldown → 10 MIN",
+              "⚠️ Cooldown pauses new signals for this authenticated account only."]
+    await telegram("\n".join(lines),chat_id=ADMIN_TELEGRAM_ID)
+
 async def telegram_background(text_msg,label):
     try:
         sent=await asyncio.wait_for(telegram(text_msg),timeout=5.0)
@@ -1200,6 +1230,12 @@ async def result_watch(key):
 
     rec=BRAIN.finish_signal(key,expiry_price)
     await save_persistent_learning()
+    batch_summary=BRAIN.consume_batch_summary()
+    if batch_summary:
+        log.info("LEARNING_10_SIGNAL_SUMMARY batch=%s wins=%s losses=%s ties=%s cooldown_seconds=%s account_id=%s",
+                 batch_summary.get("batch_no"),batch_summary.get("wins"),batch_summary.get("losses"),
+                 batch_summary.get("ties"),batch_summary.get("cooldown_seconds"),batch_summary.get("account_id"))
+        await send_learning_summary(batch_summary)
     label=rec["display_name"]
     direction_icon="⬆️" if rec["direction"]=="UP" else "⬇️"
     result_icon={"WIN":"✅","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
@@ -1240,7 +1276,7 @@ async def cycle_loop():
     last_target=0
 
     async def send_cycle_signal(candidate,target):
-        if not candidate or not BRAIN.can_send_cycle_signal():
+        if not candidate or not BRAIN.can_send_cycle_signal(STATE.get("account_id")):
             return False
 
         p=candidate["pair"]
@@ -1272,6 +1308,7 @@ async def cycle_loop():
             return False
 
         s=BRAIN.mark_signal_sent(
+            account_id=STATE.get("account_id"),
             pair=p,display_name=candidate["display_name"],
             direction=candidate["direction"],expiry_minutes=candidate["expiry_minutes"],
             # This is the pre-entry reference shown in the alert. The actual
@@ -1548,6 +1585,7 @@ async def market_worker():
             STATE["account_id"]=resolved_account_id
             STATE["account_group"]="demo"
             STATE["status"]="authenticated_account_selected"
+            BRAIN.bind_learning_account(resolved_account_id)
             log.info(
                 "DEMO_ACCOUNT_SELECTED configured_id=%s account_id=%s group=demo source=authenticated_session",
                 expected_account_id,client.account_id
