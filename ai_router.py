@@ -164,3 +164,65 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
         raise RuntimeError(f"All configured AI providers failed: {type(last).__name__}")
     log.warning("AI_NO_CONFIGURED_PROVIDER providers=%s",",".join(_providers()))
     return None
+
+
+async def review_result_with_fallback(rec:dict[str,Any])->dict[str,Any]|None:
+    """Mandatory post-result AI audit. It explains the outcome and emits a reusable lesson."""
+    ind=dict(rec.get("indicator_context") or {})
+    payload={
+        "task":"Post-result audit for Candice Brain. Do not generate a new trade signal. Explain what the completed result teaches and what exact lesson should be reused when the same market context appears again.",
+        "outcome":{
+            "result":str(rec.get("result") or ""),
+            "direction":str(rec.get("direction") or ""),
+            "entry":rec.get("entry_price"),
+            "exit":rec.get("exit_price"),
+            "expiry_minutes":rec.get("expiry_minutes"),
+            "asset":str(rec.get("display_name") or rec.get("pair") or ""),
+            "strategy":str(rec.get("strategy") or ""),
+            "self_strategy":str(rec.get("self_strategy") or ""),
+            "confidence":rec.get("confidence"),
+            "trend_15m":str(rec.get("trend_15m") or ""),
+            "structure_1m":str(rec.get("structure_1m") or ""),
+            "pattern":str(rec.get("pattern") or ""),
+        },
+        "indicators":ind,
+        "required_output":{
+            "lesson":"one concise reusable lesson grounded only in supplied evidence",
+            "reuse":"what the Brain should check or change when the same context appears again",
+            "evidence":"the concrete indicator/context conflict or confirmation",
+            "confidence":"0-100"
+        }
+    }
+    prompt=("You are the post-result learning module of Candice Brain. "
+            "Use only the supplied completed-trade evidence. Never invent missing indicators. "
+            "Do not recommend a trade or claim future profitability. Return one JSON object only.\n"+
+            json.dumps(payload,ensure_ascii=False,separators=(",",":")))
+    http_timeout=min(3.0,max(1.5,float(os.getenv("AI_REVIEW_HTTP_TIMEOUT","2.2"))))
+    async with ANALYSIS_SEMAPHORE:
+        for name in _providers():
+            cfg=_cfg(name)
+            if not cfg: continue
+            now=time.time()
+            if now < PROVIDER_COOLDOWN.get(name,0): continue
+            base,model,key=cfg
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(http_timeout,connect=min(1.0,http_timeout))) as h:
+                    r=await h.post(base+"/chat/completions",
+                        headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+                        json={"model":model,"temperature":0,"messages":[
+                            {"role":"system","content":"Return only JSON with lesson, reuse, evidence, confidence."},
+                            {"role":"user","content":prompt}]})
+                    r.raise_for_status()
+                    data=_content_json(r.json()["choices"][0]["message"]["content"])
+                    lesson=str(data.get("lesson") or "").strip()
+                    if lesson:
+                        return {"lesson":lesson,"reuse":str(data.get("reuse") or "").strip(),
+                                "evidence":str(data.get("evidence") or "").strip(),
+                                "confidence":max(0,min(100,int(data.get("confidence") or 0))),
+                                "provider":name}
+            except Exception as e:
+                log.warning("AI_POST_RESULT_REVIEW_FAILED provider=%s type=%s message=%s",name,type(e).__name__,str(e)[:140])
+                if isinstance(e,(httpx.TimeoutException,httpx.NetworkError)):
+                    PROVIDER_COOLDOWN[name]=time.time()+TRANSIENT_COOLDOWN_SECONDS
+    return None
+
