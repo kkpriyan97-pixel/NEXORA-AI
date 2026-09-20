@@ -379,8 +379,8 @@ async def scan_account_live_feed():
         "ACCOUNT_LIVE_FEED_SCAN source=authenticated_websocket:event_1 assets=%d fresh_tick=%d recent_tick=%d recent_missing=%d",
         total,fresh,recent,len(recent_missing_pairs)
     )
-    if recent_missing_pairs:
-        log.info("ACCOUNT_LIVE_FEED_RECENT_MISSING pairs=%s",sorted(recent_missing_pairs))
+    # Keep production logs compact; the aggregate coverage count above is
+    # sufficient for the 1-minute account-feed health audit.
 
 
 async def account_live_feed_worker():
