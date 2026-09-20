@@ -61,6 +61,9 @@ class BrainState:
     learning_batch_no:int=0
     account_cooldown_until:float=0.0
     last_batch_summary:dict[str,Any]|None=None
+    # Post-result AI lessons are stored separately from raw outcome statistics.
+    post_result_lessons:dict[str,dict[str,Any]]=field(default_factory=dict)
+    last_ai_review:dict[str,Any]|None=None
 
     def bind_learning_account(self,account_id):
         try: account_id=int(account_id) if account_id is not None else None
@@ -238,6 +241,47 @@ class BrainState:
         self.last_batch_summary=None
         return summary
 
+
+    @staticmethod
+    def lesson_key(rec):
+        ind=dict(rec.get("indicator_context") or {})
+        bb=str(ind.get("bollinger_signal") or "UNKNOWN").upper()
+        bb_pos=str(ind.get("bollinger_position") or "UNKNOWN").upper()
+        dc=str(ind.get("donchian_state") or "UNKNOWN").upper()
+        st=str(ind.get("stochastic_cross") or "UNKNOWN").upper()
+        return "|".join([
+            str(rec.get("pair") or ""),
+            str(rec.get("direction") or "").upper(),
+            str(rec.get("strategy") or "UNKNOWN"),
+            str(rec.get("trend_15m") or "UNKNOWN").upper(),
+            str(rec.get("structure_1m") or "UNKNOWN").upper(),
+            f"BB:{bb}:{bb_pos}", f"DC:{dc}", f"ST:{st}"
+        ])
+
+    def apply_ai_review(self,rec,review):
+        """Persist a bounded post-result AI lesson for reuse on the same setup."""
+        if not isinstance(review,dict): return
+        key=self.lesson_key(rec)
+        result=str(rec.get("result") or "").upper()
+        if result not in {"WIN","LOSS","TIE"}: return
+        b=self.post_result_lessons.setdefault(key,{"n":0.0,"win":0.0,"loss":0.0,"tie":0.0,"weighted":0.0,"reviews":[]})
+        b[result.lower()]=float(b.get(result.lower(),0) or 0)+1.0
+        b["n"]=float(b.get("n",0) or 0)+1.0
+        b["weighted"]=float(b.get("weighted",0) or 0)+{"WIN":1.0,"LOSS":-1.0,"TIE":0.0}[result]
+        lesson=str(review.get("lesson") or "").strip()[:320]
+        action=str(review.get("reuse") or review.get("action") or "").strip()[:240]
+        evidence=str(review.get("evidence") or "").strip()[:320]
+        if lesson or action or evidence:
+            b["reviews"]=(b.get("reviews") or [])[-4:]+[{"result":result,"lesson":lesson,"reuse":action,"evidence":evidence,"ai_provider":str(review.get("provider") or "internal")}]
+        self.last_ai_review={"key":key,"pair":rec.get("pair"),"result":result,"lesson":lesson,"reuse":action,"evidence":evidence}
+
+    def post_result_learning_bonus(self,rec):
+        b=self.post_result_lessons.get(self.lesson_key(rec))
+        if not b: return 0.0
+        n=float(b.get("n",0) or 0)
+        if n<=0: return 0.0
+        return max(-3.0,min(3.0,(float(b.get("weighted",0) or 0)/n)*3.0))
+
     def finish_signal(self,key,exit_price,result_ts=None):
         s=self.active_signals.pop(key)
         result=self.classify_result(s.direction,s.entry_price,float(exit_price))
@@ -414,10 +458,18 @@ class BrainState:
             self_bonus=max(-2.0,min(2.0,float(self_bucket.get("weighted",0) or 0)*0.5))
         x["self_learning_bonus"]=round(self_bonus,2)
 
+        preview=dict(x)
+        preview["indicator_context"]=dict(x.get("indicators") or x.get("indicator_context") or {})
+        lesson_rec={"pair":pair,"direction":direction,"strategy":strategy,
+                    "trend_15m":str(x.get("trend_15m") or ""),
+                    "structure_1m":str(x.get("structure_1m") or ""),
+                    "indicator_context":preview["indicator_context"]}
+        x["post_result_learning_bonus"]=round(self.post_result_learning_bonus(lesson_rec),2)
+
         technical=float(x.get("market_quality") or x.get("confidence") or 0)
         x["market_quality"]=max(
             0.0,
-            min(100.0,technical+x["learning_bonus"]+self_bonus)
+            min(100.0,technical+x["learning_bonus"]+self_bonus+x["post_result_learning_bonus"])
         )
 
         # Confidence is the resulting evidence quality; do not manufacture +8
@@ -448,6 +500,8 @@ class BrainState:
             "pattern_stats": self.pattern_stats,
             "context_stats": self.context_stats,
             "indicator_stats": self.indicator_stats,
+            "post_result_lessons": self.post_result_lessons,
+            "last_ai_review": self.last_ai_review,
         }
 
     def import_learning(self, data):
@@ -470,6 +524,8 @@ class BrainState:
         self.pattern_stats=dict(data.get("pattern_stats") or {})
         self.context_stats=dict(data.get("context_stats") or {})
         self.indicator_stats=dict(data.get("indicator_stats") or {})
+        self.post_result_lessons=dict(data.get("post_result_lessons") or {})
+        self.last_ai_review=dict(data.get("last_ai_review") or {}) if data.get("last_ai_review") else None
 
     def prune_expired_cooldowns(self,now=None):
         now=utc_now() if now is None else now
