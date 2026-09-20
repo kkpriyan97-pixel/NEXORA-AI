@@ -263,7 +263,7 @@ class BrainState:
         # Bayesian smoothing prevents a single outcome from dominating.
         return (float(b.get("win",0))+0.5)/(n+1.0)
 
-    def learning_bonus(self,pair,strategy,expiry,direction="",pattern="",trend_15m="",structure_1m=""):
+    def learning_bonus(self,pair,strategy,expiry,direction="",pattern="",trend_15m="",structure_1m="",indicator_context=None):
         """Return a bounded learned adjustment without cross-strategy expiry drift."""
         vals=[]
 
@@ -301,13 +301,20 @@ class BrainState:
             2.0
         )
         indicator_bonus=0.0
-        # Do not let a small sample rewrite the brain: indicator-combination
-        # evidence becomes active only after 10 verified observations.
-        for _key,b in self.indicator_stats.items():
-            n=float(b.get("n",0) or 0)
-            if n>=10:
+        # Exact indicator-combination learning only; never transfer one
+        # successful setup blindly to unrelated indicator states.
+        ind=dict(indicator_context or {})
+        if ind:
+            key="DC:{}:{}|ST:{}:{}".format(
+                ind.get("donchian_state","UNKNOWN"),
+                "EXPANDING" if ind.get("donchian_expansion") else "FLAT",
+                "OVERSOLD" if ind.get("stochastic_oversold") else ("OVERBOUGHT" if ind.get("stochastic_overbought") else "MID"),
+                ind.get("stochastic_cross","NEUTRAL"))
+            b=self.indicator_stats.get(key)
+            n=float(b.get("n",0) or 0) if b else 0.0
+            if b and n>=10:
                 rate=self._rate(b)
-                indicator_bonus=max(indicator_bonus,max(-2.0,min(2.0,(rate-0.5)*4.0)))
+                indicator_bonus=max(-2.0,min(2.0,(rate-0.5)*4.0))
         return max(-8.0,min(8.0,base_bonus+strategy_bonus+pattern_bonus+context_bonus+indicator_bonus))
 
     def choose_expiry(self,pair,strategy,direction,live_quality=0,allow_5m=False):
