@@ -1420,6 +1420,24 @@ async def cycle_loop():
                 )
                 if new_candidate is not None:
                     candidate=new_candidate
+                    # Preserve the selected candidate on an authenticated event-1
+                    # tick slot until the exact entry boundary. The previous
+                    # rotation worker could evict a valid candidate 5-20s after
+                    # selection, leaving send_cycle_signal without a fresh quote
+                    # at target even though Brain had already qualified it.
+                    pin_ttl=max(12.0,target-time.time()+5.0)
+                    try:
+                        await pin_account_tick_pairs([new_candidate.get("pair")],ttl=pin_ttl)
+                        log.info(
+                            "FINAL_CANDIDATE_TICK_PINNED cycle=%s pair=%s ttl=%.1f target_utc=%s",
+                            cycle_id,new_candidate.get("pair"),pin_ttl,
+                            datetime.fromtimestamp(target,tz=timezone.utc).strftime("%H:%M:%S")
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "FINAL_CANDIDATE_TICK_PIN_FAILED cycle=%s pair=%s type=%s message=%s",
+                            cycle_id,new_candidate.get("pair"),type(e).__name__,str(e)[:120]
+                        )
                     log.info(
                         "SCAN_CANDIDATE_SELECTED cycle=%s scan=%s pair=%s confidence=%s strategy=%s expiry=%s",
                         cycle_id,scan_name,new_candidate.get("pair"),
