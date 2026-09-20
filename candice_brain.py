@@ -130,6 +130,7 @@ def analyze_asset(asset,candles,price=None):
         "display_name":str(asset.get("display_name") or asset.get("title") or ""),
         "direction":best["direction"],"confidence":confidence,
         "strategy":best["strategy"],"expiry_minutes":best["expiry_minutes"],
+        "self_strategy":self_profile["strategy"],"self_strategy_strength":self_profile["strength"],
         "pattern":pattern,"trend_15m":trend,"structure_1m":s1,
         "market_quality":best["score"],"reason":reason,\n        "self_strategy_version":best.get("self_strategy_version",""),
         "entry_candle_ts":last["time"],"price":p,
