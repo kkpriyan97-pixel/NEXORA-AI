@@ -1198,22 +1198,22 @@ async def market_worker():
                 # Search all already-received authenticated events for the
                 # configured ID without logging unrelated payload values.
                 target_hits=[]
-                def find_target(v,path="root"):
+                def find_target(v,path="root",event_code=None):
                     if isinstance(v,dict):
                         for k,val in v.items():
                             if str(val)==str(expected_account_id):
-                                target_hits.append(f"{k}@{path}")
+                                target_hits.append(f"e{event_code}:{k}@{path}")
                             if isinstance(val,(dict,list)):
-                                find_target(val,f"{path}.{k}")
+                                find_target(val,f"{path}.{k}",event_code)
                     elif isinstance(v,list):
                         for idx,val in enumerate(v):
                             if isinstance(val,(dict,list)):
-                                find_target(val,f"{path}[{idx}]")
+                                find_target(val,f"{path}[{idx}]",event_code)
                             elif str(val)==str(expected_account_id):
-                                target_hits.append(f"list_item@{path}[{idx}]")
+                                target_hits.append(f"e{event_code}:list_item@{path}[{idx}]")
                 for event_code,msgs in client._event_cache.items():
                     for msg in msgs:
-                        find_target(msg,"root")
+                        find_target(msg,"root",event_code)
                         if target_hits:
                             # Keep the diagnostic bounded; only event/path metadata
                             # is recorded, never the message payload itself.
