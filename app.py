@@ -1178,14 +1178,54 @@ async def market_worker():
                 # distinguishes a true account mismatch from an ID-semantic
                 # mismatch without logging tokens or financial payloads.
                 event55_identity={}
+                event55_records=[]
                 for msg in client.get_cached_events(parameters.E_BALANCE_UPDATE):
                     event55_identity.update(extract_identity_fields(msg))
+                    data=msg.get("d") if isinstance(msg,dict) else None
+                    if isinstance(data,list):
+                        for idx,rec in enumerate(data):
+                            if isinstance(rec,dict):
+                                event55_records.append({
+                                    "index":idx,
+                                    "account_id":rec.get("account_id",rec.get("accountId")),
+                                    "group":rec.get("group",rec.get("account_group",rec.get("accountGroup"))),
+                                    "keys":sorted(str(k) for k in rec.keys()),
+                                })
                 event110_identity={}
                 for msg in client.get_cached_events(parameters.E_USER_INFO):
                     event110_identity.update(extract_identity_fields(msg))
+
+                # Search all already-received authenticated events for the
+                # configured ID without logging unrelated payload values.
+                target_hits=[]
+                def find_target(v,path="root"):
+                    if isinstance(v,dict):
+                        for k,val in v.items():
+                            if str(val)==str(expected_account_id):
+                                target_hits.append(f"{k}@{path}")
+                            if isinstance(val,(dict,list)):
+                                find_target(val,f"{path}.{k}")
+                    elif isinstance(v,list):
+                        for idx,val in enumerate(v):
+                            if isinstance(val,(dict,list)):
+                                find_target(val,f"{path}[{idx}]")
+                            elif str(val)==str(expected_account_id):
+                                target_hits.append(f"list_item@{path}[{idx}]")
+                for event_code,msgs in client._event_cache.items():
+                    for msg in msgs:
+                        find_target(msg,"root")
+                        if target_hits:
+                            # Keep the diagnostic bounded; only event/path metadata
+                            # is recorded, never the message payload itself.
+                            if len(target_hits)>20:
+                                target_hits=target_hits[:20]
+                                break
+                    if len(target_hits)>=20:
+                        break
+
                 log.error(
-                    "AUTH_IDENTITY_AUDIT expected=%s event55=%s event110=%s",
-                    expected_account_id,event55_identity,event110_identity
+                    "AUTH_IDENTITY_AUDIT expected=%s event55=%s event110=%s event55_records=%s target_hits=%s",
+                    expected_account_id,event55_identity,event110_identity,event55_records,target_hits
                 )
                 log.error(
                     "TOKEN_ACCOUNT_BINDING_FAILED expected_account_id=%s exposed_demo_accounts=%s",
