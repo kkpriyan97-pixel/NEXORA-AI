@@ -11,6 +11,10 @@ TRANSIENT_COOLDOWN_SECONDS=10.0
 DEFAULT_FALLBACKS=("GEMINI","GROQ","NVIDIA","OPENROUTER","MISTRAL")
 PROVIDER_LOCKS={}
 ANALYSIS_SEMAPHORE=asyncio.Semaphore(3)
+REVIEW_SEMAPHORE=asyncio.Semaphore(1)
+REVIEW_PROVIDER_COOLDOWN={}
+REVIEW_TRANSIENT_COOLDOWN_SECONDS=15.0
+REVIEW_429_COOLDOWN_SECONDS=120.0
 _logged_ready=set()
 
 def _providers():
@@ -166,8 +170,8 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
     return None
 
 
-async def review_result_with_fallback(rec:dict[str,Any])->dict[str,Any]|None:
-    """Mandatory post-result AI audit. It explains the outcome and emits a reusable lesson."""
+async def review_result_with_fallback(rec:dict[str,Any])->dict[str,Any]:
+    """One external post-result AI review attempt. Retries are owned by the durable queue."""
     ind=dict(rec.get("indicator_context") or {})
     payload={
         "task":"Post-result audit for Candice Brain. Do not generate a new trade signal. Explain what the completed result teaches and what exact lesson should be reused when the same market context appears again.",
@@ -197,32 +201,77 @@ async def review_result_with_fallback(rec:dict[str,Any])->dict[str,Any]|None:
             "Use only the supplied completed-trade evidence. Never invent missing indicators. "
             "Do not recommend a trade or claim future profitability. Return one JSON object only.\n"+
             json.dumps(payload,ensure_ascii=False,separators=(",",":")))
-    http_timeout=min(3.0,max(1.5,float(os.getenv("AI_REVIEW_HTTP_TIMEOUT","2.2"))))
-    async with ANALYSIS_SEMAPHORE:
-        for name in _providers():
+    try:
+        configured_timeout=float(os.getenv("AI_REVIEW_HTTP_TIMEOUT","8.0"))
+    except (TypeError,ValueError):
+        configured_timeout=8.0
+    http_timeout=max(3.0,min(15.0,configured_timeout))
+    connect_timeout=min(2.0,http_timeout)
+    async with REVIEW_SEMAPHORE:
+        providers=_providers()
+        log.info("AI_POST_RESULT_REVIEW_ATTEMPT providers=%s pair=%s result=%s",
+                 ",".join(providers),rec.get("pair"),rec.get("result"))
+        last=None
+        for name in providers:
             cfg=_cfg(name)
-            if not cfg: continue
-            now=time.time()
-            if now < PROVIDER_COOLDOWN.get(name,0): continue
+            if not cfg:
+                continue
+            cooldown_until=REVIEW_PROVIDER_COOLDOWN.get(name,0.0)
+            if time.time() < cooldown_until:
+                log.info("AI_POST_RESULT_PROVIDER_COOLDOWN provider=%s remaining=%.1fs",
+                         name,cooldown_until-time.time())
+                continue
             base,model,key=cfg
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(http_timeout,connect=min(1.0,http_timeout))) as h:
-                    r=await h.post(base+"/chat/completions",
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(http_timeout,connect=connect_timeout)
+                ) as h:
+                    r=await h.post(
+                        base+"/chat/completions",
                         headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
                         json={"model":model,"temperature":0,"messages":[
                             {"role":"system","content":"Return only JSON with lesson, reuse, evidence, confidence."},
-                            {"role":"user","content":prompt}]})
+                            {"role":"user","content":prompt},
+                        ]},
+                    )
                     r.raise_for_status()
                     data=_content_json(r.json()["choices"][0]["message"]["content"])
                     lesson=str(data.get("lesson") or "").strip()
-                    if lesson:
-                        return {"lesson":lesson,"reuse":str(data.get("reuse") or "").strip(),
-                                "evidence":str(data.get("evidence") or "").strip(),
-                                "confidence":max(0,min(100,int(data.get("confidence") or 0))),
-                                "provider":name}
+                    if not lesson:
+                        raise ValueError("provider returned empty lesson")
+                    try:
+                        confidence=max(0,min(100,int(float(data.get("confidence") or 0))))
+                    except (TypeError,ValueError):
+                        confidence=0
+                    log.info("AI_POST_RESULT_REVIEW_SUCCESS provider=%s pair=%s result=%s confidence=%s",
+                             name,rec.get("pair"),rec.get("result"),confidence)
+                    return {
+                        "lesson":lesson[:320],
+                        "reuse":str(data.get("reuse") or "").strip()[:240],
+                        "evidence":str(data.get("evidence") or "").strip()[:320],
+                        "confidence":confidence,
+                        "provider":name,
+                    }
+            except httpx.HTTPStatusError as e:
+                last=e
+                status=e.response.status_code
+                detail=e.response.text[:160].replace("\n"," ")
+                log.warning("AI_POST_RESULT_REVIEW_FAILED provider=%s status=%s detail=%s",
+                            name,status,detail)
+                if status==429:
+                    REVIEW_PROVIDER_COOLDOWN[name]=time.time()+REVIEW_429_COOLDOWN_SECONDS
+                elif status in (408,425,500,502,503,504,413):
+                    REVIEW_PROVIDER_COOLDOWN[name]=time.time()+REVIEW_TRANSIENT_COOLDOWN_SECONDS
+            except (httpx.TimeoutException,httpx.NetworkError) as e:
+                last=e
+                REVIEW_PROVIDER_COOLDOWN[name]=time.time()+REVIEW_TRANSIENT_COOLDOWN_SECONDS
+                log.warning("AI_POST_RESULT_REVIEW_FAILED provider=%s type=%s message=%s",
+                            name,type(e).__name__,str(e)[:140])
             except Exception as e:
-                log.warning("AI_POST_RESULT_REVIEW_FAILED provider=%s type=%s message=%s",name,type(e).__name__,str(e)[:140])
-                if isinstance(e,(httpx.TimeoutException,httpx.NetworkError)):
-                    PROVIDER_COOLDOWN[name]=time.time()+TRANSIENT_COOLDOWN_SECONDS
-    return None
-
+                last=e
+                log.warning("AI_POST_RESULT_REVIEW_FAILED provider=%s type=%s message=%s",
+                            name,type(e).__name__,str(e)[:140])
+    raise RuntimeError(
+        f"Post-result AI review unavailable across configured providers: "
+        f"{type(last).__name__ if last else 'no_provider'}"
+    )
