@@ -1106,30 +1106,35 @@ async def market_worker():
                                 break
                     if demo_found: break
                 if demo_found: break
-            if demo_found:
-                log.info("DEMO_ACCOUNT_SELECTED account_id=%s",client.account_id)
-                if not init_task.done():
-                    init_task.cancel()
-                try:
-                    await init_task
-                except asyncio.CancelledError:
-                    pass
-            else:
-                try: await init_task
-                except Exception as e: log.warning("SESSION_INIT_AFTER_EVENT55_FAILED %s",e)
-                for m in client.get_cached_events(55):
-                    d=m.get("d") if isinstance(m,dict) else None
-                    if isinstance(d,list):
-                        for a in d:
-                            if isinstance(a,dict) and a.get("group")=="demo" and a.get("account_id") is not None:
-                                client.account_id=a.get("account_id")
-                                client.account_group="demo"
-                                demo_found=True
-                                break
-                    if demo_found: break
-            if not demo_found:
-                log.error("DEMO_ACCOUNT_NOT_FOUND_IN_EVENT_55")
-                raise RuntimeError("DEMO account id not available from broker event 55")
+            # IMPORTANT: use the account ID explicitly bound to this access token.
+            # Do not silently switch to another demo wallet exposed in event 55.
+            expected_account_id=os.getenv("OLYMPTRADE_ACCOUNT_ID","128175463").strip()
+            try:
+                expected_account_id_int=int(expected_account_id)
+            except Exception:
+                raise RuntimeError("OLYMPTRADE_ACCOUNT_ID must be a numeric account id")
+
+            session_account_id=client.account_id if demo_found else None
+            if session_account_id is not None and int(session_account_id)!=expected_account_id_int:
+                log.warning(
+                    "ACCOUNT_ID_MISMATCH token_session_account=%s configured_account=%s; "
+                    "using configured account for account-scoped asset/live-feed requests",
+                    session_account_id,expected_account_id_int
+                )
+
+            if not init_task.done():
+                init_task.cancel()
+            try:
+                await init_task
+            except asyncio.CancelledError:
+                pass
+
+            client.account_id=expected_account_id_int
+            client.account_group="demo"
+            demo_found=True
+            STATE["account_id"]=expected_account_id_int
+            STATE["account_group"]="demo"
+            log.info("DEMO_ACCOUNT_SELECTED account_id=%s source=configured_token_account",client.account_id)
             if not await sync_account_assets(client,reason="initial"):
                 raise RuntimeError("Authenticated account asset scan returned no usable assets")
             STATE["status"]="live_read_only"
