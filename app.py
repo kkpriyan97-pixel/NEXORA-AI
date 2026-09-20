@@ -128,6 +128,27 @@ def extract_account_ids(value, group="demo"):
     walk(value)
     return sorted(set(found))
 
+def extract_identity_fields(value):
+    """Return only identity-like numeric fields for safe authentication diagnostics."""
+    out={}
+    keys={"account_id","accountId","user_id","userId","uid","customer_id","customerId","client_id","clientId"}
+    def walk(v,path="root"):
+        if isinstance(v,dict):
+            for k,val in v.items():
+                if k in keys:
+                    try:
+                        out[f"{path}.{k}"]=int(val)
+                    except (TypeError,ValueError):
+                        pass
+                if isinstance(val,(dict,list)):
+                    walk(val,f"{path}.{k}")
+        elif isinstance(v,list):
+            for idx,val in enumerate(v):
+                if isinstance(val,(dict,list)):
+                    walk(val,f"{path}[{idx}]")
+    walk(value)
+    return out
+
 def pair_name(x):
     return str(x.get("pair") or x.get("p") or x.get("symbol") or x.get("instrument") or x.get("id") or "")
 
@@ -1152,6 +1173,20 @@ async def market_worker():
             )
 
             if expected_account_id not in demo_accounts:
+                # Diagnostic only: compare identity-like fields from the
+                # authenticated account/balance and user-info events. This
+                # distinguishes a true account mismatch from an ID-semantic
+                # mismatch without logging tokens or financial payloads.
+                event55_identity={}
+                for msg in client.get_cached_events(parameters.E_BALANCE_UPDATE):
+                    event55_identity.update(extract_identity_fields(msg))
+                event110_identity={}
+                for msg in client.get_cached_events(parameters.E_USER_INFO):
+                    event110_identity.update(extract_identity_fields(msg))
+                log.error(
+                    "AUTH_IDENTITY_AUDIT expected=%s event55=%s event110=%s",
+                    expected_account_id,event55_identity,event110_identity
+                )
                 log.error(
                     "TOKEN_ACCOUNT_BINDING_FAILED expected_account_id=%s exposed_demo_accounts=%s",
                     expected_account_id,demo_accounts
