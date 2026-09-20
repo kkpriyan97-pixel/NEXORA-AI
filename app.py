@@ -81,7 +81,7 @@ TICK_RESUB_TIMEOUT=1.5
 LIVE_TICK_MAX_AGE=5.0
 QUOTE_SNAPSHOT_MAX_AGE=6.0
 QUOTE_SNAPSHOT_REFRESH=3.5
-QUOTE_SNAPSHOT_SEM=asyncio.Semaphore(3)
+QUOTE_SNAPSHOT_SEM=asyncio.Semaphore(8)
 QUOTE_SNAPSHOT_LAST={}
 AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=90.0
@@ -95,7 +95,7 @@ AI_PROVIDER_COOLDOWN={}
 AI_REVIEW_TIMEOUT=2.4
 # Rotating account-wide live quote scan. It does not touch Brain timing; it only
 # keeps current account prices warm for analysis/candidate selection.
-ACCOUNT_LIVE_SCAN_BATCH=16
+ACCOUNT_LIVE_SCAN_BATCH=64
 ACCOUNT_LIVE_SCAN_INTERVAL=5.0
 ACCOUNT_LIVE_SCAN_CURSOR=0
 # Account-wide event-1 tick subscription manager. Subscriptions are read-only;
@@ -569,12 +569,22 @@ def _closed_candles(candles,reference_ts=None):
         if ts is not None and ts < boundary:out.append(c)
     return out
 
+def _candle_closed_at(c):
+    """Return the actual close time of a 1-minute candle.
+
+    The broker's candle timestamp marks the candle START, not its close. A candle
+    stamped 09:57:00 closes at 09:58:00. Freshness must therefore be measured
+    from start+60s, while the closed-candle gate above remains unchanged.
+    """
+    ts=_candle_epoch(c)
+    return None if ts is None else ts+60.0
+
 def _candle_data_stale(pair,reference_ts=None):
     now=time.time() if reference_ts is None else float(reference_ts)
     closed=_closed_candles(STATE["candles"].get(pair,[]),now)
     if not closed:return True
-    ts=_candle_epoch(closed[-1])
-    return ts is None or (now-ts)>75.0
+    closed_at=_candle_closed_at(closed[-1])
+    return closed_at is None or (now-closed_at)>75.0
 
 async def refresh_candles(force=False):
     client=CLIENT;assets=list(STATE["assets"])
@@ -613,7 +623,8 @@ async def refresh_candles(force=False):
                         reference=time.time()
                         closed=_closed_candles(normalized,reference)
                         newest=_candle_epoch(closed[-1]) if closed else None
-                        age=(reference-newest) if newest is not None else None
+                        closed_at=_candle_closed_at(closed[-1]) if closed else None
+                        age=(reference-closed_at) if closed_at is not None else None
                         if newest is not None and age is not None and 0 <= age <= 75.0 and len(closed)>=45:
                             STATE["candles"][p]=normalized
                             CANDLE_FETCH_LAST[p]=time.time()
