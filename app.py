@@ -1114,35 +1114,45 @@ async def market_worker():
                                 break
                     if demo_found: break
                 if demo_found: break
-            # IMPORTANT: use the account ID explicitly bound to this access token.
-            # Do not silently switch to another demo wallet exposed in event 55.
-            expected_account_id=os.getenv("OLYMPTRADE_ACCOUNT_ID","128175463").strip()
-            try:
-                expected_account_id_int=int(expected_account_id)
-            except Exception:
-                raise RuntimeError("OLYMPTRADE_ACCOUNT_ID must be a numeric account id")
+            # Discover the account IDs that this access token actually exposes.
+            # Never invent/force an account ID that is not present in the authenticated session.
+            expected_account_id=int(os.getenv("OLYMPTRADE_ACCOUNT_ID","128175463").strip())
 
-            session_account_id=client.account_id if demo_found else None
-            if session_account_id is not None and int(session_account_id)!=expected_account_id_int:
-                log.warning(
-                    "ACCOUNT_ID_MISMATCH token_session_account=%s configured_account=%s; "
-                    "using configured account for account-scoped asset/live-feed requests",
-                    session_account_id,expected_account_id_int
+            demo_accounts=[]
+            try:
+                resp=await asyncio.wait_for(
+                    client.send_request(1068,[{"group":"demo"}],requires_response=True,timeout=8.0),
+                    timeout=9.0
+                )
+                data=resp.get("d") if isinstance(resp,dict) else None
+                if isinstance(data,list):
+                    for row in data:
+                        if isinstance(row,dict) and row.get("account_id") is not None:
+                            try:
+                                demo_accounts.append(int(row["account_id"]))
+                            except Exception:
+                                pass
+                demo_accounts=sorted(set(demo_accounts))
+                log.info("TOKEN_DEMO_ACCOUNTS_EXPOSED count=%d ids=%s",len(demo_accounts),demo_accounts)
+            except Exception as e:
+                log.warning("TOKEN_DEMO_ACCOUNT_DISCOVERY_FAILED type=%s message=%s",
+                            type(e).__name__,str(e)[:160])
+
+            if expected_account_id not in demo_accounts:
+                log.error(
+                    "TOKEN_ACCOUNT_BINDING_FAILED expected_account_id=%s exposed_demo_accounts=%s",
+                    expected_account_id,demo_accounts
+                )
+                raise RuntimeError(
+                    f"Access token does not expose configured demo account {expected_account_id}"
                 )
 
-            if not init_task.done():
-                init_task.cancel()
-            try:
-                await init_task
-            except asyncio.CancelledError:
-                pass
-
-            client.account_id=expected_account_id_int
+            client.account_id=expected_account_id
             client.account_group="demo"
-            demo_found=True
-            STATE["account_id"]=expected_account_id_int
+            STATE["account_id"]=expected_account_id
             STATE["account_group"]="demo"
-            log.info("DEMO_ACCOUNT_SELECTED account_id=%s source=configured_token_account",client.account_id)
+            log.info("DEMO_ACCOUNT_SELECTED account_id=%s source=token_session_verified",client.account_id)
+
             if not await sync_account_assets(client,reason="initial"):
                 raise RuntimeError("Authenticated account asset scan returned no usable assets")
             STATE["status"]="live_read_only"
