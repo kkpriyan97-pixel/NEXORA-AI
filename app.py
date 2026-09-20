@@ -370,12 +370,17 @@ async def scan_account_live_feed():
     now=time.time()
     total=len(assets)
     fresh=sum(1 for a in assets if has_fresh_live_price(a["pair"],now,LIVE_TICK_MAX_AGE))
-    recent=sum(1 for a in assets if has_fresh_live_price(a["pair"],now,LIVE_TICK_COVERAGE_MAX_AGE))
-    missing=total-recent
+    recent_missing_pairs=[
+        a["pair"] for a in assets
+        if not has_fresh_live_price(a["pair"],now,LIVE_TICK_COVERAGE_MAX_AGE)
+    ]
+    recent=total-len(recent_missing_pairs)
     log.info(
         "ACCOUNT_LIVE_FEED_SCAN source=authenticated_websocket:event_1 assets=%d fresh_tick=%d recent_tick=%d recent_missing=%d",
-        total,fresh,recent,missing
+        total,fresh,recent,len(recent_missing_pairs)
     )
+    if recent_missing_pairs:
+        log.info("ACCOUNT_LIVE_FEED_RECENT_MISSING pairs=%s",sorted(recent_missing_pairs))
 
 
 async def account_live_feed_worker():
