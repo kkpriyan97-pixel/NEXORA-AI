@@ -108,6 +108,26 @@ ACCOUNT_TICK_LAST_ATTEMPT={}
 CLIENT=None
 LOCK=asyncio.Lock()
 
+def extract_account_ids(value, group="demo"):
+    """Collect account IDs from authenticated session/account event payloads without logging secrets."""
+    found=[]
+    def walk(v):
+        if isinstance(v,dict):
+            g=v.get("group")
+            aid=v.get("account_id")
+            if aid is not None and (g is None or str(g).lower()==str(group).lower()):
+                try: found.append(int(aid))
+                except Exception: pass
+            for child in v.values():
+                if isinstance(child,(dict,list)):
+                    walk(child)
+        elif isinstance(v,list):
+            for child in v:
+                if isinstance(child,(dict,list)):
+                    walk(child)
+    walk(value)
+    return sorted(set(found))
+
 def pair_name(x):
     return str(x.get("pair") or x.get("p") or x.get("symbol") or x.get("instrument") or x.get("id") or "")
 
@@ -1097,8 +1117,8 @@ async def market_worker():
             await audit_outbound_network()
             await client.start()
             STATE["status"]="connected"
-            # Complete the browser-like session initialization first so all account
-            # metadata/subscriptions have settled before selecting the target account.
+            # Complete browser-like session initialization so authenticated account
+            # metadata and startup subscriptions are settled.
             try:
                 await client.initialize_session()
             except Exception as e:
@@ -1106,33 +1126,27 @@ async def market_worker():
 
             expected_account_id=int(os.getenv("OLYMPTRADE_ACCOUNT_ID","128175463").strip())
 
-            # Ask the authenticated session which DEMO account IDs it exposes.
-            # This is the authority for token/account binding; do not force an ID
-            # that the token does not actually expose.
-            demo_accounts=[]
-            try:
-                resp=await asyncio.wait_for(
-                    client.send_request(1068,[{"group":"demo"}],requires_response=True,timeout=8.0),
-                    timeout=9.0
-                )
-                data=resp.get("d") if isinstance(resp,dict) else None
-                if isinstance(data,list):
-                    for row in data:
-                        if isinstance(row,dict) and row.get("account_id") is not None:
-                            try:
-                                demo_accounts.append(int(row["account_id"]))
-                            except Exception:
-                                pass
-                demo_accounts=sorted(set(demo_accounts))
-                log.info("TOKEN_DEMO_ACCOUNTS_EXPOSED count=%d ids=%s",len(demo_accounts),demo_accounts)
-            except Exception as e:
-                log.warning("TOKEN_DEMO_ACCOUNT_DISCOVERY_FAILED type=%s message=%s",
-                            type(e).__name__,str(e)[:160])
+            # The broker's unsolicited event-55/account-info caches are the
+            # authoritative account universe for this access token. Collect ALL
+            # demo account IDs rather than silently taking the first one.
+            event55_accounts=[]
+            for msg in client.get_cached_events(55):
+                event55_accounts.extend(extract_account_ids(msg,"demo"))
+
+            event1068_accounts=[]
+            for msg in client.get_cached_events(1068):
+                event1068_accounts.extend(extract_account_ids(msg,"demo"))
+
+            demo_accounts=sorted(set(event55_accounts+event1068_accounts))
+            log.info(
+                "TOKEN_DEMO_ACCOUNTS_EXPOSED source=event55,event1068 count=%d ids=%s",
+                len(demo_accounts),demo_accounts
+            )
 
             if expected_account_id not in demo_accounts:
                 log.error(
-                    "TOKEN_ACCOUNT_BINDING_FAILED expected_account_id=%s exposed_demo_accounts=%s session_account_id=%s",
-                    expected_account_id,demo_accounts,client.account_id
+                    "TOKEN_ACCOUNT_BINDING_FAILED expected_account_id=%s exposed_demo_accounts=%s",
+                    expected_account_id,demo_accounts
                 )
                 STATE["account_id"]=None
                 STATE["account_group"]="demo"
@@ -1141,12 +1155,11 @@ async def market_worker():
                     f"Access token does not expose configured demo account {expected_account_id}"
                 )
 
-            # Only now bind the client to the verified account.
             client.account_id=expected_account_id
             client.account_group="demo"
             STATE["account_id"]=expected_account_id
             STATE["account_group"]="demo"
-            log.info("DEMO_ACCOUNT_SELECTED account_id=%s source=token_session_verified",client.account_id)
+            log.info("DEMO_ACCOUNT_SELECTED account_id=%s source=authenticated_session_verified",client.account_id)
 
             if not await sync_account_assets(client,reason="initial"):
                 raise RuntimeError("Authenticated account asset scan returned no usable assets")
