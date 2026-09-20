@@ -312,11 +312,70 @@ def extract_identity_fields(value):
 def pair_name(x):
     return str(x.get("pair") or x.get("p") or x.get("symbol") or x.get("instrument") or x.get("id") or "")
 
+# Canonical account-facing asset labels. Internal OlympTrade instrument
+# IDs stay in "pair" for routing/market API calls, while every user-facing
+# message uses these account labels. These labels were taken from the
+# account-visible asset names already established in the project screenshots;
+# crypto/real variants are normalized to their human asset names as well.
+ACCOUNT_ASSET_DISPLAY_MAP={
+    "EURCAD_OTC":"EURCAD OTC","AUDNZD_OTC":"AUDNZD OTC","GBPJPY_OTC":"GBPJPY OTC",
+    "CADCHF_OTC":"CADCHF OTC","CHFJPY_OTC":"CHFJPY OTC","GBPAUD_OTC":"GBPAUD OTC",
+    "EURJPY_OTC":"EURJPY OTC","EURCHF_OTC":"EURCHF OTC","EURNZD_OTC":"EURNZD OTC",
+    "GBPCHF_OTC":"GBPCHF OTC","NZDCAD_OTC":"NZDCAD OTC","NZDJPY_OTC":"NZDJPY OTC",
+    "GBPNZD_OTC":"GBPNZD OTC","NZDCHF_OTC":"NZDCHF OTC","XAGUSD_OTC":"Silver OTC",
+    "EURAUD_OTC":"EURAUD OTC","EURUSD_OTC":"EURUSD OTC","AUDUSD_OTC":"AUDUSD OTC",
+    "USDCHF_OTC":"USDCHF OTC","XAUUSD_OTC":"Gold OTC","USDCAD_OTC":"USDCAD OTC",
+    "NZDUSD_OTC":"NZDUSD OTC","AUDCAD_OTC":"AUDCAD OTC","GBPUSD_OTC":"GBPUSD OTC",
+    "GBPCAD_OTC":"GBPCAD OTC","USDJPY_OTC":"USDJPY OTC","AUDCHF_OTC":"AUDCHF OTC",
+    "CADJPY_OTC":"CADJPY OTC","EURGBP_OTC":"EURGBP OTC","AUDJPY_OTC":"AUDJPY OTC",
+    "ASIA_X":"Asia Composite Index","EUROPE_X":"Europe Composite Index",
+    "GOAL_X":"Football Champions 2026 Index","MCI_X":"Compound Index",
+    "HMA_X":"Halal Market Axis","ULTRA_X":"Quickler","STABLE_X":"Stable Tick Index",
+    "ARAB_X":"Arabian General Index","OASIS_X":"Oasis Index","QAHWA_X":"Qahwa Index",
+    "ALTCOIN":"Altcoin","Bitcoin":"Bitcoin","BTCUSD_OTC":"Bitcoin OTC",
+    "ETHUSD_OTC":"Ethereum OTC","ETHUSD":"Ethereum","LTCUSD_OTC":"Litecoin OTC",
+    "LTCUSD":"Litecoin","BNBUSD_OTC":"BNB OTC","PEPEUSD_OTC":"Pepe OTC",
+    "SHIBUSD_OTC":"Shiba Inu OTC","DOGUSD_OTC":"Dogecoin OTC","XRPUSD_OTC":"XRP OTC",
+}
+
+def _looks_like_internal_pair(value,pair):
+    s=str(value or "").strip()
+    p=str(pair or "").strip()
+    if not s:return True
+    if s==p:return True
+    # Common raw instrument forms should never leak into Telegram as a
+    # substitute for the account-facing label.
+    compact=s.upper().replace("/","").replace(" ","")
+    raw=p.upper().replace("/","").replace(" ","")
+    if compact==raw:return True
+    if re.fullmatch(r"[A-Z0-9]+(?:_[A-Z0-9]+)?",s) and ("_" in s or s.upper()==s):
+        return True
+    return False
+
 def display_name(x):
-    # Preserve the exact account-facing asset name returned by the
-    # authenticated account feed; prefer display fields over internal names.
-    for k in ("title","display_name","displayName","name"):
-        if isinstance(x.get(k),str) and x[k].strip():return x[k].strip()
+    # First honor a genuine human-facing field returned by the authenticated
+    # account feed, including nested asset metadata used by some payloads.
+    if not isinstance(x,dict): return ""
+    p=pair_name(x)
+    for k in ("title","display_name","displayName","label","displayLabel","asset_name","assetName","name"):
+        v=x.get(k)
+        if isinstance(v,str) and v.strip() and not _looks_like_internal_pair(v,p):
+            return v.strip()
+    nested_candidates=[]
+    for k in ("asset","instrument","product","metadata","meta","details"):
+        v=x.get(k)
+        if isinstance(v,dict):
+            for nk in ("title","display_name","displayName","label","displayLabel","asset_name","assetName","name"):
+                nv=v.get(nk)
+                if isinstance(nv,str) and nv.strip():
+                    nested_candidates.append(nv.strip())
+    for v in nested_candidates:
+        if not _looks_like_internal_pair(v,p):
+            return v
+    # Finally use the project-wide canonical account-name converter.
+    mapped=ACCOUNT_ASSET_DISPLAY_MAP.get(p)
+    if mapped:
+        return mapped
     return ""
 
 def event_records(client,event_id):
@@ -412,7 +471,13 @@ def build_assets(client,raw):
         # Preserve the exact name shown by the authenticated account.
         # Only fall back to the internal pair when the broker provides no
         # human-readable account-facing name.
-        title=display_name(x) or p
+        title=display_name(x)
+        if not title:
+            # Never expose a raw instrument ID in a user-facing message. An
+            # unmapped asset remains in the account scan, but is not allowed to
+            # produce a signal until an account-facing label is available.
+            log.warning("ACCOUNT_ASSET_DISPLAY_NAME_MISSING pair=%s",p)
+            continue
         v=prof.get(p,x.get("profitability",0))
         try: profitability=int(v)
         except Exception: profitability=0
@@ -432,7 +497,10 @@ def build_assets(client,raw):
     if rejected:
         log.info("ACCOUNT_ASSET_REJECTED sample=%s",rejected[:25])
     # Audit the exact account-facing/raw names that Candice accepted.
-    log.info("ACCOUNT_ASSET_NAMES %s",[a["display_name"] for a in out])
+    log.info(
+        "ACCOUNT_ASSET_NAMES %s",
+        [{"pair":a["pair"],"account_name":a["display_name"]} for a in out]
+    )
     return out
 
 async def sync_account_assets(client, reason="periodic"):
