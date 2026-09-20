@@ -445,7 +445,8 @@ class BrainState:
             pair,strategy,int(x.get("expiry_minutes") or 0),direction,
             str(x.get("pattern") or ""),
             str(x.get("trend_15m") or ""),
-            str(x.get("structure_1m") or "")
+            str(x.get("structure_1m") or ""),
+            dict(x.get("indicators") or x.get("indicator_context") or {})
         ),2)
 
         # self_strategy_stats is intentionally not double-counted when the
