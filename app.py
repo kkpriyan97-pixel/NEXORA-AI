@@ -1013,8 +1013,10 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
                 "ai_provider":"CANDICE_LOCAL_BRAIN_PRIMARY"
             })
             CANDIDATE_CACHE[cache_key]=(time.time(),y.copy())
-            log.info("BRAIN_PRIMARY_CANDIDATE pair=%s confidence=%s strategy=%s",
-                     x["pair"],local_confidence,x.get("strategy"))
+            log.info("BRAIN_PRIMARY_CANDIDATE pair=%s confidence=%s strategy=%s margin=%s dir_agree=%s expiry_hint=%s five_minute_eligible=%s",
+                     x["pair"],local_confidence,x.get("strategy"),
+                     x.get("strategy_margin",0),x.get("direction_agreement",0),
+                     x.get("expiry_minutes",0),x.get("five_minute_eligible",False))
             return y
 
         cached=AI_REVIEW_CACHE.get(cache_key)
@@ -1223,9 +1225,9 @@ async def result_watch(key):
         f"⚠️ RESULT ONLY — AUTO TRADE OFF"
     )
     log.info(
-        "RESULT pair=%s result=%s strategy=%s self_strategy=%s self_version=%s confidence=%s trend=%s structure=%s pattern=%s entry=%s exit=%s source=%s cooldown=%s",
+        "RESULT pair=%s result=%s strategy=%s self_strategy=%s self_version=%s confidence=%s trend=%s structure=%s pattern=%s expiry=%s entry=%s exit=%s source=%s cooldown=%s",
         rec["pair"],rec["result"],rec["strategy"],rec.get("self_strategy",""),rec.get("self_strategy_version",""),rec["confidence"],rec["trend_15m"],
-        rec["structure_1m"],rec["pattern"],rec["entry_price"],rec["exit_price"],
+        rec["structure_1m"],rec["pattern"],rec["expiry_minutes"],rec["entry_price"],rec["exit_price"],
         expiry_source,rec["result"]=="LOSS"
     )
 
