@@ -95,7 +95,7 @@ AI_PROVIDER_COOLDOWN={}
 AI_REVIEW_TIMEOUT=2.4
 # Rotating account-wide live quote scan. It does not touch Brain timing; it only
 # keeps current account prices warm for analysis/candidate selection.
-ACCOUNT_LIVE_SCAN_BATCH=64
+ACCOUNT_LIVE_SCAN_BATCH=16
 ACCOUNT_LIVE_SCAN_INTERVAL=5.0
 ACCOUNT_LIVE_SCAN_CURSOR=0
 # Account-wide event-1 tick subscription manager. Subscriptions are read-only;
