@@ -53,6 +53,7 @@ class BrainState:
     # cannot swing the live selector.
     pattern_stats:dict[str,dict[str,float]]=field(default_factory=dict)
     context_stats:dict[str,dict[str,float]]=field(default_factory=dict)
+    indicator_stats:dict[str,dict[str,float]]=field(default_factory=dict)
     total_results:int=0
     learning_account_id:int|None=None
     batch_results:list[dict[str,Any]]=field(default_factory=list)
@@ -173,6 +174,14 @@ class BrainState:
         structure=str(rec.get("structure_1m","") or "UNKNOWN")
         self._record_bucket(self._bucket(self.pattern_stats,pattern),result,weight)
         self._record_bucket(self._bucket(self.context_stats,f"{trend}|{structure}"),result,weight)
+        ind=dict(rec.get("indicator_context") or {})
+        dc_state=str(ind.get("donchian_state") or "UNKNOWN")
+        dc_exp="EXPANDING" if bool(ind.get("donchian_expansion")) else "FLAT"
+        st_cross=str(ind.get("stochastic_cross") or "NEUTRAL")
+        st_zone=("OVERSOLD" if bool(ind.get("stochastic_oversold")) else
+                 "OVERBOUGHT" if bool(ind.get("stochastic_overbought")) else "MID")
+        indicator_key=f"DC:{dc_state}:{dc_exp}|ST:{st_zone}:{st_cross}"
+        self._record_bucket(self._bucket(self.indicator_stats,indicator_key),result,weight)
         self.total_results+=1
 
         if len(self.batch_results) >= 10:
@@ -192,6 +201,20 @@ class BrainState:
             self_strategies=grouped("self_strategy")
             expiries=grouped("expiry_minutes")
             assets=grouped("pair")
+            def grouped_indicator(rows):
+                out={}
+                for r in rows:
+                    ind=dict(r.get("indicator_context") or {})
+                    key="DC:{}:{}|ST:{}:{}".format(
+                        ind.get("donchian_state","UNKNOWN"),
+                        "EXPANDING" if ind.get("donchian_expansion") else "FLAT",
+                        "OVERSOLD" if ind.get("stochastic_oversold") else ("OVERBOUGHT" if ind.get("stochastic_overbought") else "MID"),
+                        ind.get("stochastic_cross","NEUTRAL"))
+                    b=out.setdefault(key,{"n":0,"win":0,"loss":0,"tie":0})
+                    b["n"]+=1
+                    b[str(r.get("result","")).lower()]+=1
+                return out
+            indicator_contexts=grouped_indicator(batch)
             lessons=[]
             for st,b in sorted(strategies.items(),key=lambda kv:(-kv[1]["n"],kv[0])):
                 if b["n"]>=2:
@@ -203,7 +226,7 @@ class BrainState:
                 "signals":10,"wins":wins,"losses":losses,"ties":ties,
                 "win_rate":round(100*wins/10,1),"strategies":strategies,
                 "self_strategies":self_strategies,"expiries":expiries,
-                "assets":assets,"lessons":lessons,"details":[{"pair":r.get("pair"),"direction":r.get("direction"),"strategy":r.get("strategy"),"self_strategy":r.get("self_strategy"),"expiry":r.get("expiry_minutes"),"confidence":r.get("confidence"),"result":r.get("result")} for r in batch],"cooldown_seconds":600
+                "assets":assets,"indicator_contexts":indicator_contexts,"lessons":lessons,"details":[{"pair":r.get("pair"),"direction":r.get("direction"),"strategy":r.get("strategy"),"self_strategy":r.get("self_strategy"),"expiry":r.get("expiry_minutes"),"confidence":r.get("confidence"),"result":r.get("result")} for r in batch],"cooldown_seconds":600
             }
             self.account_cooldown_until=utc_now()+600.0
             self.batch_results.clear()
@@ -225,7 +248,8 @@ class BrainState:
             "pattern":s.pattern,"trend_15m":s.trend_15m,
             "structure_1m":s.structure_1m,"self_strategy":s.self_strategy,
             "self_strategy_version":s.self_strategy_version,"reason":s.reason,
-            "confidence":s.confidence,"result":result
+            "confidence":s.confidence,"result":result,
+            "indicator_context":s.indicator_context
         }
         self.learn(rec)
         if result=="LOSS":
@@ -276,7 +300,15 @@ class BrainState:
             f"{trend_15m or 'UNKNOWN'}|{structure_1m or 'UNKNOWN'}",
             2.0
         )
-        return max(-8.0,min(8.0,base_bonus+strategy_bonus+pattern_bonus+context_bonus))
+        indicator_bonus=0.0
+        # Do not let a small sample rewrite the brain: indicator-combination
+        # evidence becomes active only after 10 verified observations.
+        for _key,b in self.indicator_stats.items():
+            n=float(b.get("n",0) or 0)
+            if n>=10:
+                rate=self._rate(b)
+                indicator_bonus=max(indicator_bonus,max(-2.0,min(2.0,(rate-0.5)*4.0)))
+        return max(-8.0,min(8.0,base_bonus+strategy_bonus+pattern_bonus+context_bonus+indicator_bonus))
 
     def choose_expiry(self,pair,strategy,direction,live_quality=0,allow_5m=False):
         """Choose expiry from strategy-local evidence; 5m is a locked/rare path."""
@@ -406,6 +438,7 @@ class BrainState:
             "stats": {"|".join(map(str,k)): v for k,v in self.stats.items()},
             "pattern_stats": self.pattern_stats,
             "context_stats": self.context_stats,
+            "indicator_stats": self.indicator_stats,
         }
 
     def import_learning(self, data):
@@ -427,6 +460,7 @@ class BrainState:
         self.stats=rebuilt
         self.pattern_stats=dict(data.get("pattern_stats") or {})
         self.context_stats=dict(data.get("context_stats") or {})
+        self.indicator_stats=dict(data.get("indicator_stats") or {})
 
     def prune_expired_cooldowns(self,now=None):
         now=utc_now() if now is None else now
