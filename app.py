@@ -63,7 +63,7 @@ UAE_TZ=ZoneInfo("Asia/Dubai")
 
 def uae_time(ts):
     return datetime.fromtimestamp(float(ts),tz=UAE_TZ).strftime("%H:%M:%S")
-STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"network":{},"read_only":True,"cycle":0,"last_cycle":None}
+STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"network":{},"read_only":True,"cycle":0,"last_cycle":None,"account_id":None,"account_group":"demo","feed_source":"authenticated_websocket"}
 CANDLE_FETCH_SEM=asyncio.Semaphore(8)
 CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
@@ -219,19 +219,16 @@ def build_assets(client,raw):
     return out
 
 async def sync_account_assets(client, reason="periodic"):
-    """Refresh the currently exposed asset universe from the authenticated account API.
-
-    This deliberately uses MarketAPI.get_available_assets(), which is now backed only
-    by the account-scoped event-182 response. A failed/empty refresh never clears the
-    last known good account universe.
-    """
+    """Refresh account-visible assets directly from the authenticated WebSocket session."""
     if not client or not client.account_id:
         return False
     try:
-        raw=await asyncio.wait_for(
-            client.market.get_available_assets(client.account_id),
-            timeout=8.0
+        response=await asyncio.wait_for(
+            client.send_request(parameters.E_ASSET_PROFITABILITY,[{"account_id":client.account_id}],
+                                requires_response=True,timeout=8.0),
+            timeout=9.0
         )
+        raw=response.get("d") if isinstance(response,dict) else None
     except Exception as e:
         log.warning("ACCOUNT_ASSET_SYNC_FAILED account_id=%s reason=%s type=%s message=%s",
                     client.account_id,reason,type(e).__name__,str(e)[:160])
@@ -253,8 +250,10 @@ async def sync_account_assets(client, reason="periodic"):
     added=sorted(new-old)
     removed=sorted(old-new)
     STATE["assets"]=assets
+    STATE["account_id"]=client.account_id
+    STATE["account_group"]="demo"
+    STATE["feed_source"]="authenticated_websocket:event_182"
 
-    # Never let a removed account asset keep stale analysis/price state alive.
     for pair in removed:
         STATE["prices"].pop(pair,None)
         STATE["price_source"].pop(pair,None)
@@ -265,80 +264,52 @@ async def sync_account_assets(client, reason="periodic"):
         CANDLE_UNAVAILABLE_UNTIL.pop(pair,None)
         CANDLE_GOOD_ONCE.discard(pair)
 
-    log.info("ACCOUNT_ASSET_SYNC account_id=%s reason=%s raw=%d accepted=%d added=%d removed=%d total=%d",
+    log.info("ACCOUNT_ASSET_SYNC source=authenticated_websocket:event_182 account_id=%s reason=%s raw=%d accepted=%d added=%d removed=%d total=%d",
              client.account_id,reason,len(raw),len(assets),len(added),len(removed),len(assets))
-    if added:
-        log.info("ACCOUNT_ASSET_ADDED sample=%s",added[:25])
-    if removed:
-        log.info("ACCOUNT_ASSET_REMOVED sample=%s",removed[:25])
+    if added: log.info("ACCOUNT_ASSET_ADDED sample=%s",added[:25])
+    if removed: log.info("ACCOUNT_ASSET_REMOVED sample=%s",removed[:25])
     return True
 
-async def scan_account_live_feed(batch_size=16):
-    """Keep a rotating fresh read-only quote feed for the account asset universe.
+async def on_asset_update(message):
+    """Apply broker-pushed account asset changes (event 183) without rescanning a global catalog."""
+    raw=message.get("d") if isinstance(message,dict) else None
+    if not isinstance(raw,list) or not raw:
+        return
+    assets=build_assets(CLIENT,raw)
+    if not assets:
+        return
+    current={a["pair"]:a for a in STATE["assets"]}
+    for a in assets:
+        current[a["pair"]]=a
+    STATE["assets"]=list(current.values())
+    STATE["feed_source"]="authenticated_websocket:event_183"
+    log.info("ACCOUNT_ASSET_FEED_UPDATE source=authenticated_websocket:event_183 incoming=%d visible=%d",
+             len(assets),len(STATE["assets"]))
 
-    Authenticated event-1 ticks are preferred. Only assets without a fresh tick are
-    filled from the read-only live snapshot endpoint. The scan is deliberately
-    separate from the 5-minute Brain timing loop so it cannot move signal deadlines.
-    """
-    global ACCOUNT_LIVE_SCAN_CURSOR
-    client=CLIENT
+
+async def scan_account_live_feed():
+    """Audit account-wide live coverage from the authenticated event-1 tick stream only."""
     assets=list(STATE["assets"])
-    if not client or not assets:
+    if not CLIENT or not assets:
         return
-    pairs=[a["pair"] for a in assets if a.get("pair")]
-    if not pairs:
-        return
-    if ACCOUNT_LIVE_SCAN_CURSOR>=len(pairs):
-        ACCOUNT_LIVE_SCAN_CURSOR=0
-    start=ACCOUNT_LIVE_SCAN_CURSOR
-    batch=pairs[start:start+batch_size]
-    if len(batch)<batch_size:
-        batch+=pairs[:max(0,batch_size-len(batch))]
-    ACCOUNT_LIVE_SCAN_CURSOR=(start+batch_size)%len(pairs)
-
     now=time.time()
-    # Refresh the entire account universe on every live-feed pass. The previous
-    # freshness-gated request list refreshed only a rotating subset, so each asset
-    # could wait ~20s before its next snapshot while the freshness gate was 6s.
-    # That produced persistent missing coverage even though snapshot calls worked.
-    requested=list(batch)
+    total=len(assets)
+    fresh=sum(1 for a in assets if has_fresh_live_price(a["pair"],now,LIVE_TICK_MAX_AGE))
+    missing=total-fresh
+    log.info("ACCOUNT_LIVE_FEED_SCAN source=authenticated_websocket:event_1 assets=%d fresh_tick=%d missing=%d",
+             total,fresh,missing)
 
-    fetched=0
-    async def one(pair):
-        nonlocal fetched
-        async with QUOTE_SNAPSHOT_SEM:
-            try:
-                snap=await asyncio.wait_for(client.market.get_live_snapshot(pair),timeout=1.2)
-                if not snap or snap.get("price") is None:
-                    return
-                received=time.time()
-                STATE["prices"][pair]=(float(snap["price"]),float(snap.get("timestamp",received)),received)
-                STATE["price_source"][pair]="snapshot_5s"
-                fetched+=1
-            except Exception as e:
-                log.debug("ACCOUNT_LIVE_SNAPSHOT_FAILED pair=%s type=%s message=%s",
-                          pair,type(e).__name__,str(e)[:120])
-
-    if requested:
-        await asyncio.gather(*(one(p) for p in requested),return_exceptions=True)
-
-    ref=time.time()
-    total=len(pairs)
-    fresh_tick=sum(1 for p in pairs if STATE["price_source"].get(p)=="tick" and has_fresh_live_price(p,ref,LIVE_TICK_MAX_AGE))
-    fresh_snapshot=sum(1 for p in pairs if STATE["price_source"].get(p)=="snapshot_5s" and has_fresh_live_price(p,ref,QUOTE_SNAPSHOT_MAX_AGE))
-    missing=max(0,total-fresh_tick-fresh_snapshot)
-    log.info("ACCOUNT_LIVE_FEED_SCAN assets=%d batch=%d requested=%d snapshot_received=%d fresh_tick=%d fresh_snapshot=%d missing=%d",
-             total,len(batch),len(requested),fetched,fresh_tick,fresh_snapshot,missing)
 
 async def account_live_feed_worker():
     while True:
         try:
-            await scan_account_live_feed(batch_size=ACCOUNT_LIVE_SCAN_BATCH)
+            await scan_account_live_feed()
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.warning("ACCOUNT_LIVE_FEED_WORKER_ERROR type=%s message=%s",type(e).__name__,str(e)[:160])
-        await asyncio.sleep(ACCOUNT_LIVE_SCAN_INTERVAL)
+        await asyncio.sleep(1.0)
+
 
 async def ensure_account_tick_subscriptions():
     """Subscribe each signal-eligible account asset to the authenticated event-1 quote stream."""
@@ -509,48 +480,16 @@ async def ensure_candidate_ticks(pairs):
     return successes
 
 async def ensure_candidate_quotes(pairs):
+    """Refresh candidate quotes from the authenticated event-1 stream, never from a snapshot API."""
     client=CLIENT
     if not client or not pairs:
         return 0
+    await ensure_candidate_ticks(pairs)
+    await asyncio.sleep(0.20)
+    fresh=sum(1 for p in pairs if has_fresh_live_price(p,time.time(),LIVE_TICK_MAX_AGE))
+    log.info("LIVE_PRICE_EVENT1_REFRESH requested=%d fresh=%d",len(set(pairs)),fresh)
+    return fresh
 
-    now=time.time()
-    unique=[]
-    seen=set()
-    for p in pairs:
-        p=str(p or "")
-        if not p or p in seen:
-            continue
-        seen.add(p)
-        if has_fresh_live_price(p,now,LIVE_TICK_MAX_AGE):
-            continue
-        if now-QUOTE_SNAPSHOT_LAST.get(p,0.0) < QUOTE_SNAPSHOT_REFRESH:
-            continue
-        unique.append(p)
-
-    if not unique:
-        return 0
-
-    fetched=0
-    async def one(pair):
-        nonlocal fetched
-        QUOTE_SNAPSHOT_LAST[pair]=time.time()
-        async with QUOTE_SNAPSHOT_SEM:
-            try:
-                snap=await asyncio.wait_for(client.market.get_live_snapshot(pair),timeout=1.4)
-                if not snap or snap.get("price") is None:
-                    return
-                received=time.time()
-                STATE["prices"][pair]=(float(snap["price"]),float(snap.get("timestamp",received)),received)
-                STATE["price_source"][pair]="snapshot_5s"
-                fetched+=1
-            except Exception as e:
-                log.debug("QUOTE_SNAPSHOT_FAILED pair=%s type=%s message=%s",
-                          pair,type(e).__name__,str(e)[:120])
-
-    await asyncio.gather(*(one(p) for p in unique),return_exceptions=True)
-    if fetched:
-        log.info("QUOTE_SNAPSHOT_REFRESH requested=%d received=%d",len(unique),fetched)
-    return fetched
 
 def _candle_epoch(c):
     """Return candle timestamp in epoch seconds, accepting seconds or milliseconds."""
@@ -1144,6 +1083,7 @@ async def market_worker():
         ACCOUNT_TICK_SUBSCRIBED.clear()
         ACCOUNT_TICK_LAST_ATTEMPT.clear()
         client.register_callback(parameters.E_TICK_UPDATE,on_tick)
+        client.register_callback(parameters.E_ASSET_PROFITABILITY_UPDATE,on_asset_update)
         try:
             STATE["status"]="connecting"
             await audit_outbound_network()
@@ -1202,7 +1142,7 @@ async def market_worker():
             # read-only worker below. Event-1 ticks are preferred when delivered;
             # the snapshot scanner remains a timestamped fallback for assets
             # that do not emit an event-1 tick.
-            log.info("TICK_SUBSCRIPTION_MODE account_event12_worker snapshot_fallback=ON")
+            log.info("TICK_SUBSCRIPTION_MODE authenticated_event1 preferred; no live snapshot API fallback")
             await refresh_candles(force=True)
             last_asset_sync=time.time()
             while True:
@@ -1241,7 +1181,7 @@ async def health(reader,writer):
                 k,v=line.split(":",1);headers[k.strip().lower()]=v.strip()
         webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
         if path.startswith("/health"):
-            body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"network":STATE.get("network",{})}).encode()
+            body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"account_id":STATE.get("account_id"),"account_group":STATE.get("account_group"),"feed_source":STATE.get("feed_source"),"network":STATE.get("network",{})}).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
             await writer.drain()
             return
