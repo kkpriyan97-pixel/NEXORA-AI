@@ -868,7 +868,10 @@ async def refresh_candles(force=False):
 
     async def one(a):
         p=a["pair"]
-        if not a.get("signal_eligible",True):return
+        # Every authenticated account asset is analyzed for coverage. The
+        # signal-eligibility flag is applied later by final_candidate(); this
+        # keeps the account-wide 52/52 scan complete without allowing a
+        # non-signal asset into the send gate.
         async with CANDLE_FETCH_SEM:
             last_reason="unknown"
             for attempt in range(1,CANDLE_FETCH_RETRIES+1):
@@ -927,25 +930,33 @@ async def refresh_candles(force=False):
     await asyncio.gather(*(one(a) for a in due),return_exceptions=True)
 
     reference=time.time()
+    analyzed_count=0
     for a in assets:
-        if not a.get("signal_eligible",True):continue
         p=a["pair"]
         price=STATE["prices"].get(p,(None,None))[0]
         closed=_closed_candles(STATE["candles"].get(p,[]),reference)
+        if len(closed)<45:
+            if a.get("signal_eligible",True):
+                STATE["analyses"].pop(p,None)
+            continue
+        # Count every successfully analyzed account asset, even when its
+        # technical setup does not qualify as a signal. The latter remains
+        # represented separately by STATE["analyses"] for candidate ranking.
+        analyzed_count+=1
         an=analyze_asset(a,closed,price)
-        if an:
+        if an and a.get("signal_eligible",True):
             an["profitability"]=a["profitability"]
             STATE["analyses"][p]=an
-        else:
+        elif a.get("signal_eligible",True):
             STATE["analyses"].pop(p,None)
 
-    stale_count=sum(
-        1 for a in assets
-        if a.get("signal_eligible",True) and _candle_data_stale(a["pair"],reference)
+    stale_count=sum(1 for a in assets if _candle_data_stale(a["pair"],reference))
+    log.info(
+        "LIVE_ANALYSIS_REFRESH assets=%d analyzed=%d signal_eligible=%d fetched=%d stale=%d qualified=%d",
+        len(assets),analyzed_count,
+        sum(1 for a in assets if a.get("signal_eligible",True)),
+        len(due),stale_count,len(STATE["analyses"])
     )
-    log.info("LIVE_ANALYSIS_REFRESH assets=%d signal_eligible=%d fetched=%d stale=%d qualified=%d",
-             len(assets),sum(1 for a in assets if a.get("signal_eligible",True)),
-             len(due),stale_count,len(STATE["analyses"]))
 
 def has_fresh_live_price(pair,reference_ts=None,max_age=LIVE_TICK_MAX_AGE):
     rec=STATE["prices"].get(pair)
@@ -1385,24 +1396,34 @@ async def cycle_loop():
         candidate=None
         # Three full-account scans are intentional: the account has many assets,
         # and one snapshot can miss a setup that forms a few seconds later.
-        # Scan 1 = 75s before entry, Scan 2 = 50s, Scan 3 = 32s.
-        # Each pass forces a fresh closed-candle refresh across the entire
-        # authenticated account asset universe before ranking candidates.
+        # Scan 1 = 75s before entry, Scan 2 = 50s, Scan 3 = 40s.
+        # The third scan is deliberately moved earlier so its full 52-asset
+        # candle refresh can finish without consuming the exact 30s signal
+        # deadline. All three scans remain inside the same 5-minute cycle.
         scan_plan=(
             ("SCAN_1",target-75.0),
             ("SCAN_2",target-50.0),
-            ("SCAN_3",target-32.0),
+            ("SCAN_3",target-40.0),
         )
         for scan_name,scan_at in scan_plan:
             await asyncio.sleep(max(0,scan_at-time.time()))
             if time.time() >= signal_at:
                 break
             try:
-                await refresh_candles(force=True)
+                # Never allow a full-account refresh to consume the exact
+                # 30-second signal deadline. Preserve the previous scan's valid
+                # candidate if this pass overruns its bounded budget.
+                scan_budget=max(0.75,signal_at-time.time()-1.0)
+                await asyncio.wait_for(refresh_candles(force=True),timeout=scan_budget)
                 log.info(
                     "ACCOUNT_FULL_SCAN cycle=%s scan=%s assets=%d analyzed=%d seconds_to_signal=%.2f",
                     cycle_id,scan_name,len(STATE["assets"]),len(STATE["analyses"]),
                     max(0,signal_at-time.time())
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "ACCOUNT_FULL_SCAN_TIMEOUT cycle=%s scan=%s budget=%.2f seconds_to_signal=%.2f",
+                    cycle_id,scan_name,scan_budget,max(0,signal_at-time.time())
                 )
             except Exception as e:
                 log.warning(
@@ -1469,14 +1490,19 @@ async def cycle_loop():
                 )
 
         if not sent:
-            # This is an internal diagnostic only. It is never sent as a member
-            # notification. We keep the strict evidence gate rather than inventing
-            # a direction or fake confidence when all three account scans fail
-            # to produce a valid live setup.
-            log.info(
-                "THREE_SCAN_NO_QUALIFIED_SETUP cycle=%s scans=3 analyzed=%d",
-                cycle_id,len(STATE["analyses"])
-            )
+            if candidate:
+                log.info(
+                    "FINAL_SIGNAL_NOT_SENT cycle=%s candidate=%s confidence=%s signal_utc=%s now_utc=%s",
+                    cycle_id,candidate.get("pair"),candidate.get("confidence"),
+                    time.strftime("%H:%M:%S",time.gmtime(signal_at)),
+                    time.strftime("%H:%M:%S",time.gmtime(time.time()))
+                )
+            else:
+                # Internal diagnostic only; never sent as a member notification.
+                log.info(
+                    "THREE_SCAN_NO_QUALIFIED_SETUP cycle=%s scans=3 analyzed=%d",
+                    cycle_id,len(STATE["analyses"])
+                )
 
         # Keep the loop aligned to the next 5-minute boundary. Result tracking
         # uses the stored exact entry timestamp, so no extra boundary evaluation
