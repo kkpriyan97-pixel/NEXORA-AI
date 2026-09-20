@@ -69,6 +69,13 @@ CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
 CANDLE_FETCH_RETRIES=3
 CANDLE_FETCH_RETRY_DELAY=0.25
+# Some account assets are visible in the account feed but may not expose a
+# fresh 1-minute candle through this read-only candle endpoint. Back off only
+# those assets after a rejected first dataset so they cannot consume the
+# exact signal window; previously healthy assets keep the existing retry path.
+CANDLE_UNAVAILABLE_UNTIL={}
+CANDLE_UNAVAILABLE_BACKOFF=300.0
+CANDLE_GOOD_ONCE=set()
 TICK_RESUB_SEM=asyncio.Semaphore(3)
 TICK_RESUB_TIMEOUT=1.5
 LIVE_TICK_MAX_AGE=5.0
@@ -379,7 +386,9 @@ async def refresh_candles(force=False):
     client=CLIENT;assets=list(STATE["assets"])
     if not client:return
     now=time.time()
-    due=[a for a in assets if force or now-CANDLE_FETCH_LAST.get(a["pair"],0)>=CANDLE_FETCH_INTERVAL or _candle_data_stale(a["pair"],now)]
+    due=[a for a in assets
+         if (force or now-CANDLE_FETCH_LAST.get(a["pair"],0)>=CANDLE_FETCH_INTERVAL or _candle_data_stale(a["pair"],now))
+         and now>=CANDLE_UNAVAILABLE_UNTIL.get(a["pair"],0.0)]
 
     async def one(a):
         p=a["pair"]
@@ -414,6 +423,8 @@ async def refresh_candles(force=False):
                         if newest is not None and age is not None and 0 <= age <= 75.0 and len(closed)>=45:
                             STATE["candles"][p]=normalized
                             CANDLE_FETCH_LAST[p]=time.time()
+                            CANDLE_GOOD_ONCE.add(p)
+                            CANDLE_UNAVAILABLE_UNTIL.pop(p,None)
                             if attempt>1:
                                 log.info("CANDLE_REFRESH_RECOVERED pair=%s attempt=%d closed=%d newest_age=%.1f",
                                          p,attempt,len(closed),age)
@@ -431,6 +442,8 @@ async def refresh_candles(force=False):
             # Keep the previous good dataset instead of overwriting it with stale
             # data. Mark the fetch due again so the next cycle retries promptly.
             CANDLE_FETCH_LAST[p]=0.0
+            if p not in CANDLE_GOOD_ONCE:
+                CANDLE_UNAVAILABLE_UNTIL[p]=time.time()+CANDLE_UNAVAILABLE_BACKOFF
             log.warning("CANDLE_REFRESH_REJECTED pair=%s attempts=%d reason=%s",
                         p,CANDLE_FETCH_RETRIES,last_reason)
 
