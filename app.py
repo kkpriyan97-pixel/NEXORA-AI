@@ -176,45 +176,50 @@ def _norm_text(v):
 # The following is the exact OPEN asset set from the account screenshots the user
 # supplied. Closed/hidden assets are deliberately not included. The broker feed
 # remains the source for live prices, but it is NOT allowed to widen this universe.
-SCREENSHOT_OPEN_ASSETS={
-    # OTC currency/metals
-    "eurcad otc","audnzd otc","gbpjpy otc","cadchf otc","chfjpy otc",
-    "gbpaud otc","eurjpy otc","eurchf otc","eurnzd otc","gbpchf otc",
-    "nzdcad otc","nzdjpy otc","gbpnzd otc","nzdchf otc","silver otc",
-    "euraud otc","eurusd otc","audusd otc","usdchf otc","gold otc",
-    "usdcad otc","nzdusd otc","audcad otc","gbpusd otc","gbpcad otc",
-    "usdjpy otc","audchf otc","cadjpy otc","eurgbp otc","audjpy otc",
-    # Composite / index assets visible in the screenshots
-    "asia composite index","europe composite index","football champions 2026 index",
-    "compound index","halal market axis","quickler","stable tick index",
-    "arabian general index","oasis index","qahwa index",
+SCREENSHOT_OPEN_PAIRS={
+    # Exact 53 unique Flex assets visible in the user's supplied screenshots.
+    # Raw IDs below are the authenticated OlympTrade instrument IDs used by
+    # the account-scoped WebSocket event-182 asset feed.
+    "BNBUSD_OTC","PEPEUSD_OTC","SHIBUSD_OTC",
+    "ASIA_X","EUROPE_X","CRYPTO_X","GOAL_X","ETHUSD_OTC","MCI_X",
+    "BTCUSD_OTC","LTCUSD_OTC","EURUSD_OTC","DOGUSD_OTC","XRPUSD_OTC",
+    "HMA_X","NZDUSD_OTC","Bitcoin","AUDUSD_OTC","GBPUSD_OTC","ULTRA_X",
+    "XAUUSD_OTC","USDCHF_OTC","AUDCAD_OTC","USDCAD_OTC","GBPJPY_OTC",
+    "CADJPY_OTC","USDJPY_OTC","STABLE_X","GBPCAD_OTC","EURGBP_OTC",
+    "AUDCHF_OTC","AUDNZD_OTC","AUDJPY_OTC","XAGUSD_OTC","CHFJPY_OTC",
+    "EURAUD_OTC","CADCHF_OTC","EURCAD_OTC","EURJPY_OTC","EURCHF_OTC",
+    "EURNZD_OTC","GBPCHF_OTC","GBPAUD_OTC","NZDCHF_OTC","GBPNZD_OTC",
+    "ETHUSD","NZDJPY_OTC","NZDCAD_OTC","ALTCOIN","QAHWA_X","OASIS_X",
+    "ARAB_X","LTCUSD",
 }
 
 def asset_key(value):
+(value):
     text=_norm_text(value)
     return " ".join(text.replace("/"," ").replace("_"," ").split())
 
 def screenshot_asset_allowed(x):
     if not isinstance(x,dict): return False
     p=pair_name(x)
-    title=display_name(x)
-    # Match the account-facing name first; pair is only a fallback because
-    # some composite products expose internal tickers instead of their UI name.
-    if asset_key(title) in SCREENSHOT_OPEN_ASSETS:
+    # Current event-182 payloads expose the exact instrument ID (p/id), while
+    # some older payloads also carry a human-readable title. The screenshot
+    # baseline is therefore enforced primarily by the authenticated raw pair.
+    if p in SCREENSHOT_OPEN_PAIRS:
         return True
-    return asset_key(p) in SCREENSHOT_OPEN_ASSETS
+    title=display_name(x)
+    return asset_key(title) in SCREENSHOT_OPEN_PAIRS
 
 def is_flex_time_asset(x):
     if not isinstance(x,dict): return False
-    # The authenticated account asset feed is the source of truth.
-    # Do not apply the old screenshot allow-list here: the user wants every
-    # asset currently available on the Olymp Trade account to be visible to
-    # Candice, using the account-facing name exactly as returned.
-    return True
+    # The user explicitly asked for the exact 53-asset Flex universe shown in
+    # the supplied OlympTrade screenshots: no broker-side extras and no
+    # synthetic/global market symbols. The account WebSocket remains the source
+    # of the raw asset payload and live prices.
+    return screenshot_asset_allowed(x)
 
 def build_assets(client,raw):
-    # Account-scoped assets are authoritative. Keep every currently available
-    # asset, while preserving the exact account-facing display name.
+    # Account-scoped assets are authoritative, but the user's requested
+    # screenshot baseline is the exact permitted Flex universe.
     prof={}
     for x in raw or []:
         if not isinstance(x,dict): continue
@@ -223,6 +228,18 @@ def build_assets(client,raw):
         if p and isinstance(v,(int,float)): prof[p]=int(v)
 
     out=[]; seen=set(); rejected=[]
+    raw_pairs={pair_name(x) for x in (raw or []) if isinstance(x,dict) and pair_name(x)}
+    matched=raw_pairs & SCREENSHOT_OPEN_PAIRS
+    missing=sorted(SCREENSHOT_OPEN_PAIRS-raw_pairs)
+    extra=sorted(raw_pairs-SCREENSHOT_OPEN_PAIRS)
+    log.info(
+        "ACCOUNT_SCREENSHOT_ASSET_COMPARE expected=%d matched=%d missing=%d extra=%d",
+        len(SCREENSHOT_OPEN_PAIRS),len(matched),len(missing),len(extra)
+    )
+    if missing:
+        log.warning("ACCOUNT_SCREENSHOT_ASSET_MISSING %s",missing)
+    if extra:
+        log.info("ACCOUNT_SCREENSHOT_ASSET_EXTRA %s",extra)
     for x in raw or []:
         if not isinstance(x,dict) or not is_flex_time_asset(x):
             p=pair_name(x) if isinstance(x,dict) else ""
@@ -255,7 +272,7 @@ def build_assets(client,raw):
     log.info("ACCOUNT_ASSET_FILTER raw=%d accepted=%d rejected=%d",len(raw or []),len(out),len(rejected))
     if rejected:
         log.info("ACCOUNT_ASSET_REJECTED sample=%s",rejected[:25])
-    # Audit the exact account-facing names that Candice accepted.
+    # Audit the exact account-facing/raw names that Candice accepted.
     log.info("ACCOUNT_ASSET_NAMES %s",[a["display_name"] for a in out])
     return out
 
