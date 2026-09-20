@@ -1246,7 +1246,10 @@ async def market_worker():
                                     "matched_keys":matches,
                                     "keys":sorted(str(k) for k in rec.keys())
                                 })
-                log.error("AUTH_TARGET_ID_PRESENT=%s hit_count=%d", bool(target_hits), len(target_hits))
+                log.error(
+                    "AUTH_TARGET_ID_PRESENT=%s hit_count=%d first_hit=%s",
+                    bool(target_hits), len(target_hits), target_hits[0] if target_hits else ""
+                )
                 log.error("AUTH_TARGET_RECORD_CONTEXT %s", target_record_context[:10])
                 log.error(
                     "TOKEN_ACCOUNT_BINDING_FAILED expected_account_id=%s exposed_demo_accounts=%s",
