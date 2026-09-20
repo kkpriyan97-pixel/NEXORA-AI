@@ -895,7 +895,8 @@ async def refresh_candles(force=False):
                         reference=time.time()
                         closed=_closed_candles(normalized,reference)
                         newest=_candle_epoch(closed[-1]) if closed else None
-                        closed_at=_candle_closed_at(closed[-1]) if closed else None                        age=(reference-closed_at) if closed_at is not None else None
+                        closed_at=_candle_closed_at(closed[-1]) if closed else None
+                        age=(reference-closed_at) if closed_at is not None else None
                         if newest is not None and age is not None and 0 <= age <= 75.0 and len(closed)>=45:
                             STATE["candles"][p]=normalized
                             CANDLE_FETCH_LAST[p]=time.time()
@@ -1766,4 +1767,3 @@ async def main():
     await configure_telegram_webhook()
     await asyncio.gather(market_worker(),account_tick_subscription_worker(),account_live_feed_worker(),cycle_loop(),server.serve_forever())
 if __name__=="__main__":asyncio.run(main())
-
