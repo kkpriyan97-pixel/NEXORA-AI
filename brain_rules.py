@@ -216,7 +216,7 @@ class BrainState:
         return max(-8.0,min(8.0,base_bonus+strategy_bonus+pattern_bonus+context_bonus))
 
     def choose_expiry(self,pair,strategy,direction,live_quality=0,allow_5m=False):
-        """Choose expiry from strategy-local evidence; 5m is an exceptional path."""
+        """Choose expiry from strategy-local evidence; 5m is a locked/rare path."""
         strategy=str(strategy)
         direction=str(direction).upper()
         base={
@@ -234,24 +234,36 @@ class BrainState:
             "VOLATILITY":(3,4),
         }.get(strategy,(2,3,4))
 
-        # 5m is never learned globally. It is available only to a dedicated
-        # trend-following gate that has already passed the closed-candle checks.
-        # 5m requires asset+strategy+direction-specific historical support.
-        # This deliberately prevents the old global 5m drift from returning:
-        # the current technical setup must qualify AND the same pair/strategy/
-        # direction must have enough completed 5m evidence with a positive rate.
-        if strategy=="TREND_FOLLOWING" and allow_5m and float(live_quality)>=95:
-            b5=self.stats.get((str(pair),strategy,direction,5))
-            n5=float(b5.get("n",0) or 0) if b5 else 0.0
-            rate5=self._rate(b5) if b5 else 0.0
-            if n5>=6 and rate5>=0.58:
+        # 5m is not a default. It is unlocked only when BOTH global history and
+        # the exact pair+strategy+direction history are strong enough. This
+        # prevents a handful of successful 5m trades on one pair from making
+        # 5m dominate the whole selector again.
+        if strategy=="TREND_FOLLOWING" and allow_5m and float(live_quality)>=92:
+            global5=self.expiry_stats.get(5)
+            gn=float(global5.get("n",0) or 0) if global5 else 0.0
+            grate=self._rate(global5) if global5 else 0.0
+
+            pair5=self.stats.get((str(pair),strategy,direction,5))
+            pn=float(pair5.get("n",0) or 0) if pair5 else 0.0
+            prate=self._rate(pair5) if pair5 else 0.0
+
+            strat=self.strategy_stats.get(strategy)
+            sn=float(strat.get("n",0) or 0) if strat else 0.0
+            srate=self._rate(strat) if strat else 0.0
+
+            # Conservative validation thresholds:
+            #   20+ global 5m observations, >=60% smoothed win rate
+            #   12+ exact pair/strategy/direction observations, >=60%
+            #   12+ trend-following observations, >=55%
+            # This keeps 5m disabled while the legacy 5m sample remains weak.
+            if gn>=20 and grate>=0.60 and pn>=12 and prate>=0.60 and sn>=12 and srate>=0.55:
                 allowed=tuple(list(allowed)+[5])
 
         candidates=[]
         for e in allowed:
             pair_bucket=self.stats.get((str(pair),strategy,direction,int(e)))
             score=-abs(e-base)*1.35
-            if pair_bucket and float(pair_bucket.get("n",0) or 0)>=2:
+            if pair_bucket and float(pair_bucket.get("n",0) or 0)>=3:
                 n=float(pair_bucket.get("n",0) or 0)
                 weighted=float(pair_bucket.get("weighted",0) or 0)
                 score += (weighted/max(n,1.0))*2.5
@@ -262,11 +274,11 @@ class BrainState:
                 if str(s)==strategy and str(d).upper()==direction and int(ee)==int(e):
                     total_n += float(b.get("n",0) or 0)
                     total_weighted += float(b.get("weighted",0) or 0)
-            if total_n>=3:
+            if total_n>=4:
                 score += (total_weighted/total_n)*0.8
 
             if e==5:
-                score += 0.50 if float(live_quality)>=97 else 0.05
+                score += 0.30 if float(live_quality)>=94 else 0.0
             elif live_quality>=90 and e>base:
                 score += 0.10
             elif live_quality<82 and e>base:
@@ -274,7 +286,6 @@ class BrainState:
 
             candidates.append((score,e))
         return max(candidates,key=lambda z:z[0])[1]
-
     def adaptive_candidate(self,c):
         x=dict(c)
         pair=str(x.get("pair",""))
@@ -355,6 +366,8 @@ def rank_signal_candidates(candidates):
        and str(x.get("direction","")).upper() in {"UP","DOWN"}]
     return sorted(q,key=lambda x:(
         int(x.get("confidence") or 0),
+        float(x.get("strategy_margin") or 0),
+        float(x.get("direction_agreement") or 0),
         float(x.get("market_quality") or 0),
         float(x.get("learning_bonus") or 0),
         int(x.get("profitability") or 0)
