@@ -1097,27 +1097,18 @@ async def market_worker():
             await audit_outbound_network()
             await client.start()
             STATE["status"]="connected"
-            # Session initialization is what causes broker event 55 to arrive.
-            # Start it without waiting for the library's slow account-info fallback.
-            init_task=asyncio.create_task(client.initialize_session())
-            demo_found=False
-            for _ in range(20):
-                await asyncio.sleep(0.25)
-                for m in client.get_cached_events(55):
-                    d=m.get("d") if isinstance(m,dict) else None
-                    if isinstance(d,list):
-                        for a in d:
-                            if isinstance(a,dict) and a.get("group")=="demo" and a.get("account_id") is not None:
-                                client.account_id=a.get("account_id")
-                                client.account_group="demo"
-                                demo_found=True
-                                break
-                    if demo_found: break
-                if demo_found: break
-            # Discover the account IDs that this access token actually exposes.
-            # Never invent/force an account ID that is not present in the authenticated session.
+            # Complete the browser-like session initialization first so all account
+            # metadata/subscriptions have settled before selecting the target account.
+            try:
+                await client.initialize_session()
+            except Exception as e:
+                log.warning("SESSION_INIT_FAILED type=%s message=%s",type(e).__name__,str(e)[:160])
+
             expected_account_id=int(os.getenv("OLYMPTRADE_ACCOUNT_ID","128175463").strip())
 
+            # Ask the authenticated session which DEMO account IDs it exposes.
+            # This is the authority for token/account binding; do not force an ID
+            # that the token does not actually expose.
             demo_accounts=[]
             try:
                 resp=await asyncio.wait_for(
@@ -1140,13 +1131,17 @@ async def market_worker():
 
             if expected_account_id not in demo_accounts:
                 log.error(
-                    "TOKEN_ACCOUNT_BINDING_FAILED expected_account_id=%s exposed_demo_accounts=%s",
-                    expected_account_id,demo_accounts
+                    "TOKEN_ACCOUNT_BINDING_FAILED expected_account_id=%s exposed_demo_accounts=%s session_account_id=%s",
+                    expected_account_id,demo_accounts,client.account_id
                 )
+                STATE["account_id"]=None
+                STATE["account_group"]="demo"
+                STATE["status"]="account_token_mismatch"
                 raise RuntimeError(
                     f"Access token does not expose configured demo account {expected_account_id}"
                 )
 
+            # Only now bind the client to the verified account.
             client.account_id=expected_account_id
             client.account_group="demo"
             STATE["account_id"]=expected_account_id
@@ -1177,7 +1172,7 @@ async def market_worker():
                     else:
                         log.warning("ACCOUNT_ASSET_SYNC_RETAINED count=%d",len(STATE["assets"]))
         except Exception as e:
-            STATE["status"]="error";log.exception("MARKET_WORKER_ERROR %s",e);await asyncio.sleep(15)
+            STATE["status"]=("account_token_mismatch" if "Access token does not expose configured demo account" in str(e) else "error");log.exception("MARKET_WORKER_ERROR %s",e);await asyncio.sleep(30)
         finally:
             try:await client.stop()
             except Exception:pass
