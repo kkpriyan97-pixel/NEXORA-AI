@@ -187,7 +187,7 @@ class BrainState:
         # Do not inject global expiry-only learning here. It was the
         # cross-strategy source of 5m drift. Expiry learning is already represented
         # by the pair+strategy+direction bucket above.
-        for store,key in ((self.asset_stats,pair),(self.strategy_stats,strategy),(self.self_strategy_stats,self_strategy if False else strategy)):
+        for store,key in ((self.asset_stats,pair),(self.strategy_stats,strategy),(self.self_strategy_stats,strategy)):
             b=store.get(key)
             if b and b.get("n",0)>=2: vals.append(float(b.get("weighted",0)))
 
