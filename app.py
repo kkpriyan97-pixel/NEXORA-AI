@@ -7,7 +7,7 @@ from telegram.ext import ContextTypes
 import httpx
 from olymptrade_ws import OlympTradeClient
 from olymptrade_ws.olympconfig import parameters
-from brain_rules import BrainState,rank_signal_candidates
+from brain_rules import ActiveSignal,BrainState,rank_signal_candidates
 from candice_brain import analyze_asset
 from ai_engine import snapshot_from_asset
 from ai_router import analyze_with_fallback,review_result_with_fallback
@@ -63,6 +63,7 @@ UAE_TZ=ZoneInfo("Asia/Dubai")
 AI_REVIEW_QUEUE_POLL_SECONDS=2.0
 AI_REVIEW_QUEUE_STALE_SECONDS=600.0
 AI_REVIEW_QUEUE_RETRY_DELAYS=(5,15,30,60,120,300)
+RESULT_WATCH_QUEUE_STALE_SECONDS=600.0
 
 
 async def ensure_ai_review_queue_table():
@@ -241,6 +242,189 @@ async def ai_review_worker():
             log.exception("AI_REVIEW_WORKER_ERROR type=%s message=%s",
                           type(e).__name__,str(e)[:180])
             await asyncio.sleep(AI_REVIEW_QUEUE_POLL_SECONDS)
+
+async def ensure_result_watch_queue_table():
+    if not LEARNING_DB_URL:
+        log.error("RESULT_WATCH_QUEUE_DB_REQUIRED")
+        return False
+    try:
+        import psycopg
+        def init():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candice_result_watch_queue (
+                            watch_id TEXT PRIMARY KEY,
+                            record JSONB NOT NULL,
+                            status TEXT NOT NULL DEFAULT 'PROCESSING',
+                            last_error TEXT,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            completed_at TIMESTAMPTZ
+                        )
+                    """)
+                    # A Render restart leaves PROCESSING rows behind. There is
+                    # one service instance, so on process startup every unfinished
+                    # watch is safe to resume from the persisted signal snapshot.
+                    cur.execute("""
+                        UPDATE candice_result_watch_queue
+                        SET status='PENDING',updated_at=NOW()
+                        WHERE status='PROCESSING'
+                    """)
+                db.commit()
+        await asyncio.to_thread(init)
+        log.info("RESULT_WATCH_QUEUE_READY")
+        return True
+    except Exception as e:
+        log.error("RESULT_WATCH_QUEUE_INIT_FAILED type=%s message=%s",
+                  type(e).__name__,str(e)[:180])
+        return False
+
+
+def _result_watch_payload(s):
+    return {
+        "cycle_id":int(s.cycle_id),
+        "account_id":s.account_id,
+        "pair":s.pair,
+        "display_name":s.display_name,
+        "direction":s.direction,
+        "expiry_minutes":int(s.expiry_minutes),
+        "entry_price":float(s.entry_price),
+        "entry_ts":float(s.entry_ts),
+        "entry_candle_ts":s.entry_candle_ts,
+        "strategy":s.strategy,
+        "reason":s.reason,
+        "confidence":int(s.confidence),
+        "pattern":s.pattern,
+        "trend_15m":s.trend_15m,
+        "structure_1m":s.structure_1m,
+        "self_strategy":s.self_strategy,
+        "self_strategy_version":s.self_strategy_version,
+        "indicator_context":dict(s.indicator_context or {}),
+    }
+
+async def enqueue_result_watch(watch_id,s):
+    if not LEARNING_DB_URL:
+        log.error("RESULT_WATCH_QUEUE_ENQUEUE_FAILED watch_id=%s reason=db_not_configured",watch_id)
+        return False
+    try:
+        import psycopg
+        payload=json.dumps(_result_watch_payload(s),separators=(",",":"),ensure_ascii=False,default=str)
+        def put():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO candice_result_watch_queue(watch_id,record,status)
+                        VALUES(%s,%s::jsonb,'PROCESSING')
+                        ON CONFLICT(watch_id) DO NOTHING
+                    """,(watch_id,payload))
+                db.commit()
+        await asyncio.to_thread(put)
+        log.info("RESULT_WATCH_ENQUEUED watch_id=%s pair=%s expiry=%s",
+                 watch_id,s.pair,s.expiry_minutes)
+        return True
+    except Exception as e:
+        log.error("RESULT_WATCH_QUEUE_ENQUEUE_FAILED watch_id=%s type=%s message=%s",
+                  watch_id,type(e).__name__,str(e)[:180])
+        return False
+
+async def complete_result_watch(watch_id):
+    if not LEARNING_DB_URL:return False
+    try:
+        import psycopg
+        def done():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        UPDATE candice_result_watch_queue
+                        SET status='COMPLETED',completed_at=NOW(),updated_at=NOW()
+                        WHERE watch_id=%s
+                    """,(watch_id,))
+                db.commit()
+        await asyncio.to_thread(done)
+        log.info("RESULT_WATCH_COMPLETED watch_id=%s",watch_id)
+        return True
+    except Exception as e:
+        log.warning("RESULT_WATCH_QUEUE_COMPLETE_FAILED watch_id=%s type=%s message=%s",
+                    watch_id,type(e).__name__,str(e)[:160])
+        return False
+
+async def mark_result_watch_error(watch_id,error):
+    if not LEARNING_DB_URL:return False
+    try:
+        import psycopg
+        def save():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        UPDATE candice_result_watch_queue
+                        SET status='PROCESSING',last_error=%s,updated_at=NOW()
+                        WHERE watch_id=%s
+                    """,(str(error)[:500],watch_id))
+                db.commit()
+        await asyncio.to_thread(save)
+        return True
+    except Exception as e:
+        log.warning("RESULT_WATCH_QUEUE_ERROR_SAVE_FAILED watch_id=%s type=%s message=%s",
+                    watch_id,type(e).__name__,str(e)[:160])
+        return False
+
+async def restore_pending_result_watches():
+    if not LEARNING_DB_URL or not CLIENT or not CLIENT.connection.is_connected:
+        return 0
+    try:
+        import psycopg
+        def read():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        SELECT watch_id,record
+                        FROM candice_result_watch_queue
+                        WHERE status='PENDING'
+                          AND created_at > NOW() - INTERVAL '2 days'
+                        ORDER BY created_at
+                    """)
+                    return cur.fetchall()
+        rows=await asyncio.to_thread(read)
+        restored=0
+        for watch_id,record in rows:
+            try:
+                cycle_id=int(record["cycle_id"])
+                pair=str(record["pair"])
+                entry_ts=float(record["entry_ts"])
+                key=f"{cycle_id}:{pair}:{entry_ts}"
+                if key not in BRAIN.active_signals:
+                    BRAIN.active_signals[key]=ActiveSignal(
+                        cycle_id=cycle_id,
+                        account_id=int(record["account_id"]) if record.get("account_id") is not None else None,
+                        pair=pair,
+                        display_name=str(record.get("display_name") or pair),
+                        direction=str(record.get("direction") or "").upper(),
+                        expiry_minutes=int(record.get("expiry_minutes") or 1),
+                        entry_price=float(record.get("entry_price") or 0),
+                        entry_ts=entry_ts,
+                        entry_candle_ts=record.get("entry_candle_ts"),
+                        strategy=str(record.get("strategy") or ""),
+                        reason=str(record.get("reason") or ""),
+                        confidence=int(record.get("confidence") or 0),
+                        pattern=str(record.get("pattern") or ""),
+                        trend_15m=str(record.get("trend_15m") or ""),
+                        structure_1m=str(record.get("structure_1m") or ""),
+                        self_strategy=str(record.get("self_strategy") or ""),
+                        self_strategy_version=str(record.get("self_strategy_version") or ""),
+                        indicator_context=dict(record.get("indicator_context") or {}),
+                    )
+                asyncio.create_task(result_watch(key))
+                restored+=1
+                log.info("RESULT_WATCH_RESTORED watch_id=%s pair=%s entry_ts=%s",watch_id,pair,entry_ts)
+            except Exception as e:
+                log.warning("RESULT_WATCH_RESTORE_FAILED watch_id=%s type=%s message=%s",
+                            watch_id,type(e).__name__,str(e)[:160])
+        return restored
+    except Exception as e:
+        log.warning("RESULT_WATCH_RESTORE_SCAN_FAILED type=%s message=%s",
+                    type(e).__name__,str(e)[:160])
+        return 0
 
 # Secure member access: one admin-generated code grants all MB* IDs for 24h.
 ACCESS_TTL=timedelta(hours=24)
@@ -1413,6 +1597,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
 async def result_watch(key):
     s=BRAIN.active_signals.get(key)
     if not s:return
+    watch_id=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
 
     # The alert is sent 30s before the entry boundary. The old code incorrectly
     # used that pre-entry reference as the actual entry price, which could
@@ -1440,11 +1625,30 @@ async def result_watch(key):
 
     if entry_price is None:
         # Never feed a 30s-old reference price back into Brain learning.
-        log.warning("ACTUAL_ENTRY_UNAVAILABLE pair=%s target=%s reason=no_fresh_authenticated_price",
-                    s.pair,s.entry_ts)
+        log.warning("ACTUAL_ENTRY_UNAVAILABLE pair=%s target=%s reason=no_fresh_authenticated_price durable_watch=%s",
+                    s.pair,s.entry_ts,watch_id)
+        await mark_result_watch_error(watch_id,"actual_entry_unavailable")
         return
 
     s.entry_price=entry_price
+    if LEARNING_DB_URL:
+        try:
+            import psycopg
+            updated_payload=_result_watch_payload(s)
+            updated_payload["actual_entry_source"]=entry_source
+            def _persist_entry():
+                with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                    with db.cursor() as cur:
+                        cur.execute("""
+                            UPDATE candice_result_watch_queue
+                            SET record=%s::jsonb,updated_at=NOW(),last_error=NULL,status='PROCESSING'
+                            WHERE watch_id=%s
+                        """,(json.dumps(updated_payload,separators=(",",":"),ensure_ascii=False,default=str),watch_id))
+                    db.commit()
+            await asyncio.to_thread(_persist_entry)
+            log.info("RESULT_WATCH_ENTRY_PERSISTED watch_id=%s pair=%s entry=%.12g",watch_id,s.pair,s.entry_price)
+        except Exception as e:
+            log.warning("RESULT_WATCH_ENTRY_PERSIST_FAILED watch_id=%s type=%s message=%s",watch_id,type(e).__name__,str(e)[:160])
     log.info("ACTUAL_ENTRY_CAPTURED pair=%s entry=%.12g source=%s entry_ts=%s",
              s.pair,s.entry_price,entry_source,
              datetime.fromtimestamp(s.entry_ts,tz=timezone.utc).strftime("%H:%M:%S"))
@@ -1485,7 +1689,7 @@ async def result_watch(key):
             await asyncio.sleep(0.5)
 
     if expiry_price is None:
-        log.warning("RESULT_PENDING_NO_CLOSED_CANDLE pair=%s entry=%s",s.pair,s.entry_price)
+        log.warning("RESULT_PENDING_NO_CLOSED_CANDLE pair=%s entry=%s durable_watch=%s",s.pair,s.entry_price,watch_id)
         if key in BRAIN.active_signals:
             await asyncio.sleep(1.0)
             return await result_watch(key)
@@ -1528,6 +1732,7 @@ async def result_watch(key):
         f"\n"
         f"⚠️ RESULT ONLY — AUTO TRADE OFF"
     )
+    await complete_result_watch(watch_id)
     log.info(
         "RESULT pair=%s result=%s strategy=%s self_strategy=%s self_version=%s confidence=%s trend=%s structure=%s pattern=%s expiry=%s entry=%s exit=%s source=%s cooldown=%s",
         rec["pair"],rec["result"],rec["strategy"],rec.get("self_strategy",""),rec.get("self_strategy_version",""),rec["confidence"],rec["trend_15m"],
@@ -1619,6 +1824,13 @@ async def cycle_loop():
             target-time.time()
         )
         asyncio.create_task(telegram_background(msg,f"{s.cycle_id}:{s.pair}:{s.entry_ts}"))
+        # Persist the result watcher before the in-memory task starts. A Render
+        # restart can then reconstruct this exact signal and continue result tracking.
+        try:
+            await asyncio.wait_for(enqueue_result_watch(key,s),timeout=0.20)
+        except Exception as e:
+            log.warning("RESULT_WATCH_PERSIST_BEFORE_START_FAILED watch_id=%s type=%s message=%s",
+                        key,type(e).__name__,str(e)[:140])
         asyncio.create_task(result_watch(key))
         return True
 
@@ -1950,6 +2162,9 @@ async def market_worker():
                      client.account_id,len(assets),real_n,otc_n,len(assets))
             log.info("ALL_ACCOUNT_OPEN_ASSETS_READY count=%d",len(assets))
             await ensure_account_tick_subscriptions()
+            restored=await restore_pending_result_watches()
+            if restored:
+                log.info("RESULT_WATCH_RECOVERY_COMPLETE restored=%d",restored)
             # Individual event-12 subscriptions are managed by the dedicated
             # read-only worker below. Event-1 ticks are preferred when delivered;
             # the snapshot scanner remains a timestamped fallback for assets
@@ -2074,6 +2289,7 @@ async def configure_telegram_webhook():
 async def main():
     await load_persistent_learning()
     await ensure_ai_review_queue_table()
+    await ensure_result_watch_queue_table()
     await ensure_access_table()
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
