@@ -32,6 +32,7 @@ class ActiveSignal:
     structure_1m:str=""
     self_strategy:str=""
     self_strategy_version:str=""
+    indicator_context:dict[str,Any]=field(default_factory=dict)
 
 @dataclass
 class BrainState:
@@ -122,7 +123,8 @@ class BrainState:
             entry_candle_ts=kw["entry_candle_ts"],strategy=str(kw.get("strategy","")),
             reason=str(kw.get("reason","")),confidence=int(kw.get("confidence",0)),
             pattern=str(kw.get("pattern","")),trend_15m=str(kw.get("trend_15m","")),
-            structure_1m=str(kw.get("structure_1m","")),self_strategy=str(kw.get("self_strategy","")),self_strategy_version=str(kw.get("self_strategy_version","")))
+            structure_1m=str(kw.get("structure_1m","")),self_strategy=str(kw.get("self_strategy","")),self_strategy_version=str(kw.get("self_strategy_version","")),
+            indicator_context=dict(kw.get("indicator_context") or {}))
         self.active_signals[f"{s.cycle_id}:{s.pair}:{s.entry_ts}"]=s
         return s
 
