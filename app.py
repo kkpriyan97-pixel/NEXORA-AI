@@ -100,9 +100,10 @@ ACCOUNT_LIVE_SCAN_INTERVAL=1.0
 ACCOUNT_LIVE_SCAN_CURSOR=0
 # Account-wide event-1 tick subscription manager. Subscriptions are read-only;
 # the worker only requests market quotes and never places/modifies trades.
-ACCOUNT_TICK_SUB_SEM=asyncio.Semaphore(4)
+ACCOUNT_TICK_SUB_SEM=asyncio.Semaphore(1)
 ACCOUNT_TICK_SUB_BATCH=16
-ACCOUNT_TICK_SUB_RETRY=900.0
+ACCOUNT_TICK_SUB_RETRY=30.0
+ACCOUNT_TICK_SUB_DELAY=0.25
 ACCOUNT_TICK_SUBSCRIBED=set()
 ACCOUNT_TICK_LAST_ATTEMPT={}
 CLIENT=None
@@ -399,8 +400,10 @@ async def ensure_account_tick_subscriptions():
 
     accepted=0
     rejected=[]
-    async def one(pair):
-        nonlocal accepted
+    # Send one subscription at a time. Bursting parallel websocket requests
+    # causes broker-side invalid_request responses and leaves most assets
+    # without an event-1 live stream.
+    for pair in pairs:
         async with ACCOUNT_TICK_SUB_SEM:
             try:
                 await asyncio.wait_for(client.market.subscribe_ticks(pair),timeout=6.0)
@@ -413,13 +416,8 @@ async def ensure_account_tick_subscriptions():
                 rejected.append((pair,type(e).__name__,str(e)[:120]))
                 log.warning("ACCOUNT_TICK_SUBSCRIBE pair=%s status=rejected type=%s message=%s",
                             pair,type(e).__name__,str(e)[:120])
+        await asyncio.sleep(ACCOUNT_TICK_SUB_DELAY)
 
-    results=await asyncio.gather(*(one(p) for p in pairs),return_exceptions=True)
-    for p,r in zip(pairs,results):
-        if isinstance(r,asyncio.CancelledError):
-            rejected.append((p,"CancelledError","subscription task cancelled"))
-        elif isinstance(r,BaseException):
-            rejected.append((p,type(r).__name__,str(r)[:120]))
     log.info("ACCOUNT_TICK_SUBSCRIBE_BATCH requested=%d accepted=%d rejected=%d active=%d",
              len(pairs),accepted,len(rejected),len(ACCOUNT_TICK_SUBSCRIBED))
     if rejected:
