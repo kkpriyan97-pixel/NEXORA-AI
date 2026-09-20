@@ -16,6 +16,48 @@ logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(messa
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log=logging.getLogger("candice")
+
+LEARNING_DB_URL=os.getenv("DATABASE_URL","").strip()
+
+async def load_persistent_learning():
+    if not LEARNING_DB_URL:
+        log.warning("LEARNING_DB_NOT_CONFIGURED")
+        return
+    try:
+        import psycopg
+        def _load():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("CREATE TABLE IF NOT EXISTS candice_brain_learning (id SMALLINT PRIMARY KEY, state JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+                    cur.execute("SELECT state FROM candice_brain_learning WHERE id=1")
+                    row=cur.fetchone()
+                    if row: return row[0]
+            return None
+        data=await asyncio.to_thread(_load)
+        if data:
+            BRAIN.import_learning(data)
+            log.info("LEARNING_STATE_LOADED total_results=%s",BRAIN.total_results)
+        else:
+            log.info("LEARNING_STATE_INITIALIZED total_results=0")
+    except Exception as e:
+        log.warning("LEARNING_STATE_LOAD_FAILED type=%s message=%s",type(e).__name__,str(e)[:180])
+
+async def save_persistent_learning():
+    if not LEARNING_DB_URL:
+        return
+    try:
+        import psycopg
+        data=BRAIN.export_learning()
+        def _save():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("CREATE TABLE IF NOT EXISTS candice_brain_learning (id SMALLINT PRIMARY KEY, state JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())")
+                    cur.execute("INSERT INTO candice_brain_learning(id,state) VALUES(1,%s) ON CONFLICT(id) DO UPDATE SET state=EXCLUDED.state,updated_at=NOW()",(json.dumps(data,separators=(",",":")),))
+                db.commit()
+        await asyncio.to_thread(_save)
+        log.info("LEARNING_STATE_SAVED total_results=%s",BRAIN.total_results)
+    except Exception as e:
+        log.warning("LEARNING_STATE_SAVE_FAILED type=%s message=%s",type(e).__name__,str(e)[:180])
 BRAIN=BrainState()
 UAE_TZ=ZoneInfo("Asia/Dubai")
 
@@ -644,6 +686,7 @@ async def result_watch(key):
         return
 
     rec=BRAIN.finish_signal(key,expiry_price)
+    await save_persistent_learning()
     label=rec["display_name"]
     direction_icon="⬆️" if rec["direction"]=="UP" else "⬇️"
     result_icon={"WIN":"✅","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
@@ -1017,6 +1060,7 @@ async def configure_telegram_webhook():
         log.warning("TELEGRAM_WEBHOOK_SETUP_FAILED %s",e)
 
 async def main():
+    await load_persistent_learning()
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
     await asyncio.gather(market_worker(),cycle_loop(),server.serve_forever())
