@@ -720,6 +720,9 @@ async def send_learning_summary(summary):
     lines += ["","📋 LAST 10 SIGNALS"]
     for i,d in enumerate(summary.get("details") or [],1):
         lines.append(f"{i}. {d.get('pair')} {d.get('direction')} | {d.get('strategy')} | {d.get('expiry')}m | {d.get('result')} | {d.get('confidence')}%")
+    lines += ["","📐 INDICATOR RESULTS"]
+    for name,b in sorted((summary.get("indicator_contexts") or {}).items(),key=lambda kv:(-kv[1].get("n",0),kv[0])):
+        lines.append(f"• {name}: {b.get('win',0)}W / {b.get('loss',0)}L / {b.get('tie',0)}T")
     lines += ["","📖 WHAT BRAIN LEARNED"]
     lines.extend(f"• {x}" for x in (summary.get("lessons") or []))
     lines += ["","🔐 Learning scope → authenticated token account only",
