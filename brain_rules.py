@@ -203,7 +203,7 @@ class BrainState:
                 "signals":10,"wins":wins,"losses":losses,"ties":ties,
                 "win_rate":round(100*wins/10,1),"strategies":strategies,
                 "self_strategies":self_strategies,"expiries":expiries,
-                "assets":assets,"lessons":lessons,"cooldown_seconds":600
+                "assets":assets,"lessons":lessons,"details":[{"pair":r.get("pair"),"direction":r.get("direction"),"strategy":r.get("strategy"),"self_strategy":r.get("self_strategy"),"expiry":r.get("expiry_minutes"),"confidence":r.get("confidence"),"result":r.get("result")} for r in batch],"cooldown_seconds":600
             }
             self.account_cooldown_until=utc_now()+600.0
             self.batch_results.clear()
