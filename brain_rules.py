@@ -259,21 +259,43 @@ class BrainState:
         ])
 
     def apply_ai_review(self,rec,review):
-        """Persist a bounded post-result AI lesson for reuse on the same setup."""
+        """Apply an external AI lesson once; queue retries are idempotent."""
         if not isinstance(review,dict): return
         key=self.lesson_key(rec)
         result=str(rec.get("result") or "").upper()
         if result not in {"WIN","LOSS","TIE"}: return
-        b=self.post_result_lessons.setdefault(key,{"n":0.0,"win":0.0,"loss":0.0,"tie":0.0,"weighted":0.0,"reviews":[]})
-        b[result.lower()]=float(b.get(result.lower(),0) or 0)+1.0
-        b["n"]=float(b.get("n",0) or 0)+1.0
-        b["weighted"]=float(b.get("weighted",0) or 0)+{"WIN":1.0,"LOSS":-1.0,"TIE":0.0}[result]
+        b=self.post_result_lessons.setdefault(
+            key,{"n":0.0,"win":0.0,"loss":0.0,"tie":0.0,"weighted":0.0,"reviews":[]}
+        )
+        review_id=str(review.get("review_id") or "").strip()
+        existing=list(b.get("reviews") or [])
+        already=bool(
+            review_id and any(
+                isinstance(item,dict) and str(item.get("review_id") or "").strip()==review_id
+                for item in existing
+            )
+        )
         lesson=str(review.get("lesson") or "").strip()[:320]
         action=str(review.get("reuse") or review.get("action") or "").strip()[:240]
         evidence=str(review.get("evidence") or "").strip()[:320]
-        if lesson or action or evidence:
-            b["reviews"]=(b.get("reviews") or [])[-4:]+[{"result":result,"lesson":lesson,"reuse":action,"evidence":evidence,"ai_provider":str(review.get("provider") or "internal")}]
-        self.last_ai_review={"key":key,"pair":rec.get("pair"),"result":result,"lesson":lesson,"reuse":action,"evidence":evidence}
+        if not already:
+            b[result.lower()]=float(b.get(result.lower(),0) or 0)+1.0
+            b["n"]=float(b.get("n",0) or 0)+1.0
+            b["weighted"]=float(b.get("weighted",0) or 0)+{"WIN":1.0,"LOSS":-1.0,"TIE":0.0}[result]
+            if lesson or action or evidence:
+                b["reviews"]=existing[-4:]+[{
+                    "review_id":review_id,
+                    "result":result,
+                    "lesson":lesson,
+                    "reuse":action,
+                    "evidence":evidence,
+                    "ai_provider":str(review.get("provider") or "external"),
+                }]
+        self.last_ai_review={
+            "review_id":review_id,"key":key,"pair":rec.get("pair"),"result":result,
+            "lesson":lesson,"reuse":action,"evidence":evidence,
+            "provider":str(review.get("provider") or "external"),
+        }
 
     def post_result_learning_bonus(self,rec):
         b=self.post_result_lessons.get(self.lesson_key(rec))
