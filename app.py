@@ -194,7 +194,6 @@ SCREENSHOT_OPEN_PAIRS={
 }
 
 def asset_key(value):
-(value):
     text=_norm_text(value)
     return " ".join(text.replace("/"," ").replace("_"," ").split())
 
