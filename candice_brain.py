@@ -77,6 +77,33 @@ def stochastic(cs, k_period=14, d_period=3, slowing=3):
     return k,d,cross
 
 
+
+def bollinger(cs, n=30, mult=2.2):
+    """Bollinger Bands matching the user's history AI settings: 30, 2.2."""
+    if len(cs) < n:
+        return {"middle":0.0,"upper":0.0,"lower":0.0,"signal":"UNKNOWN","position":"INSUFFICIENT","width_norm":0.0}
+    closes=[x["close"] for x in cs[-n:]]
+    middle=sum(closes)/n
+    variance=sum((x-middle)**2 for x in closes)/n
+    sd=variance**0.5
+    upper=middle+mult*sd
+    lower=middle-mult*sd
+    last=closes[-1]
+    width=max(upper-lower,0.0)
+    if last>upper:
+        signal="UP"; position="ABOVE_UPPER"
+    elif last<lower:
+        signal="DOWN"; position="BELOW_LOWER"
+    elif last>=middle:
+        signal="UP"; position="ABOVE_MIDDLE"
+    else:
+        signal="DOWN"; position="BELOW_MIDDLE"
+    return {
+        "middle":middle,"upper":upper,"lower":lower,
+        "signal":signal,"position":position,
+        "width_norm":width/max(abs(last),1e-12)
+    }
+
 def donchian(cs, period=30):
     """Donchian Channel 30: prior-channel breakout plus channel-width regime."""
     if len(cs) < period + 2:
@@ -229,6 +256,7 @@ def analyze_asset(asset, candles, price=None):
     support = min(c["low"] for c in cs[-20:-1])
 
     dc = donchian(cs,30)
+    bb = bollinger(cs,30,2.2)
     stoch_k, stoch_d, stoch_cross = stochastic(cs,14,3,3)
     dc_breakout_up = bool(dc["breakout_up"] and body > 0)
     dc_breakout_down = bool(dc["breakout_down"] and body < 0)
@@ -599,7 +627,17 @@ def analyze_asset(asset, candles, price=None):
         "structure_quality": structure_quality[expected],
         "efficiency": _efficiency(v, 8),
         "indicators": {
+            "bollinger_period": 30,
+            "bollinger_stddev": 2.2,
+            "bollinger_signal": bb["signal"],
+            "bollinger_position": bb["position"],
+            "bollinger_middle": bb["middle"],
+            "bollinger_upper": bb["upper"],
+            "bollinger_lower": bb["lower"],
+            "bollinger_width_norm": bb["width_norm"],
             "donchian_period": 30,
+            "bollinger_signal": bb["signal"],
+            "bollinger_position": bb["position"],
             "donchian_state": dc["state"],
             "donchian_expansion": dc["expansion"],
             "donchian_upper": dc["upper"],
