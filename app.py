@@ -1156,124 +1156,73 @@ async def market_worker():
             STATE["status"]="connected"
             await client.initialize_session()
 
-            # e:55 is the authenticated account/balance source. Do not use the
-            # speculative e:1068 request as an identity oracle.
+            # IMPORTANT: e:55 is the balance/account-set feed, but its
+            # account_id fields are not the only identity fields used by the
+            # authenticated session. In the current broker session the library
+            # preserves the explicitly requested account_id and separately
+            # reports the e:55 balance accounts. The previous app-level guard
+            # incorrectly treated absence from e:55.account_id as proof that
+            # the token belonged to another account. That caused a valid session
+            # to be rejected before the account-scoped e:182 asset API was even
+            # tested.
             event55_accounts=[]
             for msg in client.get_cached_events(parameters.E_BALANCE_UPDATE):
                 event55_accounts.extend(extract_account_ids(msg,"demo"))
             if not event55_accounts:
-                event55_accounts.extend(
-                    extract_account_ids(client.current_balance,"demo")
-                )
-
+                event55_accounts.extend(extract_account_ids(client.current_balance,"demo"))
             demo_accounts=sorted(set(event55_accounts))
             log.info(
-                "TOKEN_DEMO_ACCOUNTS_EXPOSED source=event55 count=%d ids=%s",
+                "TOKEN_DEMO_BALANCE_ACCOUNTS source=event55 count=%d ids=%s",
                 len(demo_accounts),demo_accounts
             )
 
-            if expected_account_id not in demo_accounts:
-                # Diagnostic only: compare identity-like fields from the
-                # authenticated account/balance and user-info events. This
-                # distinguishes a true account mismatch from an ID-semantic
-                # mismatch without logging tokens or financial payloads.
-                event55_identity={}
-                event55_records=[]
-                for msg in client.get_cached_events(parameters.E_BALANCE_UPDATE):
-                    event55_identity.update(extract_identity_fields(msg))
-                    data=msg.get("d") if isinstance(msg,dict) else None
-                    if isinstance(data,list):
-                        for idx,rec in enumerate(data):
-                            if isinstance(rec,dict):
-                                event55_records.append({
-                                    "index":idx,
-                                    "account_id":rec.get("account_id",rec.get("accountId")),
-                                    "group":rec.get("group",rec.get("account_group",rec.get("accountGroup"))),
-                                    "keys":sorted(str(k) for k in rec.keys()),
-                                })
-                event110_identity={}
-                for msg in client.get_cached_events(parameters.E_USER_INFO):
-                    event110_identity.update(extract_identity_fields(msg))
-
-                # Search all already-received authenticated events for the
-                # configured ID without logging unrelated payload values.
-                target_hits=[]
-                def find_target(v,path="root",event_code=None):
-                    if isinstance(v,dict):
-                        for k,val in v.items():
-                            if str(val)==str(expected_account_id):
-                                target_hits.append(f"e{event_code}:{k}@{path}")
-                            if isinstance(val,(dict,list)):
-                                find_target(val,f"{path}.{k}",event_code)
-                    elif isinstance(v,list):
-                        for idx,val in enumerate(v):
-                            if isinstance(val,(dict,list)):
-                                find_target(val,f"{path}[{idx}]",event_code)
-                            elif str(val)==str(expected_account_id):
-                                target_hits.append(f"e{event_code}:list_item@{path}[{idx}]")
-                for event_code,msgs in client._event_cache.items():
-                    for msg in msgs:
-                        find_target(msg,"root",event_code)
-                        if target_hits:
-                            # Keep the diagnostic bounded; only event/path metadata
-                            # is recorded, never the message payload itself.
-                            if len(target_hits)>20:
-                                target_hits=target_hits[:20]
-                                break
-                    if len(target_hits)>=20:
-                        break
-
-                log.error(
-                    "AUTH_IDENTITY_FIELDS expected=%s event55=%s event110=%s",
-                    expected_account_id,event55_identity,event110_identity
-                )
-                target_record_context=[]
-                for msg in client.get_cached_events(parameters.E_BALANCE_UPDATE):
-                    data=msg.get("d") if isinstance(msg,dict) else None
-                    if isinstance(data,list):
-                        for idx,rec in enumerate(data):
-                            if not isinstance(rec,dict):
-                                continue
-                            matches=[]
-                            for k,val in rec.items():
-                                if str(val)==str(expected_account_id):
-                                    matches.append(str(k))
-                            if matches:
-                                target_record_context.append({
-                                    "index":idx,
-                                    "account_id":rec.get("account_id",rec.get("accountId")),
-                                    "group":rec.get("group",rec.get("account_group",rec.get("accountGroup"))),
-                                    "matched_keys":matches,
-                                    "keys":sorted(str(k) for k in rec.keys())
-                                })
-                log.error(
-                    "AUTH_TARGET_ID_PRESENT=%s hit_count=%d first_hit=%s",
-                    bool(target_hits), len(target_hits), target_hits[0] if target_hits else ""
-                )
-                log.error("AUTH_TARGET_RECORD_CONTEXT %s", target_record_context[:10])
-                log.error(
-                    "TOKEN_ACCOUNT_BINDING_FAILED expected_account_id=%s exposed_demo_accounts=%s",
-                    expected_account_id,demo_accounts
-                )
+            # The library's initialize_session() preserves an explicit account
+            # selection. Require that selected identity to be exactly the
+            # configured demo account; never silently switch to another ID.
+            selected_account_id=client.account_id
+            try:
+                selected_account_id=int(selected_account_id) if selected_account_id is not None else None
+            except (TypeError,ValueError):
+                selected_account_id=None
+            if selected_account_id != expected_account_id or str(client.account_group or "").lower() != "demo":
                 STATE["account_id"]=None
                 STATE["account_group"]="demo"
                 STATE["status"]="account_token_mismatch"
+                log.error(
+                    "TOKEN_ACCOUNT_SELECTION_FAILED expected_account_id=%s selected_account_id=%s selected_group=%s balance_accounts=%s",
+                    expected_account_id,selected_account_id,client.account_group,demo_accounts
+                )
                 raise RuntimeError(
-                    f"Authenticated session does not expose configured demo account {expected_account_id}"
+                    f"Authenticated session selected account {selected_account_id!r}, expected {expected_account_id}"
                 )
 
+            # Keep the requested account fixed. The definitive account test is
+            # now the authenticated account-scoped asset endpoint (e:182): if
+            # this account cannot return assets, the session is not usable for
+            # Candice and no fallback account is permitted.
             client.account_id=expected_account_id
             client.account_group="demo"
             STATE["account_id"]=expected_account_id
             STATE["account_group"]="demo"
-            STATE["status"]="authenticated_account_verified"
+            STATE["status"]="authenticated_account_selected"
             log.info(
-                "DEMO_ACCOUNT_SELECTED account_id=%s group=demo source=event55_verified",
+                "DEMO_ACCOUNT_SELECTED account_id=%s group=demo source=authenticated_session",
                 client.account_id
             )
 
             if not await sync_account_assets(client,reason="initial"):
-                raise RuntimeError("Authenticated account asset scan returned no usable assets")
+                STATE["status"]="account_asset_api_failed"
+                log.error(
+                    "TOKEN_ACCOUNT_ASSET_VALIDATION_FAILED account_id=%s balance_accounts=%s",
+                    expected_account_id,demo_accounts
+                )
+                raise RuntimeError(
+                    f"Authenticated account asset scan returned no usable assets for {expected_account_id}"
+                )
+            log.info(
+                "TOKEN_ACCOUNT_ASSET_VALIDATED account_id=%s source=authenticated_websocket:event_182 asset_count=%d",
+                client.account_id,len(STATE["assets"])
+            )
             STATE["status"]="live_read_only"
             assets=list(STATE["assets"])
             real_n=sum(a["mode"]=="REAL" for a in assets); otc_n=sum(a["mode"]=="OTC" for a in assets)
