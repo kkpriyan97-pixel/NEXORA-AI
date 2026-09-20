@@ -196,7 +196,7 @@ class BrainState:
         sn=float(sb.get("n",0) or 0) if sb else 0.0
         if sb and sn>=5:
             rate=self._rate(sb)
-            strategy_bonus=max(-6.0,min(4.0,(rate-0.5)*12.0))
+            strategy_bonus=max(-8.0,min(3.0,(rate-0.5)*20.0))
 
         base_bonus=(sum(vals)/max(1,len(vals))*1.2) if vals else 0.0
 
@@ -281,11 +281,14 @@ class BrainState:
             str(x.get("structure_1m") or "")
         ),2)
 
+        # self_strategy_stats is intentionally not double-counted when the
+        # router strategy equals the actual candidate strategy. The strategy
+        # reliability term above is already the canonical learning signal.
         self_bucket=self.self_strategy_stats.get(self_strategy,{})
         self_n=float(self_bucket.get("n",0) or 0)
         self_bonus=0.0
-        if self_n>=4:
-            self_bonus=max(-3.0,min(3.0,float(self_bucket.get("weighted",0) or 0)*0.75))
+        if self_strategy != strategy and self_n>=4:
+            self_bonus=max(-2.0,min(2.0,float(self_bucket.get("weighted",0) or 0)*0.5))
         x["self_learning_bonus"]=round(self_bonus,2)
 
         technical=float(x.get("market_quality") or x.get("confidence") or 0)
