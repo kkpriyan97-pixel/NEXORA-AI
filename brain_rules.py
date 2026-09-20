@@ -184,7 +184,10 @@ class BrainState:
         ):
             b=self.stats.get(key)
             if b and b.get("n",0)>=2: vals.append(float(b.get("weighted",0)))
-        for store,key in ((self.asset_stats,pair),(self.strategy_stats,strategy),(self.self_strategy_stats,strategy),(self.expiry_stats,expiry)):
+        # Do not inject global expiry-only learning here. It was the
+        # cross-strategy source of 5m drift. Expiry learning is already represented
+        # by the pair+strategy+direction bucket above.
+        for store,key in ((self.asset_stats,pair),(self.strategy_stats,strategy),(self.self_strategy_stats,self_strategy if False else strategy)):
             b=store.get(key)
             if b and b.get("n",0)>=2: vals.append(float(b.get("weighted",0)))
 
@@ -208,21 +211,54 @@ class BrainState:
         return max(-8.0,min(8.0,base_bonus+pattern_bonus+context_bonus))
 
     def choose_expiry(self,pair,strategy,direction,live_quality=0):
-        """Select among 1/2/3/4/5/10/15m using evidence plus live condition."""
+        """Choose expiry from strategy-local evidence only.
+
+        A global expiry bucket used to push unrelated strategies toward 5m.
+        That caused MOMENTUM candidates to inherit TREND_FOLLOWING-style
+        5-minute exposure. Keep expiry selection inside a strategy-specific
+        neighborhood and use pair/strategy/direction history when available.
+        """
         base={"BREAKOUT":1,"PULLBACK":2,"REVERSAL":3,"MEAN_REVERSION":3,
-              "MOMENTUM":2,"TREND_FOLLOWING":5,"PRICE_ACTION":3}.get(strategy,3)
+              "MOMENTUM":2,"TREND_FOLLOWING":5,"PRICE_ACTION":3,
+              "VOLATILITY":4}.get(strategy,3)
+        allowed={
+            "BREAKOUT":(1,2),
+            "MOMENTUM":(1,2,3),
+            "PULLBACK":(1,2,3),
+            "TREND_FOLLOWING":(3,5),
+            "REVERSAL":(2,3,4),
+            "MEAN_REVERSION":(2,3,4),
+            "PRICE_ACTION":(2,3,4),
+            "VOLATILITY":(3,4,5),
+        }.get(strategy,(2,3,4))
         candidates=[]
-        for e in EXPIRIES:
-            b=self.expiry_stats.get(e,{})
-            n=float(b.get("n",0) or 0)
-            learned=float(b.get("weighted",0) or 0) if n>=2 else 0.0
-            distance=abs(e-base)
-            score=learned - distance*0.7
-            # Low live quality favors shorter exposure; strong quality permits longer.
-            if live_quality>=90: score += min(e,5)*0.25
-            elif live_quality<82: score -= max(0,e-3)*0.5
+        for e in allowed:
+            pair_bucket=self.stats.get((str(pair),str(strategy),str(direction).upper(),int(e)))
+            score=-abs(e-base)*1.25
+            if pair_bucket and float(pair_bucket.get("n",0) or 0)>=2:
+                n=float(pair_bucket.get("n",0) or 0)
+                weighted=float(pair_bucket.get("weighted",0) or 0)
+                score += (weighted/max(n,1.0))*2.5
+
+            # Strategy-wide evidence is only a weak tie-breaker. It cannot move
+            # a candidate across unrelated strategy expiry ranges.
+            total_n=0.0
+            total_weighted=0.0
+            for (p,s,d,ee),b in self.stats.items():
+                if str(s)==str(strategy) and str(d).upper()==str(direction).upper() and int(ee)==int(e):
+                    total_n += float(b.get("n",0) or 0)
+                    total_weighted += float(b.get("weighted",0) or 0)
+            if total_n>=3:
+                score += (total_weighted/total_n)*0.9
+
+            # Strong live evidence can prefer the longer member of the local
+            # strategy neighborhood, but never creates a new 5m path.
+            if live_quality>=90 and e>base:
+                score += 0.20
+            elif live_quality<82 and e>base:
+                score -= 0.25
             candidates.append((score,e))
-        return max(candidates)[1]
+        return max(candidates,key=lambda z:z[0])[1]
 
     def adaptive_candidate(self,c):
         x=dict(c)
