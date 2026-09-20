@@ -177,24 +177,29 @@ class BrainState:
         return (float(b.get("win",0))+0.5)/(n+1.0)
 
     def learning_bonus(self,pair,strategy,expiry,direction="",pattern="",trend_15m="",structure_1m=""):
-        """Return a bounded learned adjustment; conservative until evidence exists."""
+        """Return a bounded learned adjustment without cross-strategy expiry drift."""
         vals=[]
-        for key in (
-            (pair,strategy,direction,expiry),
-        ):
-            b=self.stats.get(key)
-            if b and b.get("n",0)>=2: vals.append(float(b.get("weighted",0)))
-        # Do not inject global expiry-only learning here. It was the
-        # cross-strategy source of 5m drift. Expiry learning is already represented
-        # by the pair+strategy+direction bucket above.
-        for store,key in ((self.asset_stats,pair),(self.strategy_stats,strategy),(self.self_strategy_stats,strategy)):
-            b=store.get(key)
-            if b and b.get("n",0)>=2: vals.append(float(b.get("weighted",0)))
 
-        base_bonus=(sum(vals)/max(1,len(vals))*1.5) if vals else 0.0
+        pair_bucket=self.stats.get((str(pair),str(strategy),str(direction).upper(),int(expiry)))
+        if pair_bucket and float(pair_bucket.get("n",0) or 0)>=2:
+            vals.append(float(pair_bucket.get("weighted",0) or 0))
 
-        # Pattern/context evidence is deliberately gated at 8 observations.
-        # A few wins/losses must not reshape live selection.
+        asset_bucket=self.asset_stats.get(str(pair))
+        if asset_bucket and float(asset_bucket.get("n",0) or 0)>=2:
+            vals.append(float(asset_bucket.get("weighted",0) or 0))
+
+        # Strategy reliability is intentionally slow-moving. It can suppress a
+        # strategy after repeated poor outcomes, but a handful of results cannot
+        # dominate the live technical evidence.
+        strategy_bonus=0.0
+        sb=self.strategy_stats.get(str(strategy))
+        sn=float(sb.get("n",0) or 0) if sb else 0.0
+        if sb and sn>=5:
+            rate=self._rate(sb)
+            strategy_bonus=max(-6.0,min(4.0,(rate-0.5)*12.0))
+
+        base_bonus=(sum(vals)/max(1,len(vals))*1.2) if vals else 0.0
+
         def gated_rate_bonus(store,key,scale=2.0):
             b=store.get(key) if key else None
             n=float(b.get("n",0) or 0) if b else 0.0
@@ -208,78 +213,97 @@ class BrainState:
             f"{trend_15m or 'UNKNOWN'}|{structure_1m or 'UNKNOWN'}",
             2.0
         )
-        return max(-8.0,min(8.0,base_bonus+pattern_bonus+context_bonus))
+        return max(-8.0,min(8.0,base_bonus+strategy_bonus+pattern_bonus+context_bonus))
 
-    def choose_expiry(self,pair,strategy,direction,live_quality=0):
-        """Choose expiry from strategy-local evidence only.
-
-        A global expiry bucket used to push unrelated strategies toward 5m.
-        That caused MOMENTUM candidates to inherit TREND_FOLLOWING-style
-        5-minute exposure. Keep expiry selection inside a strategy-specific
-        neighborhood and use pair/strategy/direction history when available.
-        """
-        base={"BREAKOUT":1,"PULLBACK":2,"REVERSAL":3,"MEAN_REVERSION":3,
-              "MOMENTUM":2,"TREND_FOLLOWING":5,"PRICE_ACTION":3,
-              "VOLATILITY":4}.get(strategy,3)
+    def choose_expiry(self,pair,strategy,direction,live_quality=0,allow_5m=False):
+        """Choose expiry from strategy-local evidence; 5m is an exceptional path."""
+        strategy=str(strategy)
+        direction=str(direction).upper()
+        base={
+            "BREAKOUT":1,"PULLBACK":2,"REVERSAL":3,"MEAN_REVERSION":3,
+            "MOMENTUM":2,"TREND_FOLLOWING":3,"PRICE_ACTION":3,"VOLATILITY":4
+        }.get(strategy,3)
         allowed={
             "BREAKOUT":(1,2),
             "MOMENTUM":(1,2,3),
-            "PULLBACK":(1,2,3),
-            "TREND_FOLLOWING":(3,5),
+            "PULLBACK":(2,3),
+            "TREND_FOLLOWING":(2,3,4),
             "REVERSAL":(2,3,4),
             "MEAN_REVERSION":(2,3,4),
             "PRICE_ACTION":(2,3,4),
-            "VOLATILITY":(3,4,5),
+            "VOLATILITY":(3,4),
         }.get(strategy,(2,3,4))
+
+        # 5m is never learned globally. It is available only to a dedicated
+        # trend-following gate that has already passed the closed-candle checks.
+        if strategy=="TREND_FOLLOWING" and allow_5m and float(live_quality)>=94:
+            allowed=tuple(list(allowed)+[5])
+
         candidates=[]
         for e in allowed:
-            pair_bucket=self.stats.get((str(pair),str(strategy),str(direction).upper(),int(e)))
-            score=-abs(e-base)*1.25
+            pair_bucket=self.stats.get((str(pair),strategy,direction,int(e)))
+            score=-abs(e-base)*1.35
             if pair_bucket and float(pair_bucket.get("n",0) or 0)>=2:
                 n=float(pair_bucket.get("n",0) or 0)
                 weighted=float(pair_bucket.get("weighted",0) or 0)
                 score += (weighted/max(n,1.0))*2.5
 
-            # Strategy-wide evidence is only a weak tie-breaker. It cannot move
-            # a candidate across unrelated strategy expiry ranges.
             total_n=0.0
             total_weighted=0.0
             for (p,s,d,ee),b in self.stats.items():
-                if str(s)==str(strategy) and str(d).upper()==str(direction).upper() and int(ee)==int(e):
+                if str(s)==strategy and str(d).upper()==direction and int(ee)==int(e):
                     total_n += float(b.get("n",0) or 0)
                     total_weighted += float(b.get("weighted",0) or 0)
             if total_n>=3:
-                score += (total_weighted/total_n)*0.9
+                score += (total_weighted/total_n)*0.8
 
-            # Strong live evidence can prefer the longer member of the local
-            # strategy neighborhood, but never creates a new 5m path.
-            if live_quality>=90 and e>base:
-                score += 0.20
+            if e==5:
+                score += 0.50 if float(live_quality)>=97 else 0.05
+            elif live_quality>=90 and e>base:
+                score += 0.10
             elif live_quality<82 and e>base:
-                score -= 0.25
+                score -= 0.20
+
             candidates.append((score,e))
         return max(candidates,key=lambda z:z[0])[1]
 
     def adaptive_candidate(self,c):
         x=dict(c)
-        pair=str(x.get("pair","")); strategy=str(x.get("strategy",""))
+        pair=str(x.get("pair",""))
+        strategy=str(x.get("strategy",""))
         direction=str(x.get("direction","")).upper()
         self_strategy=str(x.get("self_strategy") or strategy)
+
         x["learning_bonus"]=round(self.learning_bonus(
             pair,strategy,int(x.get("expiry_minutes") or 0),direction,
-            str(x.get("pattern") or ""),str(x.get("trend_15m") or ""),
+            str(x.get("pattern") or ""),
+            str(x.get("trend_15m") or ""),
             str(x.get("structure_1m") or "")
         ),2)
+
         self_bucket=self.self_strategy_stats.get(self_strategy,{})
         self_n=float(self_bucket.get("n",0) or 0)
         self_bonus=0.0
-        if self_n>=2:
-            self_bonus=max(-4.0,min(4.0,float(self_bucket.get("weighted",0) or 0)*1.25))
+        if self_n>=4:
+            self_bonus=max(-3.0,min(3.0,float(self_bucket.get("weighted",0) or 0)*0.75))
         x["self_learning_bonus"]=round(self_bonus,2)
-        x["market_quality"]=max(0.0,min(100.0,float(x.get("market_quality") or 0)+x["learning_bonus"]+self_bonus))
-        x["confidence"]=max(0,min(99,int(x.get("confidence") or 0)+int(round(x["learning_bonus"]+self_bonus))))
+
+        technical=float(x.get("market_quality") or x.get("confidence") or 0)
+        x["market_quality"]=max(
+            0.0,
+            min(100.0,technical+x["learning_bonus"]+self_bonus)
+        )
+
+        # Confidence is the resulting evidence quality; do not manufacture +8
+        # points on top of a borderline technical score.
+        x["confidence"]=max(0,min(99,int(round(x["market_quality"]))))
+
         if pair and strategy:
-            x["expiry_minutes"]=self.choose_expiry(pair,strategy,direction,float(x.get("market_quality") or 0))
+            allow_5m=bool(x.get("five_minute_eligible")) and strategy=="TREND_FOLLOWING"
+            x["expiry_minutes"]=self.choose_expiry(
+                pair,strategy,direction,float(x.get("market_quality") or 0),
+                allow_5m=allow_5m
+            )
         return x
 
 
