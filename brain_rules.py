@@ -16,6 +16,7 @@ def utc_now():
 @dataclass
 class ActiveSignal:
     cycle_id:int
+    account_id:int|None
     pair:str
     display_name:str
     direction:str
@@ -53,6 +54,23 @@ class BrainState:
     pattern_stats:dict[str,dict[str,float]]=field(default_factory=dict)
     context_stats:dict[str,dict[str,float]]=field(default_factory=dict)
     total_results:int=0
+    learning_account_id:int|None=None
+    batch_results:list[dict[str,Any]]=field(default_factory=list)
+    learning_batch_no:int=0
+    account_cooldown_until:float=0.0
+    last_batch_summary:dict[str,Any]|None=None
+
+    def bind_learning_account(self,account_id):
+        try: account_id=int(account_id) if account_id is not None else None
+        except (TypeError,ValueError): account_id=None
+        if account_id != self.learning_account_id:
+            self.learning_account_id=account_id
+            self.batch_results.clear(); self.last_batch_summary=None
+            self.account_cooldown_until=0.0; self.learning_batch_no=0
+
+    def is_account_cooldown(self,now=None):
+        now=utc_now() if now is None else float(now)
+        return self.account_cooldown_until > now
 
     def start_cycle(self,cycle_id):
         if cycle_id != self.cycle_id:
@@ -70,11 +88,14 @@ class BrainState:
 
     def filter_candidates(self,assets,now=None):
         now=utc_now() if now is None else now
+        if self.is_account_cooldown(now): return []
         return [a for a in assets if a.get("pair") and not a.get("locked")
                 and not a.get("locked_trading") and not a.get("disabled")
                 and not self.is_in_cooldown(str(a["pair"]),now)]
 
-    def can_send_cycle_signal(self):
+    def can_send_cycle_signal(self,account_id=None):
+        if self.is_account_cooldown(): return False
+        if account_id is not None and self.learning_account_id is not None and int(account_id)!=int(self.learning_account_id): return False
         return not self.cycle_signal_sent
 
     def duplicate_key(self,pair,entry_candle_ts):
@@ -84,7 +105,7 @@ class BrainState:
         return self.duplicate_key(pair,entry_candle_ts) in self.sent_keys
 
     def mark_signal_sent(self,**kw):
-        if not self.can_send_cycle_signal():
+        if not self.can_send_cycle_signal(kw.get("account_id")):
             raise RuntimeError("Final signal already sent for cycle")
         if int(kw.get("confidence",0)) < MIN_CONFIDENCE:
             raise ValueError("Confidence below 90")
@@ -94,7 +115,7 @@ class BrainState:
         self.sent_keys.add(key)
         self.cycle_signal_sent=True
         s=ActiveSignal(
-            cycle_id=self.cycle_id,pair=str(kw["pair"]),display_name=str(kw["display_name"]),
+            cycle_id=self.cycle_id,account_id=(int(kw.get("account_id")) if kw.get("account_id") is not None else None),pair=str(kw["pair"]),display_name=str(kw["display_name"]),
             direction=str(kw["direction"]).upper(),expiry_minutes=int(kw["expiry_minutes"]),
             entry_price=float(kw["entry_price"]),entry_ts=float(kw["entry_ts"]),
             entry_candle_ts=kw["entry_candle_ts"],strategy=str(kw.get("strategy","")),
@@ -130,6 +151,10 @@ class BrainState:
         expiry=int(rec.get("expiry_minutes") or 0)
         if result not in {"WIN","LOSS","TIE"} or not pair:
             return
+        try: rec_account=int(rec.get("account_id")) if rec.get("account_id") is not None else None
+        except (TypeError,ValueError): rec_account=None
+        if self.learning_account_id is None or rec_account != int(self.learning_account_id): return
+        self.batch_results.append(dict(rec)); self.batch_results=self.batch_results[-10:]
         # Exponential recency weighting without retaining raw candle history.
         weight=max(0.25,0.985 ** min(self.total_results,200))
         self._record_bucket(self._bucket(self.asset_stats,pair),result,weight)
@@ -150,12 +175,50 @@ class BrainState:
         self._record_bucket(self._bucket(self.context_stats,f"{trend}|{structure}"),result,weight)
         self.total_results+=1
 
+        if len(self.batch_results) >= 10:
+            self.learning_batch_no += 1
+            batch=list(self.batch_results[-10:])
+            wins=sum(1 for r in batch if r.get("result")=="WIN")
+            losses=sum(1 for r in batch if r.get("result")=="LOSS")
+            ties=sum(1 for r in batch if r.get("result")=="TIE")
+            def grouped(field):
+                out={}
+                for r in batch:
+                    key=str(r.get(field) or "UNKNOWN")
+                    b=out.setdefault(key,{"n":0,"win":0,"loss":0,"tie":0})
+                    b["n"]+=1; b[str(r.get("result","")).lower()]+=1
+                return out
+            strategies=grouped("strategy")
+            self_strategies=grouped("self_strategy")
+            expiries=grouped("expiry_minutes")
+            assets=grouped("pair")
+            lessons=[]
+            for st,b in sorted(strategies.items(),key=lambda kv:(-kv[1]["n"],kv[0])):
+                if b["n"]>=2:
+                    lessons.append(f"{st}: {b['win']}W/{b['loss']}L")
+            if not lessons:
+                lessons.append("No strategy had 2+ observations; keep technical evidence unchanged.")
+            self.last_batch_summary={
+                "batch_no":self.learning_batch_no,"account_id":self.learning_account_id,
+                "signals":10,"wins":wins,"losses":losses,"ties":ties,
+                "win_rate":round(100*wins/10,1),"strategies":strategies,
+                "self_strategies":self_strategies,"expiries":expiries,
+                "assets":assets,"lessons":lessons,"cooldown_seconds":600
+            }
+            self.account_cooldown_until=utc_now()+600.0
+            self.batch_results.clear()
+
+    def consume_batch_summary(self):
+        summary=self.last_batch_summary
+        self.last_batch_summary=None
+        return summary
+
     def finish_signal(self,key,exit_price,result_ts=None):
         s=self.active_signals.pop(key)
         result=self.classify_result(s.direction,s.entry_price,float(exit_price))
         now=utc_now() if result_ts is None else float(result_ts)
         rec={
-            "cycle_id":s.cycle_id,"pair":s.pair,"display_name":s.display_name,
+            "cycle_id":s.cycle_id,"account_id":s.account_id,"pair":s.pair,"display_name":s.display_name,
             "direction":s.direction,"expiry_minutes":s.expiry_minutes,
             "entry_price":s.entry_price,"exit_price":float(exit_price),
             "entry_ts":s.entry_ts,"result_ts":now,"strategy":s.strategy,
@@ -332,6 +395,10 @@ class BrainState:
     def export_learning(self):
         return {
             "total_results": self.total_results,
+            "learning_account_id": self.learning_account_id,
+            "batch_results": self.batch_results[-10:],
+            "learning_batch_no": self.learning_batch_no,
+            "account_cooldown_until": self.account_cooldown_until,
             "asset_stats": self.asset_stats,
             "strategy_stats": self.strategy_stats,
             "self_strategy_stats": self.self_strategy_stats,
@@ -344,6 +411,11 @@ class BrainState:
     def import_learning(self, data):
         if not isinstance(data, dict): return
         self.total_results=int(data.get("total_results",0) or 0)
+        try: self.learning_account_id=int(data.get("learning_account_id")) if data.get("learning_account_id") is not None else None
+        except (TypeError,ValueError): self.learning_account_id=None
+        self.batch_results=list(data.get("batch_results") or [])[-10:]
+        self.learning_batch_no=int(data.get("learning_batch_no",0) or 0)
+        self.account_cooldown_until=float(data.get("account_cooldown_until",0) or 0)
         self.asset_stats=dict(data.get("asset_stats") or {})
         self.strategy_stats=dict(data.get("strategy_stats") or {})
         self.self_strategy_stats=dict(data.get("self_strategy_stats") or {})
