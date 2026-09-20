@@ -658,6 +658,7 @@ async def result_watch(key):
         f"🏁 Expiry: {rec['exit_price']}\n"
         f"⏱️ Duration: {rec['expiry_minutes']} MIN\n"
         f"🧠 Brain Strategy: {rec['strategy'] or '—'}\n"
+        f"🧬 Self Strategy: {rec.get('self_strategy') or '—'} ({rec.get('self_strategy_version') or '—'})\n"
         f"🎯 Brain Confidence: {rec['confidence']}%\n"
         f"📈 15m Trend: {rec['trend_15m'] or '—'}\n"
         f"🕯️ 1m Structure: {rec['structure_1m'] or '—'}\n"
@@ -668,8 +669,8 @@ async def result_watch(key):
         f"⚠️ RESULT ONLY — AUTO TRADE OFF"
     )
     log.info(
-        "RESULT pair=%s result=%s strategy=%s confidence=%s trend=%s structure=%s pattern=%s entry=%s exit=%s source=%s cooldown=%s",
-        rec["pair"],rec["result"],rec["strategy"],rec["confidence"],rec["trend_15m"],
+        "RESULT pair=%s result=%s strategy=%s self_strategy=%s self_version=%s confidence=%s trend=%s structure=%s pattern=%s entry=%s exit=%s source=%s cooldown=%s",
+        rec["pair"],rec["result"],rec["strategy"],rec.get("self_strategy",""),rec.get("self_strategy_version",""),rec["confidence"],rec["trend_15m"],
         rec["structure_1m"],rec["pattern"],rec["entry_price"],rec["exit_price"],
         expiry_source,rec["result"]=="LOSS"
     )
@@ -722,7 +723,9 @@ async def cycle_loop():
             strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence,
             pattern=str(candidate.get("pattern") or ""),
             trend_15m=str(candidate.get("trend_15m") or ""),
-            structure_1m=str(candidate.get("structure_1m") or "")
+            structure_1m=str(candidate.get("structure_1m") or ""),
+            self_strategy=str(candidate.get("self_strategy") or ""),
+            self_strategy_version=str(candidate.get("self_strategy_version") or "")
         )
         key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
         msg=(f"🚨 CANDICE AI SIGNAL\n\n"
@@ -745,6 +748,7 @@ async def cycle_loop():
             int(target//300),s.pair,s.direction,s.strategy or "UNKNOWN",s.confidence,
             STATE["price_source"].get(s.pair,"unknown"),
             s.trend_15m or "UNKNOWN",s.structure_1m or "UNKNOWN",s.pattern or "UNKNOWN",
+            getattr(s,"self_strategy","UNKNOWN"),getattr(s,"self_strategy_version","UNKNOWN"),
             s.expiry_minutes,s.entry_candle_ts,
             datetime.fromtimestamp(ts,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
             datetime.fromtimestamp(target,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
