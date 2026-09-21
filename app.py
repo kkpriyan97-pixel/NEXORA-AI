@@ -2450,36 +2450,45 @@ async def cycle_loop():
             )
             return False
 
-        # LAST-SECOND 30S CONFIRMATION ONLY:
-        # Candice Brain + AI rank the assets first. Immediately before delivery,
-        # confirm only the latest closed 30-second candle. If it fails, the caller
-        # immediately tries the next ranked asset inside the same delivery window.
+        # LAST-SECOND CANDLE-ONLY CONFIRMATION:
+        # Candice Brain + AI rank assets first. Immediately before delivery,
+        # inspect ONLY the latest closed 30s and 2m candle trend. No indicators,
+        # volume, body-strength, or higher-timeframe gates are used here.
+        # If either final candle confirmation fails, the caller tries the next
+        # ranked asset in the same delivery window.
         final_mtf=build_multi_timeframe_context(
             p,STATE["candles"].get(p,[]),time.time(),candidate.get("direction")
         )
         frames=final_mtf.get("frames") or {}
         thirty=frames.get("30s") or {}
+        two=(frames.get("2m") or {}).get("candle_confirmation") or {}
         expected=str(candidate.get("direction") or "").upper()
         final_mtf_diag={
             "30s":thirty.get("direction","NEUTRAL"),
             "30s_bars":thirty.get("bars",0),
+            "2m":two.get("candle_direction",two.get("direction","NEUTRAL")),
+            "2m_bars":two.get("bars",0),
         }
 
         confirm_reason=None
         if thirty.get("status")!="READY":
-            confirm_reason="30s_confirmation_insufficient"
+            confirm_reason="30s_candle_not_ready"
         elif thirty.get("direction")!=expected:
             confirm_reason="30s_candle_trend_conflict"
+        elif two.get("status")!="READY":
+            confirm_reason="2m_candle_not_ready"
+        elif two.get("candle_direction",two.get("direction","NEUTRAL"))!=expected:
+            confirm_reason="2m_candle_trend_conflict"
 
         if confirm_reason:
             log.info(
-                "FINAL_30S_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
+                "FINAL_30S_2M_CANDLE_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
                 cycle_id,p,expected,confirm_reason,final_mtf_diag
             )
             return False
 
         log.info(
-            "FINAL_30S_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
+            "FINAL_30S_2M_CANDLE_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
             cycle_id,p,expected,final_mtf_diag
         )
 
