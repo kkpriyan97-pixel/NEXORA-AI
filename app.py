@@ -2563,7 +2563,10 @@ async def cycle_loop():
             confirm_reason="2m_candle_trend_conflict"
         elif not two.get("candle_ok"):
             confirm_reason="2m_body_strength_failed"
-        elif not two.get("volume_ok"):
+        elif two.get("volume_available") and not two.get("volume_ok"):
+            # Broker 2m candle payloads can legitimately omit volume. In that
+            # case volume cannot be used as a hard reject; preserve the volume
+            # rule whenever real volume data is actually available.
             confirm_reason="2m_volume_confirmation_failed"
         elif one.get("status")!="READY":
             confirm_reason="1m_candle_not_ready"
