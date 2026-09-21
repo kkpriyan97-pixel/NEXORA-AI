@@ -998,7 +998,6 @@ SCREENSHOT_OPEN_PAIRS={
 def asset_key(value):
     text=_norm_text(value)
     return " ".join(text.replace("/"," ").replace("_"," ").split())
-
 def screenshot_asset_allowed(x):
     if not isinstance(x,dict): return False
     p=pair_name(x)
@@ -1710,6 +1709,59 @@ def _frame_bias(bars):
         direction="NEUTRAL"
     return {"status":"READY","direction":direction,"bars":len(bars),"strength":round(strength,3)}
 
+def _latest_closed_candle_direction(bars):
+    """Return direction from the latest completed candle only; no indicators or volume."""
+    bars=list(bars or [])
+    if not bars:
+        return {"status":"INSUFFICIENT","direction":"NEUTRAL","bars":0}
+    last=bars[-1]
+    try:
+        open_price=float(last.get("open",last.get("o")))
+        close_price=float(last.get("close",last.get("c")))
+    except (TypeError,ValueError):
+        return {"status":"INSUFFICIENT","direction":"NEUTRAL","bars":len(bars)}
+    if close_price>open_price:
+        direction="UP"
+    elif close_price<open_price:
+        direction="DOWN"
+    else:
+        direction="NEUTRAL"
+    return {
+        "status":"READY",
+        "direction":direction,
+        "bars":len(bars),
+        "open":open_price,
+        "close":close_price,
+        "time":_candle_epoch(last),
+    }
+
+def _latest_closed_30s_candle(pair,reference_ts=None):
+    """Build the latest completed 30s candle from real received ticks only."""
+    reference=time.time() if reference_ts is None else float(reference_ts)
+    items=list(TICK_HISTORY.get(pair,()))
+    if not items:
+        return {"status":"INSUFFICIENT","direction":"NEUTRAL","bars":0}
+    groups={}
+    for received,price in items:
+        if received>=reference:
+            continue
+        bucket=int(received//30)*30
+        if bucket+30>reference:
+            continue
+        groups.setdefault(bucket,[]).append(float(price))
+    candles=[]
+    for bucket in sorted(groups):
+        prices=groups[bucket]
+        if prices:
+            candles.append({
+                "time":bucket,
+                "open":prices[0],
+                "high":max(prices),
+                "low":min(prices),
+                "close":prices[-1],
+            })
+    return _latest_closed_candle_direction(candles)
+
 def _candle_confirmation_2m(bars,expected):
     """Candle-first 2m confirmation; indicators are intentionally not used."""
     expected=str(expected or "").upper()
@@ -1885,7 +1937,7 @@ def live_price_age(pair,reference_ts=None):
     try:return max(0.0,ref-received)
     except Exception:return None
 
-async def final_candidate(use_cached_only=False,require_live_price=False,deep_analysis=False,seed_candidates=None):
+async def final_candidate(use_cached_only=False,require_live_price=False,deep_analysis=False,seed_candidates=None,return_ranked=False):
     BRAIN.prune_expired_cooldowns()
 
     # Hard account boundary: Brain may select/analyze an asset only after the
@@ -1997,8 +2049,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     # order until one has a genuinely fresh authenticated tick.
     top=raw[:(8 if deep_analysis else 5)]
     if require_live_price:
-        log.info(
-            "LIVE_PRICE_SELECTION_MODE source=authenticated_event1 candidates=%d deep=%s",
+        log.info(            "LIVE_PRICE_SELECTION_MODE source=authenticated_event1 candidates=%d deep=%s",
             len(top),deep_analysis)
     now=time.time()
     reviewed=[]
@@ -2190,6 +2241,11 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         elif r:
             reviewed.append(r)
     ranked=rank_signal_candidates(reviewed)
+    if return_ranked:
+        # Pass 5 may provide several Brain+AI-qualified candidates. The delivery
+        # stage will check the final candle/quote on each candidate in rank order.
+        # This is the key fallback that prevents one asset from suppressing a cycle.
+        return ranked[:8]
     if ranked and require_live_price:
         # The broker only keeps a small number of event-1 tick slots active.
         # Refresh candidates sequentially after Brain/AI qualification so a
@@ -2435,9 +2491,30 @@ async def cycle_loop():
 
         p=candidate["pair"]
         now=time.time()
+
+        # Keep the final quote fresh without turning a transient rotating-tick
+        # miss into a dead cycle. Pass 5 pre-pins the top candidates; this quick
+        # refresh is only a safety net for the exact asset being attempted.
         if not has_fresh_live_price(p,now,LIVE_TICK_MAX_AGE):
+            try:
+                await pin_account_tick_pairs(
+                    [p],
+                    ttl=max(8.0,target-time.time()+6.0)
+                )
+            except Exception as e:
+                log.warning(
+                    "FINAL_LIVE_QUOTE_PIN_FAILED cycle=%s pair=%s type=%s message=%s",
+                    cycle_id,p,type(e).__name__,str(e)[:120]
+                )
+            refresh_deadline=min(target-0.25,time.time()+1.0)
+            while time.time()<refresh_deadline and not has_fresh_live_price(
+                p,time.time(),LIVE_TICK_MAX_AGE
+            ):
+                await asyncio.sleep(0.05)
+
+        if not has_fresh_live_price(p,time.time(),LIVE_TICK_MAX_AGE):
             log.info(
-                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=quote_not_fresh",
+                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=quote_not_fresh next_asset=TRUE",
                 cycle_id,p
             )
             return False
@@ -2445,28 +2522,26 @@ async def cycle_loop():
         entry=STATE["prices"].get(p,(None,None))[0]
         if entry is None:
             log.info(
-                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=price_missing",
+                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=price_missing next_asset=TRUE",
                 cycle_id,p
             )
             return False
 
         # LAST-SECOND CANDLE-ONLY CONFIRMATION:
-        # Candice Brain + AI rank assets first. Immediately before delivery,
-        # inspect ONLY the latest closed 30s and 2m candle trend. No indicators,
-        # volume, body-strength, or higher-timeframe gates are used here.
-        # If either final candle confirmation fails, the caller tries the next
-        # ranked asset in the same delivery window.
-        final_mtf=build_multi_timeframe_context(
-            p,STATE["candles"].get(p,[]),time.time(),candidate.get("direction")
-        )
-        frames=final_mtf.get("frames") or {}
-        thirty=frames.get("30s") or {}
-        two=(frames.get("2m") or {}).get("candle_confirmation") or {}
+        # Brain + AI rank assets first. Immediately before delivery, inspect
+        # ONLY the latest completed 30s candle and latest completed 2m candle.
+        # No indicators, volume, body-strength, 1m gate, or higher-timeframe
+        # gate participates in this final decision.
+        reference=time.time()
+        thirty=_latest_closed_30s_candle(p,reference)
+        closed_1m=_closed_candles(STATE["candles"].get(p,[]),reference)
+        bars2=_aggregate_closed_minutes(closed_1m,2,reference)
+        two=_latest_closed_candle_direction(bars2)
         expected=str(candidate.get("direction") or "").upper()
         final_mtf_diag={
             "30s":thirty.get("direction","NEUTRAL"),
             "30s_bars":thirty.get("bars",0),
-            "2m":two.get("candle_direction",two.get("direction","NEUTRAL")),
+            "2m":two.get("direction","NEUTRAL"),
             "2m_bars":two.get("bars",0),
         }
 
@@ -2477,7 +2552,7 @@ async def cycle_loop():
             confirm_reason="30s_candle_trend_conflict"
         elif two.get("status")!="READY":
             confirm_reason="2m_candle_not_ready"
-        elif two.get("candle_direction",two.get("direction","NEUTRAL"))!=expected:
+        elif two.get("direction")!=expected:
             confirm_reason="2m_candle_trend_conflict"
 
         if confirm_reason:
@@ -2784,27 +2859,86 @@ async def cycle_loop():
                 candidate=await asyncio.wait_for(
                     final_candidate(
                         # Scan passes select from the full authenticated account/candle
-                        # universe. Event-1 tick freshness is enforced only at the
-                        # final delivery boundary after the candidate is pinned.
-                        # Pass 5 is the final/deep qualification pass. Make its
-                        # selected candidate carry a fresh authenticated live quote
-                        # before it is pinned so the exact T-30s delivery guard is
-                        # not forced to reject a stale candidate at the boundary.
-                        require_live_price=(pass_no==5),
-                        deep_analysis=(pass_no==5)
+                        # universe. Live quote freshness is a delivery concern; it
+                        # must not collapse pass 5 to a single asset because the
+                        # broker rotates a small number of tick slots.
+                        require_live_price=False,
+                        deep_analysis=(pass_no==5),
+                        return_ranked=(pass_no==5)
                     ),
                     timeout=max(1.0,remaining-0.50)
                 )
-                if candidate is None:
+                if isinstance(candidate,list):
+                    selected=candidate[:8]
+                    if not selected:
+                        log.info(
+                            "SCAN_COMPLETE cycle=%s scan=SCAN_%s candidate=none analyzed=%d",
+                            cycle_id,pass_no,len(STATE["analyses"])
+                        )
+                    else:
+                        for raw_candidate in selected:
+                            if not isinstance(raw_candidate,dict) or not raw_candidate.get("pair"):
+                                continue
+                            item=raw_candidate.copy()
+                            item["expiry_minutes"]=1
+                            item["qualified_pass"]=pass_no
+                            key=(
+                                item.get("pair"),
+                                str(item.get("entry_candle_ts")),
+                                str(item.get("direction") or "").upper()
+                            )
+                            candidate_pool[key]=item
+
+                        if pass_no==5:
+                            # Pre-pin the strongest two final candidates so a
+                            # final candle rejection can immediately fall through
+                            # to the next asset without waiting for tick rotation.
+                            final_items=sorted(
+                                [x for x in candidate_pool.values()
+                                 if int(x.get("qualified_pass") or 0)==5],
+                                key=lambda x:(
+                                    int(x.get("confidence") or 0),
+                                    float(x.get("strategy_margin") or 0),
+                                    float(x.get("direction_agreement") or 0),
+                                    float(x.get("market_quality") or 0)
+                                ),
+                                reverse=True
+                            )[:ACCOUNT_TICK_MAX_SLOTS]
+                            if final_items:
+                                pin_ttl=max(15.0,target-time.time()+8.0)
+                                try:
+                                    await pin_account_tick_pairs(
+                                        [x.get("pair") for x in final_items],
+                                        ttl=pin_ttl
+                                    )
+                                    log.info(
+                                        "FINAL_CANDIDATE_TICKS_PINNED cycle=%s pairs=%s pass=%s ttl=%.1f target_utc=%s",
+                                        cycle_id,[x.get("pair") for x in final_items],
+                                        pass_no,pin_ttl,
+                                        datetime.fromtimestamp(
+                                            target,tz=timezone.utc
+                                        ).strftime("%H:%M:%S")
+                                    )
+                                except Exception as e:
+                                    log.warning(
+                                        "FINAL_CANDIDATE_TICKS_PIN_FAILED cycle=%s pairs=%s pass=%s type=%s message=%s",
+                                        cycle_id,[x.get("pair") for x in final_items],
+                                        pass_no,type(e).__name__,str(e)[:120]
+                                    )
+                        for item in selected:
+                            log.info(
+                                "SCAN_CANDIDATE_SELECTED cycle=%s scan=SCAN_%s pass=%s pair=%s "
+                                "confidence=%s strategy=%s expiry=%s pool=%s deep=%s",
+                                cycle_id,pass_no,pass_no,item.get("pair"),
+                                item.get("confidence"),1,len(candidate_pool),pass_no==5
+                            )
+                elif candidate is None:
                     log.info(
                         "SCAN_COMPLETE cycle=%s scan=SCAN_%s candidate=none analyzed=%d",
                         cycle_id,pass_no,len(STATE["analyses"])
                     )
                 else:
                     candidate=candidate.copy()
-                    # Every delivered signal in this DEMO 3-minute mode has a
-                    # fixed 1-minute expiry. This does not change the Candice
-                    # Brain direction/strategy/evidence or the AI verification.
                     candidate["expiry_minutes"]=1
                     candidate["qualified_pass"]=pass_no
                     key=(
@@ -2813,36 +2947,6 @@ async def cycle_loop():
                         str(candidate.get("direction") or "").upper()
                     )
                     candidate_pool[key]=candidate
-
-                    # Only the final/deep pass is allowed to pin the broker's
-                    # scarce event-1 live-tick slots. Earlier passes only enrich the
-                    # candidate pool; pinning them would freeze account-wide rotation
-                    # for their long TTL and starve other account assets from fresh quotes.
-                    if pass_no==5:
-                        pin_ttl=max(15.0,target-time.time()+8.0)
-                        try:
-                            await pin_account_tick_pairs(
-                                [candidate.get("pair")],ttl=pin_ttl
-                            )
-                            log.info(
-                                "FINAL_CANDIDATE_TICK_PINNED cycle=%s pair=%s pass=%s ttl=%.1f target_utc=%s",
-                                cycle_id,candidate.get("pair"),pass_no,pin_ttl,
-                                datetime.fromtimestamp(
-                                    target,tz=timezone.utc
-                                ).strftime("%H:%M:%S")
-                            )
-                        except Exception as e:
-                            log.warning(
-                                "FINAL_CANDIDATE_TICK_PIN_FAILED cycle=%s pair=%s pass=%s type=%s message=%s",
-                                cycle_id,candidate.get("pair"),pass_no,
-                                type(e).__name__,str(e)[:120]
-                            )
-                    else:
-                        log.info(
-                            "CANDIDATE_TICK_NOT_PINNED cycle=%s pair=%s pass=%s reason=early_pass_rotation_preserved",
-                            cycle_id,candidate.get("pair"),pass_no
-                        )
-
                     log.info(
                         "SCAN_CANDIDATE_SELECTED cycle=%s scan=SCAN_%s pass=%s pair=%s "
                         "confidence=%s strategy=%s expiry=%s pool=%s deep=%s",
@@ -2997,8 +3101,7 @@ async def cycle_loop():
                 log.info(
                     "FIVE_SCAN_NO_VALID_SIGNAL cycle=%s candidates=%s "
                     "signal_utc=%s now_utc=%s",
-                    cycle_id,len(ranked_pool),
-                    time.strftime("%H:%M:%S",time.gmtime(signal_at)),
+                    cycle_id,len(ranked_pool),                    time.strftime("%H:%M:%S",time.gmtime(signal_at)),
                     time.strftime("%H:%M:%S",time.gmtime(time.time()))
                 )
             else:
