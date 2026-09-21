@@ -584,7 +584,7 @@ def rank_signal_candidates(candidates):
     q=[x for x in candidates if int(x.get("confidence") or 0)>=MIN_CONFIDENCE
        and str(x.get("direction","")).upper() in {"UP","DOWN"}
        and not bool(x.get("ai_learning_blocked"))]
-    return sorted(q,key=lambda x:
+    return sorted(q,key=lambda x:(
         int(x.get("confidence") or 0),
         float(x.get("strategy_margin") or 0),
         float(x.get("direction_agreement") or 0),
