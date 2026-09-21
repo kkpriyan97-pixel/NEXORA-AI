@@ -61,6 +61,9 @@ async def save_persistent_learning():
         log.warning("LEARNING_STATE_SAVE_FAILED type=%s message=%s",type(e).__name__,str(e)[:180])
 BRAIN=BrainState()
 UAE_TZ=ZoneInfo("Asia/Dubai")
+# Cycle-state persistence is recovery metadata only. It must never be allowed
+# to block the market/signal scheduler when the database stalls.
+CYCLE_STATE_IO_TIMEOUT=2.5
 AI_REVIEW_QUEUE_POLL_SECONDS=2.0
 AI_REVIEW_QUEUE_STALE_SECONDS=600.0
 AI_REVIEW_QUEUE_RETRY_DELAYS=(5,15,30,60,120,300)
@@ -160,8 +163,17 @@ async def save_cycle_state(
                         str(reason)[:500],SCHEDULER_OWNER
                     ))
                 db.commit()
-        await asyncio.to_thread(put)
+        await asyncio.wait_for(
+            asyncio.to_thread(put),
+            timeout=CYCLE_STATE_IO_TIMEOUT,
+        )
         return True
+    except asyncio.TimeoutError:
+        log.warning(
+            "CYCLE_STATE_SAVE_FAILED cycle=%s type=TimeoutError message=database_write_timeout timeout=%.1fs",
+            cycle_id,CYCLE_STATE_IO_TIMEOUT
+        )
+        return False
     except Exception as e:
         log.warning("CYCLE_STATE_SAVE_FAILED cycle=%s type=%s message=%s",
                     cycle_id,type(e).__name__,str(e)[:160])
@@ -186,7 +198,10 @@ async def load_recoverable_cycle_state(now=None):
                         LIMIT 1
                     """,(now,))
                     return cur.fetchone()
-        row=await asyncio.to_thread(read)
+        row=await asyncio.wait_for(
+            asyncio.to_thread(read),
+            timeout=CYCLE_STATE_IO_TIMEOUT,
+        )
         if not row:
             return None
         cycle_id,target_epoch,signal_epoch,signal_lead,completed_pass,pool=row
@@ -209,6 +224,12 @@ async def load_recoverable_cycle_state(now=None):
             "completed_pass":int(completed_pass or 0),
             "candidate_pool":pool,
         }
+    except asyncio.TimeoutError:
+        log.warning(
+            "CYCLE_STATE_RECOVERY_READ_FAILED type=TimeoutError message=database_read_timeout timeout=%.1fs",
+            CYCLE_STATE_IO_TIMEOUT
+        )
+        return None
     except Exception as e:
         log.warning(
             "CYCLE_STATE_RECOVERY_READ_FAILED type=%s message=%s",
