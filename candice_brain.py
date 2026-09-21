@@ -323,19 +323,38 @@ def analyze_asset(asset, candles, price=None):
             active = breakout_up if direction == "UP" else breakout_down
             distance = breakout_distance_up if direction == "UP" else breakout_distance_down
             prior_inside = prev <= resistance if direction == "UP" else prev >= support
-            dc_confirm = (direction == "UP" and (dc_breakout_up or dc["expansion"])) or (direction == "DOWN" and (dc_breakout_down or dc["expansion"]))
+            # Strict breakout confirmation:
+            # 1) real price displacement must be meaningful (>= 0.15 ATR)
+            # 2) the breakout candle must have a strong body (>= 0.55)
+            # 3) momentum/efficiency must show continuation potential
+            # 4) either the 30-period Donchian itself broke in the same direction,
+            #    or the 20-bar level was cleared decisively.
+            dc_confirm = (
+                (direction == "UP" and dc_breakout_up) or
+                (direction == "DOWN" and dc_breakout_down)
+            )
+            level_confirm = bool(distance >= 0.15 and body_ratio >= 0.55)
+            continuation_confirm = bool(momentum_norm >= 0.30 and _efficiency(v, 8) >= 0.35)
             stoch_confirm = (direction == "UP" and stoch_bull) or (direction == "DOWN" and stoch_bear)
-            if not active or distance < 0.08 or body_ratio < 0.45 or not prior_inside or not dc_confirm:
+            if (
+                not active
+                or distance < 0.15
+                or body_ratio < 0.55
+                or not prior_inside
+                or not (dc_confirm or level_confirm)
+                or not continuation_confirm
+            ):
                 return -1.0
             s = 62.0
-            s += 10 if distance >= 0.15 else 4
-            s += 8 if body_ratio >= 0.65 else 3
+            s += 10 if distance >= 0.20 else 6
+            s += 8 if body_ratio >= 0.65 else 4
             s += 7 if trend_ok else 0
             s += 6 if slope_ok else 0
             s += 5 if aligned_recent(direction) >= 2 else 0
             s += 4 if structure_ok else 0
             s += 4 if stoch_confirm else 0
             s += 4 if dc["expansion"] else 0
+            s += 4 if _efficiency(v, 8) >= 0.50 else 0
             return min(96.0, s)
 
         if strategy == "PULLBACK":
@@ -619,6 +638,12 @@ def analyze_asset(asset, candles, price=None):
         "atr": aa,
         "momentum": momentum,
         "momentum_norm": momentum_norm,
+        "breakout_distance_up": round(breakout_distance_up, 4),
+        "breakout_distance_down": round(breakout_distance_down, 4),
+        "breakout_confirmed": bool(
+            (expected == "UP" and breakout_up and breakout_distance_up >= 0.15)
+            or (expected == "DOWN" and breakout_down and breakout_distance_down >= 0.15)
+        ),
         "ema_gap_norm": ema_gap_norm,
         "ema_slope_norm": ema_slope_norm,
         "body_ratio": body_ratio,
@@ -661,6 +686,11 @@ def analyze_asset(asset, candles, price=None):
             "efficiency": _efficiency(v, 8),
             "breakout_up": breakout_up,
             "breakout_down": breakout_down,
+            "breakout_distance": breakout_distance_up if expected == "UP" else breakout_distance_down,
+            "breakout_confirmed": bool(
+                (expected == "UP" and breakout_up and breakout_distance_up >= 0.15)
+                or (expected == "DOWN" and breakout_down and breakout_distance_down >= 0.15)
+            ),
             "near_support": near_support,
             "near_resistance": near_resistance,
             "pattern": pattern,
