@@ -2151,7 +2151,7 @@ async def cycle_loop():
             STATE["price_source"].get(s.pair,"unknown"),
             s.trend_15m or "UNKNOWN",s.structure_1m or "UNKNOWN",s.pattern or "UNKNOWN",
             getattr(s,"self_strategy","UNKNOWN"),getattr(s,"self_strategy_version","UNKNOWN"),
-            s.expiry_minutes,getattr(candidate,"qualified_pass",None) if isinstance(candidate,object) else candidate.get("qualified_pass"),
+            s.expiry_minutes,candidate.get("qualified_pass"),
             datetime.fromtimestamp(ts,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
             datetime.fromtimestamp(target,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
             target-time.time()
