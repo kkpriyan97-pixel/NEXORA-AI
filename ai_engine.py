@@ -22,6 +22,7 @@ class MarketSnapshot:
     price: float | None
     timestamp: Any
     candles: list[dict[str, Any]]
+    technical_context: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,7 @@ def snapshot_from_asset(
     candles: list[dict[str, Any]],
     price: float | None,
     timestamp: Any,
+    technical_context: dict[str, Any] | None = None,
 ) -> MarketSnapshot:
     return MarketSnapshot(
         display_name=str(asset.get("display_name") or asset.get("title") or "").strip(),
@@ -48,6 +50,7 @@ def snapshot_from_asset(
         price=price,
         timestamp=timestamp,
         candles=candles or [],
+        technical_context=dict(technical_context or {}),
     )
 
 
@@ -83,6 +86,7 @@ def build_ai_request(snapshot: MarketSnapshot) -> dict[str, Any]:
                 for c in snapshot.candles[-20:]
                 if isinstance(c, dict)
             ],
+            "technical_context": dict(snapshot.technical_context or {}),
         },
         "required_output": {
             "direction": "UP or DOWN",
