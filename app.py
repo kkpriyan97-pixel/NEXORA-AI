@@ -2475,6 +2475,26 @@ async def cycle_loop():
         # Immediately iterate to the next 10-minute target. Because the first
         # scan of the next target is 10m30s before that target, it becomes
         # runnable immediately after the current 30s/40s signal boundary.
+
+async def cycle_loop_supervisor():
+    """Keep the scheduler alive if cycle_loop exits unexpectedly."""
+    while True:
+        task = asyncio.create_task(cycle_loop())
+        try:
+            await task
+            log.warning(
+                "CYCLE_LOOP_SUPERVISOR_RESTART reason=cycle_loop_returned"
+            )
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        except Exception as e:
+            log.exception(
+                "CYCLE_LOOP_SUPERVISOR_RESTART type=%s message=%s",
+                type(e).__name__, str(e)[:180]
+            )
+        await asyncio.sleep(2.0)
+
 async def audit_outbound_network():
     """
     Record the actual public egress identity used by the Render process.
@@ -2816,5 +2836,5 @@ async def main():
     await ensure_access_table()
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
-    await asyncio.gather(market_worker(),account_tick_subscription_worker(),account_live_feed_worker(),cycle_loop(),ai_review_worker(),server.serve_forever())
+    await asyncio.gather(market_worker(),account_tick_subscription_worker(),account_live_feed_worker(),cycle_loop_supervisor(),ai_review_worker(),server.serve_forever())
 if __name__=="__main__":asyncio.run(main())
