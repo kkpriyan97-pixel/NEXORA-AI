@@ -11,5 +11,7 @@ jobs:
     steps:
       - name: Ping NEXORA health endpoint
         run: |
-          curl --fail --silent --show-error --max-time 20 \
+          curl --fail --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 3 \
+            --connect-timeout 10 --max-time 60 \
             https://priyanithan-zflv.onrender.com/health
