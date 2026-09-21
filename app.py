@@ -1529,6 +1529,31 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
             "ai_provider":"CANDICE_LOCAL_BRAIN_PRIMARY"
         })
 
+        # Final lightweight setup-strength guard. This is intentionally scoped
+        # to BREAKOUT candidates only and runs before the external verifier,
+        # so it cannot consume additional cycle time. It vetoes only weak
+        # breakouts; other strategies and the 30-second deadline are untouched.
+        if (
+            str(x.get("strategy") or "").upper()=="BREAKOUT"
+            and (
+                not bool((x.get("evidence") or {}).get("breakout_confirmed"))
+                or float(x.get("breakout_distance_up") if str(x.get("direction") or "").upper()=="UP"
+                         else x.get("breakout_distance_down") or 0.0) < 0.15
+                or float(x.get("body_ratio") or 0.0) < 0.55
+                or float(x.get("momentum_norm") or 0.0) < 0.30
+                or float(x.get("efficiency") or 0.0) < 0.35
+            )
+        ):
+            log.info(
+                "BREAKOUT_STRENGTH_GATE_REJECTED pair=%s direction=%s distance=%.3f body=%.2f momentum=%.2f efficiency=%.2f",
+                x.get("pair"),x.get("direction"),
+                float(x.get("breakout_distance_up") if str(x.get("direction") or "").upper()=="UP"
+                      else x.get("breakout_distance_down") or 0.0),
+                float(x.get("body_ratio") or 0.0),float(x.get("momentum_norm") or 0.0),
+                float(x.get("efficiency") or 0.0)
+            )
+            return None
+
         if local_confidence>=90:
             if isinstance(d,dict) and str(d.get("direction") or "").upper() in {"UP","DOWN"}:
                 ai_direction=str(d.get("direction") or "").upper()
