@@ -2611,6 +2611,30 @@ async def cycle_loop():
         elif higher_agreement<0.60 or higher_opp>2:
             confirm_reason="higher_timeframe_conflict"
 
+        confidence=int(candidate.get("confidence") or 0)
+
+        # The technical Brain is already the primary qualification layer. Some
+        # OTC feeds do not expose reliable 2m volume/body statistics, so a
+        # borderline body-strength failure must not create a permanent
+        # "no-signal" deadlock when the Brain is very strong and the closed 1m/2m
+        # directions plus higher-timeframe context still agree.
+        if (
+            confirm_reason=="2m_body_strength_failed"
+            and not two.get("volume_available")
+            and two.get("candle_direction")==expected
+            and one.get("direction")==expected
+            and higher_agreement>=0.60
+            and higher_opp<=2
+            and confidence>=95
+        ):
+            log.info(
+                "FINAL_STRICT_GATE_RELAXED cycle=%s pair=%s direction=%s reason=%s "
+                "brain_confidence=%s higher_agreement=%.3f body_ratio=%.3f volume_available=%s",
+                cycle_id,p,expected,confirm_reason,confidence,higher_agreement,
+                float(two.get("body_ratio") or 0),bool(two.get("volume_available"))
+            )
+            confirm_reason=None
+
         if confirm_reason:
             log.info(
                 "FINAL_2M_VOLUME_BODY_1M_HIGHER_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
@@ -2622,8 +2646,6 @@ async def cycle_loop():
             "FINAL_2M_VOLUME_BODY_1M_HIGHER_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
             cycle_id,p,expected,final_mtf_diag
         )
-
-        confidence=int(candidate.get("confidence") or 0)
         if confidence < 90:
             log.info(
                 "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=confidence_%s",
