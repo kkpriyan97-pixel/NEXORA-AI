@@ -427,20 +427,6 @@ class NextCandleModel:
         for k,v in f.items():self.w[k]=max(-8,min(8,self.w.get(k,0)+lr*err*v))
         self.save_weights()
 
-def extract_search_urls(raw):
-    found=[]
-    patterns=(
-        r"""<a[^>]+class=['"][^'"]*result__a[^'"]*['"][^>]+href=['"]([^'"]+)""",
-        r"""<li[^>]+class=['"][^'"]*b_algo[^'"]*.*?<a[^>]+href=['"]([^'"]+)""",
-        r"""<a[^>]+href=['"](https?://[^'"]+)['"][^>]*>""",
-    )
-    for pat in patterns:
-        for u in re.findall(pat,raw,re.I|re.S):
-            v=clean_url(unwrap(u))
-            if v and domain(v) not in SEARCH_HOSTS and v not in found:
-                found.append(v)
-    return found
-
 class M1WorldLab:
     def __init__(self):
         self.db=DB();self.model=NextCandleModel(self.db);self.queue=asyncio.Queue()
@@ -529,17 +515,23 @@ class M1WorldLab:
                    "https://www.bing.com/search?q="+quote_plus(q))
         for ep in endpoints:
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(8,connect=3),headers={"User-Agent":USER_AGENT},follow_redirects=True) as h:r=await h.get(ep)
+                async with httpx.AsyncClient(timeout=httpx.Timeout(8,connect=3),headers={"User-Agent":USER_AGENT},follow_redirects=True) as h:
+                    r=await h.get(ep)
                 if r.status_code>=400:continue
-                p=Parser();p.feed(r.text);found=0
-                urls=extract_search_urls(r.text)
-                urls.extend(clean_url(unwrap(href)) for href,label in p.links)
-                for v in urls:
+                p=Parser()
+                p.feed(r.text)
+                found=0
+                for href,label in p.links:
+                    v=clean_url(unwrap(href))
                     if not v or domain(v) in SEARCH_HOSTS:continue
-                    self.enqueue(v,lang,"search");found+=1
+                    self.enqueue(v,lang,"search")
+                    found+=1
                 if found:return found
-            except Exception:self.metrics["errors"]+=1
+            except Exception as exc:
+                self.metrics["errors"]+=1
+                log.debug("M1_SEARCH_ERROR query=%s error=%s",q,exc)
         return 0
+
     async def discover(self):
         items=[]
         langs=list(LANGUAGE_QUERIES)
