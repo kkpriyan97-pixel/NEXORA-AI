@@ -12,6 +12,7 @@ from brain_rules import ActiveSignal,BrainState,rank_signal_candidates
 from candice_brain import analyze_asset
 from ai_engine import snapshot_from_asset
 from ai_router import analyze_with_fallback,review_result_with_fallback
+from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot, world_learning_loop
 
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -1604,6 +1605,13 @@ async def refresh_candles(force=False):
             if a.get("signal_eligible",True):
                 STATE["analyses"].pop(p,None)
             continue
+        # Feed only completed 1-minute candles into the isolated forward-learning lab.
+        # The lab predicts candle t+1 using information available at candle t close;
+        # it never changes this live technical analysis path.
+        try:
+            record_market_snapshot(p,closed,reference)
+        except Exception as e:
+            log.debug("M1_WORLD_SNAPSHOT_FAILED pair=%s type=%s message=%s",p,type(e).__name__,str(e)[:120])
         # Count every successfully analyzed account asset, even when its
         # technical setup does not qualify as a signal. The latter remains
         # represented separately by STATE["analyses"] for candidate ranking.
@@ -3480,7 +3488,7 @@ async def health(reader,writer):
             log.info("PING_REQUEST status=200")
             return
         if path.startswith("/health"):
-            body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"account_id":STATE.get("account_id"),"account_group":STATE.get("account_group"),"feed_source":STATE.get("feed_source"),"network":STATE.get("network",{})}).encode()
+            body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"account_id":STATE.get("account_id"),"account_group":STATE.get("account_group"),"feed_source":STATE.get("feed_source"),"network":STATE.get("network",{}),"m1_world_learning":m1_learning_status()}).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "+str(len(body_out)).encode()+b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
             await writer.drain()
             log.info("HEALTH_REQUEST status=200 path=%s",path)
@@ -3549,5 +3557,5 @@ async def main():
     await ensure_access_table()
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
-    await asyncio.gather(market_worker(),account_tick_subscription_worker(),account_live_feed_worker(),cycle_loop_supervisor(),ai_review_worker(),server.serve_forever())
+    await asyncio.gather(market_worker(),account_tick_subscription_worker(),account_live_feed_worker(),cycle_loop_supervisor(),ai_review_worker(),world_learning_loop(),server.serve_forever())
 if __name__=="__main__":asyncio.run(main())
