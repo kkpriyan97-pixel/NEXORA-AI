@@ -2224,7 +2224,7 @@ async def cycle_loop():
     # Rolling 10-minute signal scheduler.
     # For each target:
     #   - target = exact next 10-minute boundary (e.g. 12:10:00)
-    #   - Telegram signal = target minus the current 30s/40s lead
+    #   - Telegram signal = target minus an exact 30s lead
     #   - five Brain passes are performed before that signal
     #   - pass 5 is the deep/final qualification pass
     #   - 5s + every complete 1m..15m frame are checked in each pass
@@ -2232,9 +2232,9 @@ async def cycle_loop():
     #     result watching and History-AI remain background tasks and never block it.
     # Ten-minute signal cycle with five pre-signal analysis passes.
     # For target T: passes at T-10:30, T-8:30, T-6:30, T-4:30, T-2:30;
-    # final signal remains at T-0:30.
+    # final signal remains at T-0:30 on every cycle.
     SIGNAL_INTERVAL=600.0
-    SIGNAL_LEADS=(30.0,40.0)
+    SIGNAL_LEADS=(30.0,30.0)
     SCAN_OFFSETS=(630.0,510.0,390.0,270.0,150.0)
 
     async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
@@ -2582,7 +2582,11 @@ async def cycle_loop():
                         # Scan passes select from the full authenticated account/candle
                         # universe. Event-1 tick freshness is enforced only at the
                         # final delivery boundary after the candidate is pinned.
-                        require_live_price=False,
+                        # Pass 5 is the final/deep qualification pass. Make its
+                        # selected candidate carry a fresh authenticated live quote
+                        # before it is pinned so the exact T-30s delivery guard is
+                        # not forced to reject a stale candidate at the boundary.
+                        require_live_price=(pass_no==5),
                         deep_analysis=(pass_no==5)
                     ),
                     timeout=max(1.0,remaining-0.50)
