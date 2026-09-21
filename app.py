@@ -2210,11 +2210,58 @@ async def cycle_loop():
             "30S" if signal_lead==30.0 else "40S"
         )
 
+        catchup_mode=False
+        catchup_next_at=None
+
         for pass_no,offset in enumerate(SCAN_OFFSETS,1):
             scan_at=target-offset
-            wait_for=max(0.0,scan_at-time.time())
-            if wait_for>0:
-                await asyncio.sleep(wait_for)
+
+            if pass_no==1:
+                # On a Render restart, the ideal first scan may already be in
+                # the past. Do not burn all five passes against an empty account
+                # state. Wait for the authenticated demo feed, then run the
+                # missed passes in a compressed but still separated window.
+                catchup_mode=scan_at<=time.time()
+                if catchup_mode:
+                    ready_deadline=signal_at-20.0
+                    while time.time()<ready_deadline:
+                        account_ready=bool(
+                            CLIENT
+                            and getattr(CLIENT.connection,"is_connected",False)
+                            and STATE.get("account_group")=="demo"
+                            and STATE.get("account_id")
+                            and STATE.get("feed_source") in {
+                                "authenticated_websocket:event_182",
+                                "authenticated_websocket:event_183",
+                            }
+                            and len(STATE.get("assets") or [])>0
+                        )
+                        if account_ready:
+                            break
+                        await asyncio.sleep(1.0)
+                    account_ready=bool(
+                        CLIENT
+                        and getattr(CLIENT.connection,"is_connected",False)
+                        and STATE.get("account_group")=="demo"
+                        and STATE.get("account_id")
+                        and STATE.get("feed_source") in {
+                            "authenticated_websocket:event_182",
+                            "authenticated_websocket:event_183",
+                        }
+                        and len(STATE.get("assets") or [])>0
+                    )
+                    if not account_ready:
+                        log.warning(
+                            "FIVE_SCAN_ACCOUNT_NOT_READY cycle=%s signal_utc=%s now_utc=%s",
+                            cycle_id,
+                            time.strftime("%H:%M:%S",time.gmtime(signal_at)),
+                            time.strftime("%H:%M:%S",time.gmtime(time.time()))
+                        )
+                        break
+            elif not catchup_mode:
+                await asyncio.sleep(max(0.0,scan_at-time.time()))
+            elif catchup_next_at is not None:
+                await asyncio.sleep(max(0.0,catchup_next_at-time.time()))
 
             remaining=max(0,signal_at-time.time())
             if remaining<=3.0:
@@ -2232,10 +2279,10 @@ async def cycle_loop():
                 )
                 log.info(
                     "ACCOUNT_FULL_SCAN cycle=%s scan=SCAN_%s pass=%s assets=%d analyzed=%d "
-                    "seconds_to_signal=%.2f deep=%s",
+                    "seconds_to_signal=%.2f deep=%s catchup=%s",
                     cycle_id,pass_no,pass_no,len(STATE["assets"]),
                     len(STATE["analyses"]),max(0,signal_at-time.time()),
-                    pass_no==5
+                    pass_no==5,catchup_mode
                 )
             except asyncio.TimeoutError:
                 log.warning(
@@ -2267,44 +2314,43 @@ async def cycle_loop():
                         "SCAN_COMPLETE cycle=%s scan=SCAN_%s candidate=none analyzed=%d",
                         cycle_id,pass_no,len(STATE["analyses"])
                     )
-                    continue
-
-                candidate=candidate.copy()
-                candidate["qualified_pass"]=pass_no
-                key=(
-                    candidate.get("pair"),
-                    str(candidate.get("entry_candle_ts")),
-                    str(candidate.get("direction") or "").upper()
-                )
-                candidate_pool[key]=candidate
-
-                pin_ttl=max(15.0,target-time.time()+8.0)
-                try:
-                    await pin_account_tick_pairs(
-                        [candidate.get("pair")],ttl=pin_ttl
+                else:
+                    candidate=candidate.copy()
+                    candidate["qualified_pass"]=pass_no
+                    key=(
+                        candidate.get("pair"),
+                        str(candidate.get("entry_candle_ts")),
+                        str(candidate.get("direction") or "").upper()
                     )
+                    candidate_pool[key]=candidate
+
+                    pin_ttl=max(15.0,target-time.time()+8.0)
+                    try:
+                        await pin_account_tick_pairs(
+                            [candidate.get("pair")],ttl=pin_ttl
+                        )
+                        log.info(
+                            "FINAL_CANDIDATE_TICK_PINNED cycle=%s pair=%s pass=%s ttl=%.1f target_utc=%s",
+                            cycle_id,candidate.get("pair"),pass_no,pin_ttl,
+                            datetime.fromtimestamp(
+                                target,tz=timezone.utc
+                            ).strftime("%H:%M:%S")
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "FINAL_CANDIDATE_TICK_PIN_FAILED cycle=%s pair=%s pass=%s type=%s message=%s",
+                            cycle_id,candidate.get("pair"),pass_no,
+                            type(e).__name__,str(e)[:120]
+                        )
+
                     log.info(
-                        "FINAL_CANDIDATE_TICK_PINNED cycle=%s pair=%s pass=%s ttl=%.1f target_utc=%s",
-                        cycle_id,candidate.get("pair"),pass_no,pin_ttl,
-                        datetime.fromtimestamp(
-                            target,tz=timezone.utc
-                        ).strftime("%H:%M:%S")
+                        "SCAN_CANDIDATE_SELECTED cycle=%s scan=SCAN_%s pass=%s pair=%s "
+                        "confidence=%s strategy=%s expiry=%s pool=%s deep=%s",
+                        cycle_id,pass_no,pass_no,candidate.get("pair"),
+                        candidate.get("confidence"),candidate.get("strategy"),
+                        candidate.get("expiry_minutes"),len(candidate_pool),
+                        pass_no==5
                     )
-                except Exception as e:
-                    log.warning(
-                        "FINAL_CANDIDATE_TICK_PIN_FAILED cycle=%s pair=%s pass=%s type=%s message=%s",
-                        cycle_id,candidate.get("pair"),pass_no,
-                        type(e).__name__,str(e)[:120]
-                    )
-
-                log.info(
-                    "SCAN_CANDIDATE_SELECTED cycle=%s scan=SCAN_%s pass=%s pair=%s "
-                    "confidence=%s strategy=%s expiry=%s pool=%s deep=%s",
-                    cycle_id,pass_no,pass_no,candidate.get("pair"),
-                    candidate.get("confidence"),candidate.get("strategy"),
-                    candidate.get("expiry_minutes"),len(candidate_pool),
-                    pass_no==5
-                )
             except asyncio.TimeoutError:
                 log.warning(
                     "SCAN_EVALUATION_TIMEOUT cycle=%s scan=SCAN_%s pass=%s remaining=%.2f",
@@ -2316,6 +2362,14 @@ async def cycle_loop():
                     cycle_id,pass_no,type(e).__name__,str(e)[:160]
                 )
 
+            # When starting after a restart, compress the remaining missed
+            # passes into the available pre-signal window. In normal operation
+            # the exact scheduled timestamps above remain unchanged.
+            if catchup_mode and pass_no<5:
+                remaining_passes=5-pass_no
+                window=max(0.0,signal_at-time.time()-5.0)
+                spacing=max(15.0,window/max(1,remaining_passes))
+                catchup_next_at=time.time()+spacing
         # The final signal can only use a candidate produced by the fifth/deep
         # pass. Earlier passes continue to inform Brain state and can keep ticks
         # warm, but they cannot directly become the final signal.
