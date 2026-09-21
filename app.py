@@ -2346,7 +2346,10 @@ async def cycle_loop():
             try:
                 candidate=await asyncio.wait_for(
                     final_candidate(
-                        require_live_price=True,
+                        # Scan passes select from the full authenticated account/candle
+                        # universe. Event-1 tick freshness is enforced only at the
+                        # final delivery boundary after the candidate is pinned.
+                        require_live_price=False,
                         deep_analysis=(pass_no==5)
                     ),
                     timeout=max(1.0,remaining-0.50)
