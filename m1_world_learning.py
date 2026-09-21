@@ -139,7 +139,8 @@ RESEARCH_SEEDS=[
 {"source":"MQL5 M1 Gold scalping article (2026)","url":"https://www.mql5.com/en/blogs/post/773047","lang":"en","method_id":"risk_and_filtering","finding":"The article emphasizes filtering, closed-bar confirmation and avoiding sideways/fakeout/repainting conditions in M1 scalping.","caution":"Author experience; hypothesis only."},
 {"source":"Spanish M1 guide (2026)","url":"https://mejorbrokerbinario.com/es/estrategias/1-minuto/","lang":"es","method_id":"volatility_regime","finding":"The source emphasizes noise and execution sensitivity on one-minute charts and the need for strict filters.","caution":"Retail educational source."},
 {"source":"GitHub Intra-Minute Execution Timing","url":"https://github.com/KeyangPan/Intra-Minute-Execution-Timing","lang":"en","method_id":"advanced_models","finding":"A walk-forward project used top-of-book features and logistic regression to optimize within-minute execution timing, separating decision timestamps from raw tick fills.","caution":"Execution-timing study, not a directional signal system."}
-]\n
+]
+
 class Parser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
