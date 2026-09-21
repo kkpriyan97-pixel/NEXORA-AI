@@ -3232,7 +3232,7 @@ async def health(reader,writer):
             # Ultra-lightweight keepalive endpoint. It must never trigger
             # market scans, AI review, Telegram delivery, or signal cycles.
             payload=b'{"status":"ok","service":"CANDICE-AI"}'
-            writer.write(b"HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: "+str(len(payload)).encode()+b"\\r\\nCache-Control: no-store\\r\\nConnection: close\\r\\n\\r\\n"+payload)
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "+str(len(payload)).encode()+b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+payload)
             await writer.drain()
             log.info("PING_REQUEST status=200")
             return
