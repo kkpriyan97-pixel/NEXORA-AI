@@ -2240,21 +2240,20 @@ async def result_watch(key):
     )
 
 async def cycle_loop():
-    # Rolling 10-minute signal scheduler.
-    # For each target:
-    #   - target = exact next 10-minute boundary (e.g. 12:10:00)
+    # Fast 3-minute signal scheduler.
+    # For each target T:
+    #   - target = exact next 3-minute boundary
     #   - Telegram signal = target minus an exact 30s lead
-    #   - five Brain passes are performed before that signal
+    #   - five Brain passes are completed inside the same 150s pre-signal window
     #   - pass 5 is the deep/final qualification pass
     #   - 5s + every complete 1m..15m frame are checked in each pass
-    #   - the next cycle starts immediately after the current signal is delivered;
-    #     result watching and History-AI remain background tasks and never block it.
-    # Ten-minute signal cycle with five pre-signal analysis passes.
-    # For target T: passes at T-10:30, T-8:30, T-6:30, T-4:30, T-2:30;
-    # final signal remains at T-0:30 on every cycle.
-    SIGNAL_INTERVAL=600.0
+    #   - result watching and History-AI remain background tasks and never block
+    #     the scheduler, so one completed signal cannot stop the next cycle.
+    # The Brain/AI strategy itself is unchanged; only the scheduling cadence
+    # and the requested expiry are changed for DEMO analysis.
+    SIGNAL_INTERVAL=180.0
     SIGNAL_LEADS=(30.0,30.0)
-    SCAN_OFFSETS=(630.0,510.0,390.0,270.0,150.0)
+    SCAN_OFFSETS=(150.0,125.0,100.0,75.0,55.0)
 
     async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
         if not candidate or not BRAIN.can_send_cycle_signal(
@@ -2735,7 +2734,7 @@ async def cycle_loop():
 
         # Do not let the current cycle's durable DB status update block
         # the 24/7 scheduler after a signal/no-signal decision. The next
-        # 10-minute target must be scheduled immediately; persistence runs
+        # 3-minute target must be scheduled immediately; persistence runs
         # independently and never owns the scan loop.
         if sent:
             asyncio.create_task(
@@ -2765,9 +2764,9 @@ async def cycle_loop():
         )
         await asyncio.sleep(0)
 
-        # Immediately iterate to the next 10-minute target. Because the first
-        # scan of the next target is 10m30s before that target, it becomes
-        # runnable immediately after the current 30s/40s signal boundary.
+        # Immediately iterate to the next 3-minute target. Because the first
+        # scan of the next target is 2m30s before that target, the next cycle
+        # is queued as soon as the current signal boundary is released.
 
 async def cycle_loop_supervisor():
     """Keep the scheduler alive if cycle_loop exits unexpectedly."""
