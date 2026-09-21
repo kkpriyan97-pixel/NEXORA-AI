@@ -67,6 +67,171 @@ AI_REVIEW_QUEUE_RETRY_DELAYS=(5,15,30,60,120,300)
 RESULT_WATCH_QUEUE_STALE_SECONDS=600.0
 ACCOUNT_TICK_CONTROL_LOCK=asyncio.Lock()
 
+# Durable scheduler state. Render can replace the running instance at any time;
+# this state keeps the active five-pass window and candidate pool recoverable.
+SCHEDULER_OWNER=secrets.token_hex(8)
+
+async def ensure_cycle_state_table():
+    if not LEARNING_DB_URL:
+        log.error("CYCLE_STATE_DB_REQUIRED")
+        return False
+    try:
+        import psycopg
+        def init():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candice_cycle_state (
+                            cycle_id BIGINT PRIMARY KEY,
+                            target_epoch DOUBLE PRECISION NOT NULL,
+                            signal_epoch DOUBLE PRECISION NOT NULL,
+                            signal_lead INTEGER NOT NULL,
+                            completed_pass INTEGER NOT NULL DEFAULT 0,
+                            candidate_pool JSONB NOT NULL DEFAULT '[]'::jsonb,
+                            status TEXT NOT NULL DEFAULT 'ACTIVE',
+                            last_reason TEXT,
+                            owner TEXT,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            completed_at TIMESTAMPTZ
+                        )
+                    """)
+                    cur.execute("""
+                        DELETE FROM candice_cycle_state
+                        WHERE updated_at < NOW() - INTERVAL '1 day'
+                    """)
+                db.commit()
+        await asyncio.to_thread(init)
+        log.info("CYCLE_STATE_QUEUE_READY")
+        return True
+    except Exception as e:
+        log.error("CYCLE_STATE_INIT_FAILED type=%s message=%s",
+                  type(e).__name__,str(e)[:180])
+        return False
+
+def _cycle_state_json(pool):
+    try:
+        values=list(pool.values()) if isinstance(pool,dict) else list(pool or [])
+        return json.loads(json.dumps(
+            values,separators=(",",":"),ensure_ascii=False,default=str
+        ))
+    except Exception:
+        return []
+
+async def save_cycle_state(
+    cycle_id,target_epoch,signal_epoch,signal_lead,completed_pass,
+    candidate_pool,status="ACTIVE",reason=""
+):
+    if not LEARNING_DB_URL:
+        return False
+    try:
+        import psycopg
+        payload=json.dumps(
+            _cycle_state_json(candidate_pool),
+            separators=(",",":"),ensure_ascii=False,default=str
+        )
+        def put():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO candice_cycle_state(
+                            cycle_id,target_epoch,signal_epoch,signal_lead,
+                            completed_pass,candidate_pool,status,last_reason,owner
+                        )
+                        VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s)
+                        ON CONFLICT(cycle_id) DO UPDATE SET
+                            target_epoch=EXCLUDED.target_epoch,
+                            signal_epoch=EXCLUDED.signal_epoch,
+                            signal_lead=EXCLUDED.signal_lead,
+                            completed_pass=EXCLUDED.completed_pass,
+                            candidate_pool=EXCLUDED.candidate_pool,
+                            status=EXCLUDED.status,
+                            last_reason=EXCLUDED.last_reason,
+                            owner=EXCLUDED.owner,
+                            updated_at=NOW(),
+                            completed_at=CASE
+                                WHEN EXCLUDED.status IN ('SENT','SKIPPED')
+                                THEN NOW()
+                                ELSE candice_cycle_state.completed_at
+                            END
+                    """,(
+                        int(cycle_id),float(target_epoch),float(signal_epoch),
+                        int(signal_lead),int(completed_pass),payload,status,
+                        str(reason)[:500],SCHEDULER_OWNER
+                    ))
+                db.commit()
+        await asyncio.to_thread(put)
+        return True
+    except Exception as e:
+        log.warning("CYCLE_STATE_SAVE_FAILED cycle=%s type=%s message=%s",
+                    cycle_id,type(e).__name__,str(e)[:160])
+        return False
+
+async def load_recoverable_cycle_state(now=None):
+    if not LEARNING_DB_URL:
+        return None
+    now=float(now or time.time())
+    try:
+        import psycopg
+        def read():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        SELECT cycle_id,target_epoch,signal_epoch,signal_lead,
+                               completed_pass,candidate_pool
+                        FROM candice_cycle_state
+                        WHERE status='ACTIVE'
+                          AND signal_epoch > %s
+                        ORDER BY target_epoch DESC
+                        LIMIT 1
+                    """,(now,))
+                    return cur.fetchone()
+        row=await asyncio.to_thread(read)
+        if not row:
+            return None
+        cycle_id,target_epoch,signal_epoch,signal_lead,completed_pass,pool=row
+        try:
+            pool=list(pool or [])
+        except Exception:
+            pool=[]
+        log.info(
+            "CYCLE_STATE_RECOVERED cycle=%s completed_pass=%s candidates=%s "
+            "signal_utc=%s target_utc=%s",
+            cycle_id,completed_pass,len(pool),
+            datetime.fromtimestamp(float(signal_epoch),tz=timezone.utc).strftime("%H:%M:%S"),
+            datetime.fromtimestamp(float(target_epoch),tz=timezone.utc).strftime("%H:%M:%S")
+        )
+        return {
+            "cycle_id":int(cycle_id),
+            "target_epoch":float(target_epoch),
+            "signal_epoch":float(signal_epoch),
+            "signal_lead":float(signal_lead),
+            "completed_pass":int(completed_pass or 0),
+            "candidate_pool":pool,
+        }
+
+async def mark_cycle_state(cycle_id,status,reason=""):
+    if not LEARNING_DB_URL:
+        return False
+    try:
+        import psycopg
+        def done():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        UPDATE candice_cycle_state
+                        SET status=%s,last_reason=%s,updated_at=NOW(),
+                            completed_at=NOW(),owner=%s
+                        WHERE cycle_id=%s
+                    """,(status,str(reason)[:500],SCHEDULER_OWNER,int(cycle_id)))
+                db.commit()
+        await asyncio.to_thread(done)
+        return True
+    except Exception as e:
+        log.warning("CYCLE_STATE_MARK_FAILED cycle=%s status=%s type=%s message=%s",
+                    cycle_id,status,type(e).__name__,str(e)[:160])
+        return False
+
 
 async def ensure_ai_review_queue_table():
     if not LEARNING_DB_URL:
@@ -2187,19 +2352,43 @@ async def cycle_loop():
 
     while True:
         now=time.time()
-        if target is None:
-            # On process startup, align to the next exact 10-minute boundary.
-            target=(int(now)//int(SIGNAL_INTERVAL)+1)*int(SIGNAL_INTERVAL)
-        else:
-            # After the current signal is delivered, advance exactly one
-            # 10-minute target. This prevents the scheduler from repeating the
-            # same boundary while time is still before the target itself.
-            target += SIGNAL_INTERVAL
-        cycle_id=int(target//SIGNAL_INTERVAL)
+        recovered=None
+        resume_completed_pass=0
 
-        # The 30s/40s lead remains in 10-cycle blocks. Use the cycle id so a
-        # Render restart does not reset the block pattern mid-stream.
-        cycle_sequence=(cycle_id % 20) or 20
+        if target is None:
+            recovered=await load_recoverable_cycle_state(now)
+            if recovered:
+                target=float(recovered["target_epoch"])
+                cycle_id=int(recovered["cycle_id"])
+                cycle_sequence=(cycle_id % 20) or 20
+                signal_lead=SIGNAL_LEADS[0 if cycle_sequence<=10 else 1]
+                signal_at=target-signal_lead
+                resume_completed_pass=int(recovered.get("completed_pass") or 0)
+                candidate_pool={}
+                for item in recovered.get("candidate_pool") or []:
+                    if isinstance(item,dict) and item.get("pair"):
+                        key=(item.get("pair"),str(item.get("entry_candle_ts")),
+                             str(item.get("direction") or "").upper())
+                        candidate_pool[key]=item
+                log.info(
+                    "CYCLE_RESUME_AFTER_RESTART cycle=%s completed_pass=%s candidates=%s",
+                    cycle_id,resume_completed_pass,len(candidate_pool)
+                )
+            else:
+                target=(int(now)//int(SIGNAL_INTERVAL)+1)*int(SIGNAL_INTERVAL)
+                cycle_id=int(target//SIGNAL_INTERVAL)
+                cycle_sequence=(cycle_id % 20) or 20
+                signal_lead=SIGNAL_LEADS[0 if cycle_sequence<=10 else 1]
+                signal_at=target-signal_lead
+                candidate_pool={}
+        else:
+            target += SIGNAL_INTERVAL
+            cycle_id=int(target//SIGNAL_INTERVAL)
+            cycle_sequence=(cycle_id % 20) or 20
+            signal_lead=SIGNAL_LEADS[0 if cycle_sequence<=10 else 1]
+            signal_at=target-signal_lead
+            candidate_pool={}
+
         signal_lead=SIGNAL_LEADS[0 if cycle_sequence<=10 else 1]
         signal_at=target-signal_lead
 
@@ -2238,7 +2427,11 @@ async def cycle_loop():
         # universe before Brain state for this cycle is created.
         BRAIN.start_cycle(cycle_id)
         STATE["cycle"]=cycle_id
-        candidate_pool={}
+        await save_cycle_state(
+            cycle_id,target,signal_at,signal_lead,resume_completed_pass,
+            candidate_pool,status="ACTIVE",
+            reason="cycle_resumed" if recovered else "cycle_started"
+        )
 
         log.info(
             "CYCLE_WINDOW_START cycle=%s sequence=%s interval=%ss signal_lead=%ss "
@@ -2257,6 +2450,14 @@ async def cycle_loop():
         catchup_next_at=None
 
         for pass_no,offset in enumerate(SCAN_OFFSETS,1):
+            if pass_no<=resume_completed_pass:
+                log.info(
+                    "SCAN_RESTORED cycle=%s scan=SCAN_%s pass=%s "
+                    "reason=already_completed_before_restart",
+                    cycle_id,pass_no,pass_no
+                )
+                continue
+
             scan_at=target-offset
 
             if pass_no==1:
@@ -2410,13 +2611,15 @@ async def cycle_loop():
             # When starting after a restart, compress the remaining missed
             # passes into the available pre-signal window. In normal operation
             # the exact scheduled timestamps above remain unchanged.
+            # Persist each completed pass immediately. If Render replaces
+            # this process, the next instance resumes from the next unfinished
+            # pass and keeps the candidates already discovered.
+            await save_cycle_state(
+                cycle_id,target,signal_at,signal_lead,pass_no,
+                candidate_pool,status="ACTIVE",
+                reason=f"scan_{pass_no}_completed"
+            )
             if catchup_mode and pass_no<5:
-                # Do not dynamically compress the remaining passes.  The next
-                # pass keeps its original scheduled timestamp; if that timestamp
-                # is already past, the next iteration runs it immediately.
-                # This prevents catch-up from starving pass 5 and producing a
-                # false "no qualified setup" merely because analysis finished
-                # after the signal deadline.
                 catchup_next_at=target-SCAN_OFFSETS[pass_no]
         # The final signal can only use a candidate produced by the fifth/deep
         # pass. Earlier passes continue to inform Brain state and can keep ticks
@@ -2474,6 +2677,13 @@ async def cycle_loop():
                     "FIVE_SCAN_NO_QUALIFIED_SETUP cycle=%s scans=5 analyzed=%d",
                     cycle_id,len(STATE["analyses"])
                 )
+
+        if sent:
+            await mark_cycle_state(cycle_id,"SENT","signal_delivered")
+        elif ranked_pool:
+            await mark_cycle_state(cycle_id,"SKIPPED","final_candidate_failed_delivery")
+        else:
+            await mark_cycle_state(cycle_id,"SKIPPED","no_final_pass_candidate")
 
         # Immediately iterate to the next 10-minute target. Because the first
         # scan of the next target is 10m30s before that target, it becomes
@@ -2836,6 +3046,7 @@ async def main():
     await load_persistent_learning()
     await ensure_ai_review_queue_table()
     await ensure_result_watch_queue_table()
+    await ensure_cycle_state_table()
     await ensure_access_table()
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
