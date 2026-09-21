@@ -1789,7 +1789,7 @@ def live_price_age(pair,reference_ts=None):
     try:return max(0.0,ref-received)
     except Exception:return None
 
-async def final_candidate(use_cached_only=False,require_live_price=False,deep_analysis=False):
+async def final_candidate(use_cached_only=False,require_live_price=False,deep_analysis=False,seed_candidates=None):
     BRAIN.prune_expired_cooldowns()
 
     # Hard account boundary: Brain may select/analyze an asset only after the
@@ -1810,12 +1810,78 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     ]
     analyzed=[STATE["analyses"][a["pair"]].copy() for a in eligible if a["pair"] in STATE["analyses"]]
     adapted=[BRAIN.adaptive_candidate(x) for x in analyzed]
-    raw=rank_signal_candidates(adapted)
+    # Final-pass resilience: earlier passes may have found a strong candidate that
+    # disappears from STATE["analyses"] on the last refresh because its technical
+    # score moved below the threshold for that instant. Never send that older decision
+    # directly. Instead, optionally re-run the current closed-candle Brain analysis for
+    # those earlier seed pairs and merge only freshly requalified candidates into the
+    # normal ranking/review path. This preserves the Brain strategy and prevents a
+    # transient final-pass refresh from creating an artificial signal gap.
+    recovery_adapted=[]
+    recovery_seen=set()
+    if seed_candidates:
+        seed_list=[x for x in (seed_candidates or []) if isinstance(x,dict) and x.get("pair")]
+        log.info(
+            "FINAL_RECOVERY_START seeds=%d deep=%s require_live=%s",
+            len(seed_list),deep_analysis,require_live_price
+        )
+        for seed in seed_list[:8]:
+            pair=str(seed.get("pair"))
+            if pair in recovery_seen:
+                continue
+            recovery_seen.add(pair)
+            if any(str(x.get("pair"))==pair for x in adapted):
+                continue
+            asset=next((a for a in eligible if str(a.get("pair"))==pair),None)
+            if not asset:
+                continue
+            try:
+                current_candles=_closed_candles(
+                    STATE["candles"].get(pair,[]),time.time()
+                )
+                if len(current_candles)<45:
+                    log.info(
+                        "FINAL_RECOVERY_REJECTED pair=%s reason=closed_candles=%s",
+                        pair,len(current_candles)
+                    )
+                    continue
+                live_price=STATE["prices"].get(
+                    pair,(None,None)
+                )[0]
+                refreshed=analyze_asset(asset,current_candles,live_price)
+                if not refreshed:
+                    log.info(
+                        "FINAL_RECOVERY_REJECTED pair=%s reason=brain_no_setup",
+                        pair
+                    )
+                    continue
+                refreshed["profitability"]=asset.get("profitability",0)
+                adapted_recovered=BRAIN.adaptive_candidate(refreshed)
+                recovery_adapted.append(adapted_recovered)
+                log.info(
+                    "FINAL_RECOVERY_BRAIN_RECHECK pair=%s confidence=%s strategy=%s direction=%s",
+                    pair,adapted_recovered.get("confidence"),
+                    adapted_recovered.get("strategy"),
+                    adapted_recovered.get("direction")
+                )
+            except Exception as e:
+                log.warning(
+                    "FINAL_RECOVERY_REJECTED pair=%s type=%s message=%s",
+                    pair,type(e).__name__,str(e)[:140]
+                )
+        if recovery_adapted:
+            log.info(
+                "FINAL_RECOVERY_MERGED seeds=%d requalified=%d",
+                len(seed_list),len(recovery_adapted)
+            )
+
+    candidate_inputs=adapted+recovery_adapted
+    raw=rank_signal_candidates(candidate_inputs)
     if not raw:
-        if adapted:
-            top_debug=max(adapted,key=lambda x:(int(x.get("confidence") or 0),float(x.get("market_quality") or 0)))
+        if candidate_inputs:
+            top_debug=max(candidate_inputs,key=lambda x:(int(x.get("confidence") or 0),float(x.get("market_quality") or 0)))
             log.info("CANDIDATE_GATE_REJECTED analyzed=%d top_pair=%s top_confidence=%s top_quality=%s strategy=%s",
-                     len(adapted),top_debug.get("pair"),top_debug.get("confidence"),
+                     len(candidate_inputs),top_debug.get("pair"),top_debug.get("confidence"),
                      top_debug.get("market_quality"),top_debug.get("strategy"))
         else:
             log.info("CANDIDATE_GATE_REJECTED analyzed=0 reason=no_closed_candle_setup")
@@ -2689,6 +2755,81 @@ async def cycle_loop():
                     "SCAN_EVALUATION_FAILED cycle=%s scan=SCAN_%s pass=%s type=%s message=%s",
                     cycle_id,pass_no,type(e).__name__,str(e)[:160]
                 )
+
+            # Final recovery window: if the scheduled deep pass returns no
+            # eligible candidate, re-check the candidates found in earlier passes using
+            # the latest closed candles. This is a fresh Brain decision, not a stale
+            # candidate bypass. Keep a hard time budget so the exact 30s lead is never
+            # sacrificed.
+            if candidate is None and pass_no==5 and candidate_pool:
+                recovery_remaining=max(0,signal_at-time.time())
+                if recovery_remaining>=8.0:
+                    try:
+                        recovery_timeout=min(10.0,max(1.0,recovery_remaining-6.0))
+                        log.info(
+                            "FINAL_RECOVERY_WINDOW cycle=%s seeds=%d timeout=%.2f "
+                            "seconds_to_signal=%.2f",
+                            cycle_id,len(candidate_pool),recovery_timeout,
+                            recovery_remaining
+                        )
+                        candidate=await asyncio.wait_for(
+                            final_candidate(
+                                require_live_price=True,
+                                deep_analysis=True,
+                                seed_candidates=list(candidate_pool.values())
+                            ),
+                            timeout=recovery_timeout
+                        )
+                        if candidate is not None:
+                            candidate=candidate.copy()
+                            candidate["expiry_minutes"]=1
+                            candidate["qualified_pass"]=5
+                            key=(
+                                candidate.get("pair"),
+                                str(candidate.get("entry_candle_ts")),
+                                str(candidate.get("direction") or "").upper()
+                            )
+                            candidate_pool[key]=candidate
+                            try:
+                                pin_ttl=max(
+                                    8.0,
+                                    target-time.time()+8.0
+                                )
+                                await pin_account_tick_pairs(
+                                    [candidate.get("pair")],ttl=pin_ttl
+                                )
+                            except Exception as e:
+                                log.warning(
+                                    "FINAL_RECOVERY_TICK_PIN_FAILED cycle=%s pair=%s type=%s message=%s",
+                                    cycle_id,candidate.get("pair"),
+                                    type(e).__name__,str(e)[:120]
+                                )
+                            log.info(
+                                "FINAL_RECOVERY_READY cycle=%s pair=%s confidence=%s "
+                                "strategy=%s direction=%s seconds_to_signal=%.2f",
+                                cycle_id,candidate.get("pair"),
+                                candidate.get("confidence"),
+                                candidate.get("strategy"),
+                                candidate.get("direction"),
+                                max(0,signal_at-time.time())
+                            )
+                        else:
+                            log.info(
+                                "FINAL_RECOVERY_NONE cycle=%s seeds=%d seconds_to_signal=%.2f",
+                                cycle_id,len(candidate_pool),
+                                max(0,signal_at-time.time())
+                            )
+                    except asyncio.TimeoutError:
+                        log.warning(
+                            "FINAL_RECOVERY_TIMEOUT cycle=%s seeds=%d seconds_to_signal=%.2f",
+                            cycle_id,len(candidate_pool),
+                            max(0,signal_at-time.time())
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "FINAL_RECOVERY_FAILED cycle=%s type=%s message=%s",
+                            cycle_id,type(e).__name__,str(e)[:160]
+                        )
 
             # When starting after a restart, compress the remaining missed
             # passes into the available pre-signal window. In normal operation
