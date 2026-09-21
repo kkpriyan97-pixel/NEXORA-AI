@@ -2527,43 +2527,36 @@ async def cycle_loop():
             )
             return False
 
-        # LAST-SECOND CANDLE-ONLY CONFIRMATION:
+        # LAST-SECOND 2M CANDLE-ONLY CONFIRMATION:
         # Brain + AI rank assets first. Immediately before delivery, inspect
-        # ONLY the latest completed 30s candle and latest completed 2m candle.
-        # No indicators, volume, body-strength, 1m gate, or higher-timeframe
-        # gate participates in this final decision.
+        # ONLY the latest completed 2m candle. No 30s check, indicators,
+        # volume, body-strength, 1m gate, or higher-timeframe gate participates
+        # in this final decision.
         reference=time.time()
-        thirty=_latest_closed_30s_candle(p,reference)
         closed_1m=_closed_candles(STATE["candles"].get(p,[]),reference)
         bars2=_aggregate_closed_minutes(closed_1m,2,reference)
         two=_latest_closed_candle_direction(bars2)
         expected=str(candidate.get("direction") or "").upper()
         final_mtf_diag={
-            "30s":thirty.get("direction","NEUTRAL"),
-            "30s_bars":thirty.get("bars",0),
             "2m":two.get("direction","NEUTRAL"),
             "2m_bars":two.get("bars",0),
         }
 
         confirm_reason=None
-        if thirty.get("status")!="READY":
-            confirm_reason="30s_candle_not_ready"
-        elif thirty.get("direction")!=expected:
-            confirm_reason="30s_candle_trend_conflict"
-        elif two.get("status")!="READY":
+        if two.get("status")!="READY":
             confirm_reason="2m_candle_not_ready"
         elif two.get("direction")!=expected:
             confirm_reason="2m_candle_trend_conflict"
 
         if confirm_reason:
             log.info(
-                "FINAL_30S_2M_CANDLE_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
+                "FINAL_2M_CANDLE_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
                 cycle_id,p,expected,confirm_reason,final_mtf_diag
             )
             return False
 
         log.info(
-            "FINAL_30S_2M_CANDLE_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
+            "FINAL_2M_CANDLE_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
             cycle_id,p,expected,final_mtf_diag
         )
 
