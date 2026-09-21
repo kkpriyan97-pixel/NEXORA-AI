@@ -100,10 +100,10 @@ class BrainState:
                 and not a.get("locked_trading") and not a.get("disabled")]
 
     def is_signal_blocked(self,pair=None,account_id=None,now=None):
-        """Apply account/pair cooldowns only at the signal-delivery boundary."""
+        """Apply only pair cooldown at signal delivery; learning batches never pause the account."""
         now=utc_now() if now is None else float(now)
-        if self.is_account_cooldown(now):
-            return True
+        # The 10-result learning batch is an analytics/reporting boundary only.
+        # It must never suppress all account signals. LOSS cooldown remains pair-local.
         if pair and self.is_in_cooldown(str(pair),now):
             return True
         if account_id is not None and self.learning_account_id is not None:
@@ -241,14 +241,19 @@ class BrainState:
                     lessons.append(f"{st}: {b['win']}W/{b['loss']}L")
             if not lessons:
                 lessons.append("No strategy had 2+ observations; keep technical evidence unchanged.")
+            # One-time audit line: confirms that the batch report is not a
+            # global signal stop. Pair cooldown remains 600s after LOSS.
             self.last_batch_summary={
                 "batch_no":self.learning_batch_no,"account_id":self.learning_account_id,
                 "signals":10,"wins":wins,"losses":losses,"ties":ties,
                 "win_rate":round(100*wins/10,1),"strategies":strategies,
                 "self_strategies":self_strategies,"expiries":expiries,
-                "assets":assets,"indicator_contexts":indicator_contexts,"lessons":lessons,"details":[{"pair":r.get("pair"),"direction":r.get("direction"),"strategy":r.get("strategy"),"self_strategy":r.get("self_strategy"),"expiry":r.get("expiry_minutes"),"confidence":r.get("confidence"),"result":r.get("result")} for r in batch],"cooldown_seconds":600
+                "assets":assets,"indicator_contexts":indicator_contexts,"lessons":lessons,"details":[{"pair":r.get("pair"),"direction":r.get("direction"),"strategy":r.get("strategy"),"self_strategy":r.get("self_strategy"),"expiry":r.get("expiry_minutes"),"confidence":r.get("confidence"),"result":r.get("result")} for r in batch],"cooldown_seconds":COOLDOWN_SECONDS
             }
-            self.account_cooldown_until=utc_now()+600.0
+            # Learning summaries must never create an account-wide delivery pause.
+            # Keep the field for backward-compatible persistence, but it is no longer
+            # consulted by is_signal_blocked(). Only a losing pair gets cooldown.
+            self.account_cooldown_until=0.0
             self.batch_results.clear()
 
     def consume_batch_summary(self):
