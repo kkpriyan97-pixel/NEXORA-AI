@@ -430,9 +430,9 @@ class NextCandleModel:
 def extract_search_urls(raw):
     found=[]
     patterns=(
-        r"<a[^>]+class=['"][^'"]*result__a[^'"]*['"][^>]+href=['"]([^'"]+)",
-        r"<li[^>]+class=['"][^'"]*b_algo[^'"]*.*?<a[^>]+href=['"]([^'"]+)",
-        r"<a[^>]+href=['"](https?://[^'"]+)['"][^>]*>",
+        r"""<a[^>]+class=['"][^'"]*result__a[^'"]*['"][^>]+href=['"]([^'"]+)""",
+        r"""<li[^>]+class=['"][^'"]*b_algo[^'"]*.*?<a[^>]+href=['"]([^'"]+)""",
+        r"""<a[^>]+href=['"](https?://[^'"]+)['"][^>]*>""",
     )
     for pat in patterns:
         for u in re.findall(pat,raw,re.I|re.S):
