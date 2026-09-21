@@ -2221,7 +2221,11 @@ async def cycle_loop():
                 # the past. Do not burn all five passes against an empty account
                 # state. Wait for the authenticated demo feed, then run the
                 # missed passes in a compressed but still separated window.
-                catchup_mode=scan_at<=time.time()
+                # The first scan is scheduled exactly at the previous
+                # signal boundary. A few hundred milliseconds of scheduler
+                # jitter must NOT turn a normal cycle into catch-up mode.
+                # Enter catch-up only when the scan was genuinely missed.
+                catchup_mode=(time.time()-scan_at)>5.0
                 if catchup_mode:
                     ready_deadline=signal_at-20.0
                     while time.time()<ready_deadline:
