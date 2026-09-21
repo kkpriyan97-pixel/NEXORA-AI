@@ -278,10 +278,23 @@ class BrainState:
         lesson=str(review.get("lesson") or "").strip()[:320]
         action=str(review.get("reuse") or review.get("action") or "").strip()[:240]
         evidence=str(review.get("evidence") or "").strip()[:320]
+        try:
+            review_confidence=max(0,min(100,int(float(review.get("confidence") or 0))))
+        except (TypeError,ValueError):
+            review_confidence=0
         if not already:
             b[result.lower()]=float(b.get(result.lower(),0) or 0)+1.0
             b["n"]=float(b.get("n",0) or 0)+1.0
             b["weighted"]=float(b.get("weighted",0) or 0)+{"WIN":1.0,"LOSS":-1.0,"TIE":0.0}[result]
+            # A high-confidence external History-AI LOSS creates an exact-context
+            # re-entry block. This does not change unrelated setups and only
+            # activates after the completed result has been reviewed externally.
+            # A later high-confidence WIN for the same exact context clears it.
+            if result=="LOSS" and review_confidence>=85:
+                b["block_reentry"]=True
+            elif result=="WIN" and review_confidence>=85:
+                b["block_reentry"]=False
+            b["last_review_confidence"]=review_confidence
             if lesson or action or evidence:
                 b["reviews"]=existing[-4:]+[{
                     "review_id":review_id,
@@ -289,6 +302,7 @@ class BrainState:
                     "lesson":lesson,
                     "reuse":action,
                     "evidence":evidence,
+                    "confidence":review_confidence,
                     "ai_provider":str(review.get("provider") or "external"),
                 }]
         self.last_ai_review={
@@ -297,9 +311,15 @@ class BrainState:
             "provider":str(review.get("provider") or "external"),
         }
 
+    def post_result_context_blocked(self,rec):
+        b=self.post_result_lessons.get(self.lesson_key(rec))
+        return bool(b and b.get("block_reentry"))
+
     def post_result_learning_bonus(self,rec):
         b=self.post_result_lessons.get(self.lesson_key(rec))
         if not b: return 0.0
+        if b.get("block_reentry"):
+            return -20.0
         n=float(b.get("n",0) or 0)
         if n<=0: return 0.0
         return max(-3.0,min(3.0,(float(b.get("weighted",0) or 0)/n)*3.0))
@@ -487,6 +507,7 @@ class BrainState:
                     "trend_15m":str(x.get("trend_15m") or ""),
                     "structure_1m":str(x.get("structure_1m") or ""),
                     "indicator_context":preview["indicator_context"]}
+        x["ai_learning_blocked"]=self.post_result_context_blocked(lesson_rec)
         x["post_result_learning_bonus"]=round(self.post_result_learning_bonus(lesson_rec),2)
 
         technical=float(x.get("market_quality") or x.get("confidence") or 0)
@@ -557,7 +578,8 @@ class BrainState:
 
 def rank_signal_candidates(candidates):
     q=[x for x in candidates if int(x.get("confidence") or 0)>=MIN_CONFIDENCE
-       and str(x.get("direction","")).upper() in {"UP","DOWN"}]
+       and str(x.get("direction","")).upper() in {"UP","DOWN"}
+       and not bool(x.get("ai_learning_blocked"))]
     return sorted(q,key=lambda x:(
         int(x.get("confidence") or 0),
         float(x.get("strategy_margin") or 0),
