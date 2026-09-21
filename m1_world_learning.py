@@ -39,10 +39,10 @@ log = logging.getLogger("candice.m1lab")
 TARGET_DAYS = 15
 TARGET_DOMAINS = 10_000
 TARGET_DAILY = math.ceil(TARGET_DOMAINS / TARGET_DAYS)
-RUN_SECONDS = max(45, int(os.getenv("M1_RESEARCH_RUN_SECONDS", "90")))
+RUN_SECONDS = max(45, int(os.getenv("M1_RESEARCH_RUN_SECONDS", "60")))
 MAX_CONCURRENCY = max(4, min(24, int(os.getenv("M1_RESEARCH_MAX_CONCURRENCY", "12"))))
-DISCOVERY_QUERIES_PER_RUN = max(8, min(32, int(os.getenv("M1_RESEARCH_QUERIES_PER_RUN", "18"))))
-FETCHES_PER_RUN = max(16, min(120, int(os.getenv("M1_RESEARCH_FETCHES_PER_RUN", "48"))))
+DISCOVERY_QUERIES_PER_RUN = max(12, min(48, int(os.getenv("M1_RESEARCH_QUERIES_PER_RUN", "30"))))
+FETCHES_PER_RUN = max(24, min(160, int(os.getenv("M1_RESEARCH_FETCHES_PER_RUN", "72"))))
 HTTP_TIMEOUT = max(4.0, float(os.getenv("M1_RESEARCH_HTTP_TIMEOUT", "8")))
 MAX_PAGE_BYTES = max(200_000, int(os.getenv("M1_RESEARCH_MAX_PAGE_BYTES", "700000")))
 USER_AGENT = os.getenv("M1_RESEARCH_USER_AGENT", "NEXORA-M1-ResearchBot/1.0")
@@ -127,6 +127,19 @@ MARKETING = re.compile(r"(90\\s*%|95\\s*%|99\\s*%|100\\s*%|guaranteed|guarantee|
                        r"lucro garantido|profit garanti|гарантированн|稳赚|稳赚不赔)", re.I)
 SEARCH_HOSTS={"google.com","googleusercontent.com","duckduckgo.com","bing.com","search.yahoo.com"}
 
+# Task-verified research seeds: hypotheses/evidence only; never direct live overrides.
+RESEARCH_SEEDS=[
+{"source":"ScienceDirect / QREF 81 (Rif & Utz, 2021)","url":"https://www.sciencedirect.com/science/article/pii/S1062976921000922","lang":"en","method_id":"reversal_rejection","finding":"Extreme negative one-minute returns in a Nasdaq-100 study showed a 31% reversal in the subsequent minute; reversal was stronger in the most liquid/largest firms.","caution":"Sample-specific academic result; revalidate on the target feed."},
+{"source":"Journal of Multinational Financial Management (2021)","url":"https://www.sciencedirect.com/science/article/pii/S1042444X21000402","lang":"en","method_id":"microstructure","finding":"Real-time buyer/seller trade imbalance and passive-order imbalance were reported to predict one-minute-ahead excess returns in Borsa Istanbul data.","caution":"Requires order/trade-flow features; OHLC alone cannot reproduce the same signal."},
+{"source":"ScienceDirect high-frequency conditional-probability study","url":"https://www.sciencedirect.com/science/article/pii/S0378437113007140","lang":"en","method_id":"microstructure","finding":"A studied high-frequency stock exhibited short-horizon directional dependence; same-direction movements showed predictive structure up to roughly one minute before weakening.","caution":"Asset-specific result; must be revalidated."},
+{"source":"Oxford Journal of Financial Econometrics (2023)","url":"https://academic.oup.com/jfec/article-abstract/21/2/485/6400345","lang":"en","method_id":"advanced_models","finding":"Regularized linear and tree-based models showed short-horizon intraday predictability in a 5-minute equity study, with ensemble models strong after transaction costs in that sample.","caution":"5-minute equity study, not direct proof for M1 OTC signals."},
+{"source":"MQL5 Market Microstructure / Order Flow (2026)","url":"https://www.mql5.com/en/articles/22939","lang":"en","method_id":"microstructure","finding":"At one-minute resolution, OHLCV does not directly reveal aggressor-side order flow; order-flow proxies need separate treatment.","caution":"Methodological guidance, not standalone performance evidence."},
+{"source":"TradingView 1-minute 2-bar continuation script","url":"https://www.tradingview.com/script/0URsJopj-BarrettFVG-2-Bar-Continuation-Scalper/","lang":"en","method_id":"breakout","finding":"A one-minute continuation hypothesis can require two same-direction closed candles, minimum body/range, higher second-candle volume and agreeing trend/session filters.","caution":"Community script methodology; independently validate."},
+{"source":"FXGlory M1 guide updated 2026-09-19","url":"https://fxglory.com/learn/forex-strategies/1-minute-forex-strategy/","lang":"en","method_id":"market_structure","finding":"M1 is presented as entry timing inside a broader plan using market condition, session, spread, volatility and higher-timeframe context.","caution":"Educational retail source."},
+{"source":"MQL5 M1 Gold scalping article (2026)","url":"https://www.mql5.com/en/blogs/post/773047","lang":"en","method_id":"risk_and_filtering","finding":"The article emphasizes filtering, closed-bar confirmation and avoiding sideways/fakeout/repainting conditions in M1 scalping.","caution":"Author experience; hypothesis only."},
+{"source":"Spanish M1 guide (2026)","url":"https://mejorbrokerbinario.com/es/estrategias/1-minuto/","lang":"es","method_id":"volatility_regime","finding":"The source emphasizes noise and execution sensitivity on one-minute charts and the need for strict filters.","caution":"Retail educational source."},
+{"source":"GitHub Intra-Minute Execution Timing","url":"https://github.com/KeyangPan/Intra-Minute-Execution-Timing","lang":"en","method_id":"advanced_models","finding":"A walk-forward project used top-of-book features and logistic regression to optimize within-minute execution timing, separating decision timestamps from raw tick fills.","caution":"Execution-timing study, not a directional signal system."}
+]\n
 class Parser(HTMLParser):
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -276,6 +289,35 @@ class DB:
         import psycopg
         with psycopg.connect(DB_URL,connect_timeout=8) as c:
             with c.cursor() as q:q.execute("INSERT INTO nexora_m1_meta(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",(k,str(v)));c.commit()
+    def seed_research_seeds(self):
+        if self.sqlite:
+            for e in RESEARCH_SEEDS:
+                payload=json.dumps(e,ensure_ascii=False,separators=(",",":"))
+                self.cx.execute("INSERT OR IGNORE INTO evidence(method_id,url,domain,language,evidence_score,evidence_json,marketing_claim,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                                (e["method_id"],e["url"],domain(e["url"]),e["lang"],round(min(1.0,quality(e["url"])),3),payload,0,time.time()))
+                self.cx.execute("INSERT OR IGNORE INTO sources(domain,language,homepage,first_seen,last_seen) VALUES(?,?,?,?,?)",
+                                (domain(e["url"]),e["lang"],e["url"],time.time(),time.time()))
+            self.cx.commit()
+            return
+        import psycopg
+        with psycopg.connect(DB_URL,connect_timeout=8) as cdb:
+            with cdb.cursor() as q:
+                for e in RESEARCH_SEEDS:
+                    d=domain(e["url"])
+                    q.execute("INSERT INTO nexora_m1_sources(domain,language,homepage) VALUES(%s,%s,%s) ON CONFLICT(domain) DO NOTHING",(d,e["lang"],e["url"]))
+                    q.execute("INSERT INTO nexora_m1_evidence(method_id,url,domain,language,evidence_score,evidence_json,marketing_claim) VALUES(%s,%s,%s,%s,%s,%s::jsonb,FALSE) ON CONFLICT(method_id,url) DO NOTHING",
+                              (e["method_id"],e["url"],d,e["lang"],round(min(1.0,quality(e["url"])),3),json.dumps(e,ensure_ascii=False,separators=(",",":"))))
+            cdb.commit()
+
+    def count_pages(self):
+        if self.sqlite:
+            return int(self.cx.execute("SELECT COUNT(*) FROM pages").fetchone()[0])
+        import psycopg
+        with psycopg.connect(DB_URL,connect_timeout=8) as cdb:
+            with cdb.cursor() as q:
+                q.execute("SELECT COUNT(*) FROM nexora_m1_pages")
+                return int(q.fetchone()[0])
+
     def count_domains(self):
         if self.sqlite:return int(self.cx.execute("SELECT COUNT(*) FROM sources").fetchone()[0])
         import psycopg
@@ -384,6 +426,20 @@ class NextCandleModel:
         for k,v in f.items():self.w[k]=max(-8,min(8,self.w.get(k,0)+lr*err*v))
         self.save_weights()
 
+def extract_search_urls(raw):
+    found=[]
+    patterns=(
+        r'<a[^>]+class=["'][^"']*result__a[^"']*["'][^>]+href=["']([^"']+)',
+        r'<li[^>]+class=["'][^"']*b_algo[^"']*.*?<a[^>]+href=["']([^"']+)',
+        r'<a[^>]+href=["'](https?://[^"']+)["'][^>]*>',
+    )
+    for pat in patterns:
+        for u in re.findall(pat,raw,re.I|re.S):
+            v=clean_url(unwrap(u))
+            if v and domain(v) not in SEARCH_HOSTS and v not in found:
+                found.append(v)
+    return found
+
 class M1WorldLab:
     def __init__(self):
         self.db=DB();self.model=NextCandleModel(self.db);self.queue=asyncio.Queue()
@@ -394,6 +450,7 @@ class M1WorldLab:
             try:self.started_at=datetime.fromisoformat(raw.replace("Z","+00:00")).astimezone(timezone.utc).timestamp()
             except Exception:self.started_at=time.time()
             self.db.set_meta("started_at",self.started_at)
+        self.db.seed_research_seeds()
         self.metrics={"runs":0,"searches":0,"discovered":0,"fetched":0,"evidence":0,"errors":0,"deduped":0}
         self.languages_seen=defaultdict(int)
     def day(self):
@@ -474,8 +531,9 @@ class M1WorldLab:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(8,connect=3),headers={"User-Agent":USER_AGENT},follow_redirects=True) as h:r=await h.get(ep)
                 if r.status_code>=400:continue
                 p=Parser();p.feed(r.text);found=0
-                for href,label in p.links:
-                    v=clean_url(unwrap(href))
+                urls=extract_search_urls(r.text)
+                urls.extend(clean_url(unwrap(href)) for href,label in p.links)
+                for v in urls:
                     if not v or domain(v) in SEARCH_HOSTS:continue
                     self.enqueue(v,lang,"search");found+=1
                 if found:return found
@@ -537,7 +595,7 @@ class M1WorldLab:
         if workers:await asyncio.gather(*workers,return_exceptions=True)
         self.db.set_meta("last_status",json.dumps(self.status(),separators=(",",":")))
         log.info("M1_WORLD_RESEARCH day=%d domains=%d/%d pages=%d evidence=%d model=%s languages=%s",
-                 self.day(),self.db.count_domains(),TARGET_DOMAINS,self.db.count_domains(),self.metrics["evidence"],
+                 self.day(),self.db.count_domains(),TARGET_DOMAINS,self.db.count_pages(),self.metrics["evidence"],
                  self.db.forecast_stats(),dict(self.languages_seen))
         return self.synthesize()
     async def run_forever(self):
