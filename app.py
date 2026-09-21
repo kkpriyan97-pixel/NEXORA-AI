@@ -2450,52 +2450,36 @@ async def cycle_loop():
             )
             return False
 
-        # LAST-SECOND CONFIRMATION ONLY:
-        # Candice Brain + AI rank the assets first. Only now, immediately before
-        # delivery, confirm the requested closed 30s and 2m candle conditions.
-        # 2m confirmation includes trend + candle body + transaction volume.
-        # If this asset fails, the caller immediately tries the next ranked asset
-        # inside the same 30-second delivery window.
+        # LAST-SECOND 30S CONFIRMATION ONLY:
+        # Candice Brain + AI rank the assets first. Immediately before delivery,
+        # confirm only the latest closed 30-second candle. If it fails, the caller
+        # immediately tries the next ranked asset inside the same delivery window.
         final_mtf=build_multi_timeframe_context(
             p,STATE["candles"].get(p,[]),time.time(),candidate.get("direction")
         )
         frames=final_mtf.get("frames") or {}
         thirty=frames.get("30s") or {}
-        two=(frames.get("2m") or {}).get("candle_confirmation") or {}
         expected=str(candidate.get("direction") or "").upper()
         final_mtf_diag={
             "30s":thirty.get("direction","NEUTRAL"),
             "30s_bars":thirty.get("bars",0),
-            "2m":two.get("direction","NEUTRAL"),
-            "2m_same_direction_candles":two.get("same_direction_candles",0),
-            "2m_candle_direction":two.get("candle_direction","NEUTRAL"),
-            "2m_body_ratio":two.get("body_ratio",0),
-            "2m_volume_ratio":two.get("volume_ratio",0),
-            "2m_volume_available":two.get("volume_available",False),
         }
+
         confirm_reason=None
         if thirty.get("status")!="READY":
             confirm_reason="30s_confirmation_insufficient"
         elif thirty.get("direction")!=expected:
             confirm_reason="30s_candle_trend_conflict"
-        elif two.get("status")!="READY":
-            confirm_reason="2m_confirmation_insufficient"
-        elif two.get("direction")!=expected:
-            confirm_reason="2m_candle_trend_conflict"
-        elif not two.get("trend_ok") or not two.get("candle_ok"):
-            confirm_reason="2m_candle_strength_insufficient"
-        elif not two.get("volume_ok"):
-            confirm_reason="2m_volume_confirmation_failed"
 
         if confirm_reason:
             log.info(
-                "FINAL_30S_2M_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
+                "FINAL_30S_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
                 cycle_id,p,expected,confirm_reason,final_mtf_diag
             )
             return False
 
         log.info(
-            "FINAL_30S_2M_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
+            "FINAL_30S_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
             cycle_id,p,expected,final_mtf_diag
         )
 
