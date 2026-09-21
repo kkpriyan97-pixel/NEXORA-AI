@@ -2209,8 +2209,8 @@ async def cycle_loop():
     #   - 5s + every complete 1m..15m frame are checked in each pass
     #   - the next cycle starts immediately after the current signal is delivered;
     #     result watching and History-AI remain background tasks and never block it.
-    # Five-minute signal cycle with five pre-signal analysis passes.
-    # For target T: passes at T-5:30, T-4:30, T-3:30, T-2:30, T-1:30;
+    # Ten-minute signal cycle with five pre-signal analysis passes.
+    # For target T: passes at T-10:30, T-8:30, T-6:30, T-4:30, T-2:30;
     # final signal remains at T-0:30.
     SIGNAL_INTERVAL=600.0
     SIGNAL_LEADS=(30.0,40.0)
@@ -2689,12 +2689,37 @@ async def cycle_loop():
                     cycle_id,len(STATE["analyses"])
                 )
 
+        # Do not let the current cycle's durable DB status update block
+        # the 24/7 scheduler after a signal/no-signal decision. The next
+        # 10-minute target must be scheduled immediately; persistence runs
+        # independently and never owns the scan loop.
         if sent:
-            await mark_cycle_state(cycle_id,"SENT","signal_delivered")
+            asyncio.create_task(
+                mark_cycle_state(cycle_id,"SENT","signal_delivered")
+            )
+            cycle_outcome="SENT"
         elif ranked_pool:
-            await mark_cycle_state(cycle_id,"SKIPPED","final_candidate_failed_delivery")
+            asyncio.create_task(
+                mark_cycle_state(cycle_id,"SKIPPED","final_candidate_failed_delivery")
+            )
+            cycle_outcome="SKIPPED_DELIVERY"
         else:
-            await mark_cycle_state(cycle_id,"SKIPPED","no_final_pass_candidate")
+            asyncio.create_task(
+                mark_cycle_state(cycle_id,"SKIPPED","no_final_pass_candidate")
+            )
+            cycle_outcome="SKIPPED_NO_SETUP"
+
+        next_target=target+SIGNAL_INTERVAL
+        next_cycle_id=int(next_target//SIGNAL_INTERVAL)
+        next_signal=next_target-SIGNAL_LEADS[0 if (next_cycle_id%20 or 20)<=10 else 1]
+        log.info(
+            "CYCLE_CONTINUE_AFTER_SIGNAL cycle=%s outcome=%s next_cycle=%s "
+            "next_signal_utc=%s next_target_utc=%s",
+            cycle_id,cycle_outcome,next_cycle_id,
+            time.strftime("%H:%M:%S",time.gmtime(next_signal)),
+            time.strftime("%H:%M:%S",time.gmtime(next_target))
+        )
+        await asyncio.sleep(0)
 
         # Immediately iterate to the next 10-minute target. Because the first
         # scan of the next target is 10m30s before that target, it becomes
