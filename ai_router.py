@@ -90,7 +90,10 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                 "and continuation evidence, not direction alone: meaningful ATR displacement, strong "
                 "breakout body, momentum/efficiency, and matching Donchian or level confirmation "
                 "must support the setup. Treat a marginal/weak breakout as uncertain rather than "
-                "agreeing with it. Return one JSON object only with direction UP or DOWN, confidence "
+                "agreeing with it. For MOMENTUM candidates in a SIDEWAYS 15m regime, require "
+                "strong displacement plus repeated directional candles and a directional pattern; "
+                "do not approve a setup merely because one candle points in the requested direction. "
+                "Return uncertain/low confidence when the evidence is mixed or range-bound. Return one JSON object only with direction UP or DOWN, confidence "
                 "0-100, and a short reason. This is DEMO read-only; never trade.\n"+
                 json.dumps(request,ensure_ascii=False,separators=(",",":")))
     else:
