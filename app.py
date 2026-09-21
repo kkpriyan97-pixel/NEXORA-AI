@@ -1705,10 +1705,16 @@ def multi_timeframe_confirmation(context,expected):
         return False,{"reason":"invalid_direction"}
 
     five=frames.get("5s",{})
-    if five.get("status")!="READY":
-        return False,{"reason":"5s_insufficient","bars":five.get("bars",0)}
-    if five.get("direction") not in {expected,"NEUTRAL"}:
-        return False,{"reason":"5s_opposite","direction":five.get("direction")}
+    # 5s is microstructure context, not a hard veto on the Candice Brain.
+    # A brief 5s reversal must not erase an otherwise valid 1m..15m setup.
+    five_status=five.get("status")
+    five_direction=five.get("direction","NEUTRAL")
+    if five_status!="READY":
+        five_warning="5s_insufficient"
+    elif five_direction not in {expected,"NEUTRAL"}:
+        five_warning="5s_opposite"
+    else:
+        five_warning="none"
 
     short=[frames.get(f"{m}m",{}) for m in (1,2,3,4)]
     short=[x for x in short if x.get("status")=="READY"]
@@ -1733,7 +1739,8 @@ def multi_timeframe_confirmation(context,expected):
 
     return True,{
         "reason":"multi_timeframe_confirmed",
-        "5s":five.get("direction"),
+        "5s":five_direction,
+        "5s_warning":five_warning,
         "short_align":short_align,
         "short_opp":short_opp,
         "higher_align":align,
@@ -2202,14 +2209,12 @@ async def cycle_loop():
     #   - 5s + every complete 1m..15m frame are checked in each pass
     #   - the next cycle starts immediately after the current signal is delivered;
     #     result watching and History-AI remain background tasks and never block it.
-    SIGNAL_INTERVAL=600.0
+    # Five-minute signal cycle with five pre-signal analysis passes.
+    # For target T: passes at T-5:30, T-4:30, T-3:30, T-2:30, T-1:30;
+    # final signal remains at T-0:30.
+    SIGNAL_INTERVAL=300.0
     SIGNAL_LEADS=(30.0,40.0)
-    # For a target at 12:10:00 these are:
-    # 11:59:30, 12:01:30, 12:03:30, 12:05:30, 12:07:30.
-    # Thus the next cycle can begin at the same boundary as the current
-    # Telegram delivery, while the final pass still finishes well before the
-    # signal deadline.
-    SCAN_OFFSETS=(630.0,510.0,390.0,270.0,150.0)
+    SCAN_OFFSETS=(330.0,270.0,210.0,150.0,90.0)
 
     async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
         if not candidate or not BRAIN.can_send_cycle_signal(
