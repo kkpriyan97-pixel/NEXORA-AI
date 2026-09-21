@@ -2260,34 +2260,45 @@ async def handle_telegram_command(msg):
 
 async def health(reader,writer):
     try:
-        raw=await reader.read(65536)
-        head,_,body=raw.partition(b"\r\n\r\n")
-        first=head.split(b"\r\n",1)[0].decode("latin1","ignore")
+        # Read HTTP headers first. reader.read() waits for client EOF, which can
+        # deadlock a persistent HTTP/1.1 GET and make the Render/GitHub keepalive
+        # curl request time out before /health is answered.
+        head=await reader.readuntil(b"\r\n\r\n")
+        lines=head.decode("latin1","ignore").split("\r\n")
+        first=lines[0] if lines else ""
         parts=first.split(" ")
         path=parts[1] if len(parts)>1 else "/"
         headers={}
-        for line in head.decode("latin1","ignore").split("\r\n")[1:]:
+        for line in lines[1:]:
             if ":" in line:
                 k,v=line.split(":",1);headers[k.strip().lower()]=v.strip()
+
+        try:
+            content_length=max(0,int(headers.get("content-length","0") or 0))
+        except (TypeError,ValueError):
+            content_length=0
+        body=await reader.readexactly(content_length) if content_length else b""
+
         webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
         if path.startswith("/health"):
             body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"account_id":STATE.get("account_id"),"account_group":STATE.get("account_group"),"feed_source":STATE.get("feed_source"),"network":STATE.get("network",{})}).encode()
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "+str(len(body_out)).encode()+b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
             await writer.drain()
+            log.info("HEALTH_REQUEST status=200 path=%s",path)
             return
         if path.startswith("/telegram/webhook") and webhook_secret and headers.get("x-telegram-bot-api-secret-token") != webhook_secret:
-            writer.write(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+            writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             await writer.drain()
             return
         if path.startswith("/telegram/webhook") and not body:
-            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nNEXORA Telegram webhook is ready")
+            payload=b"NEXORA Telegram webhook is ready"
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: "+str(len(payload)).encode()+b"\r\nConnection: close\r\n\r\n"+payload)
             await writer.drain()
             return
         if path.startswith("/telegram/webhook") and body:
             try:
                 upd=json.loads(body.decode("utf-8"))
                 msg=upd.get("message") or upd.get("edited_message") or {}
-                txt=str(msg.get("text") or "").strip()
                 chat_id=(msg.get("chat") or {}).get("id")
                 if chat_id is not None:
                     STATE["telegram_chat_id"]=chat_id
@@ -2295,9 +2306,21 @@ async def health(reader,writer):
                 await handle_telegram_command(msg)
             except Exception as e:
                 log.warning("TELEGRAM_WEBHOOK_PARSE_FAILED %s",e)
-        body_out=json.dumps({"service":"NEXORA-AI","status":"ok","read_only":True}).encode()
-        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"+body_out);await writer.drain()
-    finally:writer.close()
+        body_out=json.dumps({"service":"CANDICE-AI","status":"ok","read_only":True}).encode()
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "+str(len(body_out)).encode()+b"\r\nConnection: close\r\n\r\n"+body_out)
+        await writer.drain()
+    except (asyncio.IncompleteReadError,asyncio.LimitOverrunError):
+        try:
+            writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+        except Exception:
+            pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
 
 async def configure_telegram_webhook():
     token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
