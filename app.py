@@ -1836,7 +1836,14 @@ async def cycle_loop():
     last_target=0
 
     async def send_cycle_signal(candidate,target):
-        if not candidate or not BRAIN.can_send_cycle_signal(STATE.get("account_id")):
+        if not candidate or not BRAIN.can_send_cycle_signal(
+            STATE.get("account_id"),candidate.get("pair")
+        ):
+            if candidate:
+                log.info(
+                    "SIGNAL_DELIVERY_BLOCKED cooldown_or_account cycle=%s pair=%s",
+                    int(target//300),candidate.get("pair")
+                )
             return False
 
         p=candidate["pair"]
