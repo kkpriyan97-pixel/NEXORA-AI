@@ -2628,23 +2628,33 @@ async def cycle_loop():
                     )
                     candidate_pool[key]=candidate
 
-                    pin_ttl=max(15.0,target-time.time()+8.0)
-                    try:
-                        await pin_account_tick_pairs(
-                            [candidate.get("pair")],ttl=pin_ttl
-                        )
+                    # Only the final/deep pass is allowed to pin the broker's
+                    # scarce event-1 live-tick slots. Earlier passes only enrich the
+                    # candidate pool; pinning them would freeze account-wide rotation
+                    # for their long TTL and starve other account assets from fresh quotes.
+                    if pass_no==5:
+                        pin_ttl=max(15.0,target-time.time()+8.0)
+                        try:
+                            await pin_account_tick_pairs(
+                                [candidate.get("pair")],ttl=pin_ttl
+                            )
+                            log.info(
+                                "FINAL_CANDIDATE_TICK_PINNED cycle=%s pair=%s pass=%s ttl=%.1f target_utc=%s",
+                                cycle_id,candidate.get("pair"),pass_no,pin_ttl,
+                                datetime.fromtimestamp(
+                                    target,tz=timezone.utc
+                                ).strftime("%H:%M:%S")
+                            )
+                        except Exception as e:
+                            log.warning(
+                                "FINAL_CANDIDATE_TICK_PIN_FAILED cycle=%s pair=%s pass=%s type=%s message=%s",
+                                cycle_id,candidate.get("pair"),pass_no,
+                                type(e).__name__,str(e)[:120]
+                            )
+                    else:
                         log.info(
-                            "FINAL_CANDIDATE_TICK_PINNED cycle=%s pair=%s pass=%s ttl=%.1f target_utc=%s",
-                            cycle_id,candidate.get("pair"),pass_no,pin_ttl,
-                            datetime.fromtimestamp(
-                                target,tz=timezone.utc
-                            ).strftime("%H:%M:%S")
-                        )
-                    except Exception as e:
-                        log.warning(
-                            "FINAL_CANDIDATE_TICK_PIN_FAILED cycle=%s pair=%s pass=%s type=%s message=%s",
-                            cycle_id,candidate.get("pair"),pass_no,
-                            type(e).__name__,str(e)[:120]
+                            "CANDIDATE_TICK_NOT_PINNED cycle=%s pair=%s pass=%s reason=early_pass_rotation_preserved",
+                            cycle_id,candidate.get("pair"),pass_no
                         )
 
                     log.info(
