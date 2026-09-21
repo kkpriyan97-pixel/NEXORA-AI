@@ -2022,74 +2022,94 @@ async def result_watch(key):
     )
 
 async def cycle_loop():
-    # Rolling preselection pipeline:
-    # - Prepare the next 5-minute target before its final signal window.
-    # - Run exactly five Brain passes over the account-visible market.
-    # - The first ten cycles use a 30s signal lead; the next ten use 40s,
-    #   then repeat in ten-cycle blocks.
-    # - Pass 5 widens the external verification set for a slightly deeper review.
-    # - Keep a candidate pool so a late MTF rejection can fall through to the
-    #   next independently prepared candidate without restarting the cycle.
+    # Rolling 10-minute signal scheduler.
+    # For each target:
+    #   - target = exact next 10-minute boundary (e.g. 12:10:00)
+    #   - Telegram signal = target minus the current 30s/40s lead
+    #   - five Brain passes are performed before that signal
+    #   - pass 5 is the deep/final qualification pass
+    #   - 5s + every complete 1m..15m frame are checked in each pass
+    #   - the next cycle starts immediately after the current signal is delivered;
+    #     result watching and History-AI remain background tasks and never block it.
+    SIGNAL_INTERVAL=600.0
     SIGNAL_LEADS=(30.0,40.0)
-    SCAN_OFFSETS=(270.0,210.0,150.0,90.0,60.0)
-    cycle_sequence=0
-    last_target=0
+    # For a target at 12:10:00 these are:
+    # 11:59:30, 12:01:30, 12:03:30, 12:05:30, 12:07:30.
+    # Thus the next cycle can begin at the same boundary as the current
+    # Telegram delivery, while the final pass still finishes well before the
+    # signal deadline.
+    SCAN_OFFSETS=(630.0,510.0,390.0,270.0,150.0)
 
-    async def send_cycle_signal(candidate,target,signal_lead):
+    async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
         if not candidate or not BRAIN.can_send_cycle_signal(
             STATE.get("account_id"),candidate.get("pair")
         ):
             if candidate:
                 log.info(
                     "SIGNAL_DELIVERY_BLOCKED cooldown_or_account cycle=%s pair=%s",
-                    int(target//300),candidate.get("pair")
+                    cycle_id,candidate.get("pair")
                 )
             return False
 
         p=candidate["pair"]
-        # The quote is refreshed immediately before this function is called.
-        # Keep this send path non-blocking so the 30s signal deadline is not
-        # consumed by another network request.
         now=time.time()
         if not has_fresh_live_price(p,now,LIVE_TICK_MAX_AGE):
-            log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=quote_not_fresh",
-                     int(target//300),p)
+            log.info(
+                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=quote_not_fresh",
+                cycle_id,p
+            )
             return False
 
         entry=STATE["prices"].get(p,(None,None))[0]
         if entry is None:
-            log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=price_missing",
-                     int(target//300),p)
+            log.info(
+                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=price_missing",
+                cycle_id,p
+            )
             return False
 
-        # Recompute all requested frames immediately before delivery so the
-        # final signal is based on the latest closed 1m-derived frames plus
-        # real completed 5s tick micro-candles gathered while the candidate was pinned.
+        # Final live re-check: 5s + every requested 1m..15m frame must still
+        # agree before the user-facing signal is released.
         final_mtf=build_multi_timeframe_context(
             p,STATE["candles"].get(p,[]),time.time()
         )
-        final_mtf_ok,final_mtf_diag=multi_timeframe_confirmation(final_mtf,candidate.get("direction"))
+        final_mtf_ok,final_mtf_diag=multi_timeframe_confirmation(
+            final_mtf,candidate.get("direction")
+        )
         if not final_mtf_ok:
             log.info(
                 "FINAL_MULTI_TF_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s",
-                int(target//300),p,candidate.get("direction"),
+                cycle_id,p,candidate.get("direction"),
                 final_mtf_diag.get("reason"),final_mtf_diag
             )
             return False
         log.info(
             "FINAL_MULTI_TF_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
-            int(target//300),p,candidate.get("direction"),final_mtf_diag
+            cycle_id,p,candidate.get("direction"),final_mtf_diag
         )
+
         confidence=int(candidate.get("confidence") or 0)
         if confidence < 90:
-            log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=confidence_%s",
-                     int(target//300),p,confidence)
+            log.info(
+                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=confidence_%s",
+                cycle_id,p,confidence
+            )
             return False
 
         ts=target-signal_lead
         if time.time() > ts+0.25:
-            log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=deadline_passed",
-                     int(target//300),p)
+            log.info(
+                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=deadline_passed",
+                cycle_id,p
+            )
+            return False
+
+        # Only a candidate that survived pass 5 is eligible for final delivery.
+        if int(candidate.get("qualified_pass") or 0) < 5:
+            log.info(
+                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=not_final_pass_qualified",
+                cycle_id,p
+            )
             return False
 
         s=BRAIN.mark_signal_sent(
@@ -2125,52 +2145,66 @@ async def cycle_loop():
              f"🤖 CANDICE BRAIN")
         log.info(
             "FINAL_SIGNAL cycle=%s pair=%s direction=%s strategy=%s confidence=%s price_source=%s "
-            "trend=%s structure=%s pattern=%s self_strategy=%s self_version=%s expiry=%s entry_candle=%s signal_utc=%s target_utc=%s lead_seconds=%.3f",
-            int(target//300),s.pair,s.direction,s.strategy or "UNKNOWN",s.confidence,
+            "trend=%s structure=%s pattern=%s self_strategy=%s self_version=%s expiry=%s "
+            "qualified_pass=%s signal_utc=%s target_utc=%s lead_seconds=%.3f",
+            cycle_id,s.pair,s.direction,s.strategy or "UNKNOWN",s.confidence,
             STATE["price_source"].get(s.pair,"unknown"),
             s.trend_15m or "UNKNOWN",s.structure_1m or "UNKNOWN",s.pattern or "UNKNOWN",
             getattr(s,"self_strategy","UNKNOWN"),getattr(s,"self_strategy_version","UNKNOWN"),
-            s.expiry_minutes,s.entry_candle_ts,
+            s.expiry_minutes,getattr(candidate,"qualified_pass",None) if isinstance(candidate,object) else candidate.get("qualified_pass"),
             datetime.fromtimestamp(ts,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
             datetime.fromtimestamp(target,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
             target-time.time()
         )
-        asyncio.create_task(telegram_background(msg,f"{s.cycle_id}:{s.pair}:{s.entry_ts}"))
-        # Persist the result watcher before the in-memory task starts. A Render
-        # restart can then reconstruct this exact signal and continue result tracking.
+        asyncio.create_task(
+            telegram_background(msg,f"{s.cycle_id}:{s.pair}:{s.entry_ts}")
+        )
         try:
             await asyncio.wait_for(enqueue_result_watch(key,s),timeout=0.20)
         except Exception as e:
-            log.warning("RESULT_WATCH_PERSIST_BEFORE_START_FAILED watch_id=%s type=%s message=%s",
-                        key,type(e).__name__,str(e)[:140])
+            log.warning(
+                "RESULT_WATCH_PERSIST_BEFORE_START_FAILED watch_id=%s type=%s message=%s",
+                key,type(e).__name__,str(e)[:140]
+            )
         asyncio.create_task(result_watch(key))
         return True
 
+    first_cycle=True
+    cycle_sequence=0
 
     while True:
         now=time.time()
-        target=(int(now)//300+1)*300
-        if target<=last_target:
-            target=last_target+300
+        target=(int(now)//int(SIGNAL_INTERVAL)+1)*int(SIGNAL_INTERVAL)
+        signal_at=target-30.0
 
-        cycle_sequence+=1
-        signal_lead=SIGNAL_LEADS[((cycle_sequence-1)//10)%2]
-        analysis_start=target-SCAN_OFFSETS[0]
+        if first_cycle:
+            # On process startup, wait until the first analysis point for the
+            # upcoming 10-minute target. After that, each new cycle starts as
+            # soon as the previous signal is delivered.
+            first_cycle=False
+            try:
+                probe_sequence=max(1,cycle_sequence+1)
+            except Exception:
+                probe_sequence=1
+        cycle_id=int(target//SIGNAL_INTERVAL)
+
+        # The 30s/40s lead remains in 10-cycle blocks. Use the cycle id so a
+        # Render restart does not reset the block pattern mid-stream.
+        cycle_sequence=(cycle_id % 20) or 20
+        signal_lead=SIGNAL_LEADS[0 if cycle_sequence<=10 else 1]
         signal_at=target-signal_lead
-        cycle_id=int(target//300)
 
-        # Begin preselection as soon as this target enters the rolling window.
-        await asyncio.sleep(max(0,analysis_start-time.time()))
+        # First-cycle startup aligns to the first scan. Later cycles enter
+        # immediately after the previous signal; missed scan timestamps are
+        # executed immediately rather than waiting for another cycle.
         BRAIN.start_cycle(cycle_id)
         STATE["cycle"]=cycle_id
-        last_target=target
-
         candidate_pool={}
+
         log.info(
-            "CYCLE_WINDOW_START cycle=%s sequence=%s signal_lead=%ss "
-            "analysis_start_utc=%s signal_utc=%s target_utc=%s analysis_passes=5",
-            cycle_id,cycle_sequence,int(signal_lead),
-            time.strftime("%H:%M:%S",time.gmtime(analysis_start)),
+            "CYCLE_WINDOW_START cycle=%s sequence=%s interval=%ss signal_lead=%ss "
+            "signal_utc=%s target_utc=%s analysis_passes=5 frames=5s,1m..15m",
+            cycle_id,cycle_sequence,int(SIGNAL_INTERVAL),int(signal_lead),
             time.strftime("%H:%M:%S",time.gmtime(signal_at)),
             time.strftime("%H:%M:%S",time.gmtime(target))
         )
@@ -2181,46 +2215,47 @@ async def cycle_loop():
         )
 
         for pass_no,offset in enumerate(SCAN_OFFSETS,1):
-            scan_name=f"SCAN_{pass_no}"
             scan_at=target-offset
-            await asyncio.sleep(max(0,scan_at-time.time()))
+            wait_for=max(0.0,scan_at-time.time())
+            if wait_for>0:
+                await asyncio.sleep(wait_for)
 
             remaining=max(0,signal_at-time.time())
-            if remaining<=2.0:
+            if remaining<=3.0:
                 log.info(
-                    "FIVE_SCAN_WINDOW_CLOSED cycle=%s scan=%s remaining=%.2f",
-                    cycle_id,scan_name,remaining
+                    "FIVE_SCAN_WINDOW_CLOSED cycle=%s scan=SCAN_%s remaining=%.2f",
+                    cycle_id,pass_no,remaining
                 )
                 break
 
-            scan_budget=max(0.75,remaining-3.0)
+            scan_budget=max(1.0,remaining-4.0)
             try:
                 await asyncio.wait_for(
                     refresh_candles(force=True),
                     timeout=scan_budget
                 )
                 log.info(
-                    "ACCOUNT_FULL_SCAN cycle=%s scan=%s pass=%s assets=%d analyzed=%d "
+                    "ACCOUNT_FULL_SCAN cycle=%s scan=SCAN_%s pass=%s assets=%d analyzed=%d "
                     "seconds_to_signal=%.2f deep=%s",
-                    cycle_id,scan_name,pass_no,len(STATE["assets"]),
+                    cycle_id,pass_no,pass_no,len(STATE["assets"]),
                     len(STATE["analyses"]),max(0,signal_at-time.time()),
                     pass_no==5
                 )
             except asyncio.TimeoutError:
                 log.warning(
-                    "ACCOUNT_FULL_SCAN_TIMEOUT cycle=%s scan=%s pass=%s budget=%.2f "
+                    "ACCOUNT_FULL_SCAN_TIMEOUT cycle=%s scan=SCAN_%s pass=%s budget=%.2f "
                     "seconds_to_signal=%.2f",
-                    cycle_id,scan_name,pass_no,scan_budget,
+                    cycle_id,pass_no,pass_no,scan_budget,
                     max(0,signal_at-time.time())
                 )
             except Exception as e:
                 log.warning(
-                    "ACCOUNT_FULL_SCAN_FAILED cycle=%s scan=%s pass=%s type=%s message=%s",
-                    cycle_id,scan_name,pass_no,type(e).__name__,str(e)[:160]
+                    "ACCOUNT_FULL_SCAN_FAILED cycle=%s scan=SCAN_%s pass=%s type=%s message=%s",
+                    cycle_id,pass_no,pass_no,type(e).__name__,str(e)[:160]
                 )
 
             remaining=max(0,signal_at-time.time())
-            if remaining<=2.0:
+            if remaining<=3.0:
                 break
 
             try:
@@ -2229,67 +2264,74 @@ async def cycle_loop():
                         require_live_price=True,
                         deep_analysis=(pass_no==5)
                     ),
-                    timeout=max(0.75,remaining-0.50)
+                    timeout=max(1.0,remaining-0.50)
                 )
                 if candidate is None:
                     log.info(
-                        "SCAN_COMPLETE cycle=%s scan=%s candidate=none analyzed=%d",
-                        cycle_id,scan_name,len(STATE["analyses"])
+                        "SCAN_COMPLETE cycle=%s scan=SCAN_%s candidate=none analyzed=%d",
+                        cycle_id,pass_no,len(STATE["analyses"])
                     )
                     continue
 
+                candidate=candidate.copy()
+                candidate["qualified_pass"]=pass_no
                 key=(
                     candidate.get("pair"),
                     str(candidate.get("entry_candle_ts")),
                     str(candidate.get("direction") or "").upper()
                 )
-                candidate_pool[key]=candidate.copy()
+                candidate_pool[key]=candidate
 
-                pin_ttl=max(12.0,target-time.time()+5.0)
+                pin_ttl=max(15.0,target-time.time()+8.0)
                 try:
                     await pin_account_tick_pairs(
                         [candidate.get("pair")],ttl=pin_ttl
                     )
                     log.info(
-                        "FINAL_CANDIDATE_TICK_PINNED cycle=%s pair=%s ttl=%.1f target_utc=%s",
-                        cycle_id,candidate.get("pair"),pin_ttl,
+                        "FINAL_CANDIDATE_TICK_PINNED cycle=%s pair=%s pass=%s ttl=%.1f target_utc=%s",
+                        cycle_id,candidate.get("pair"),pass_no,pin_ttl,
                         datetime.fromtimestamp(
                             target,tz=timezone.utc
                         ).strftime("%H:%M:%S")
                     )
                 except Exception as e:
                     log.warning(
-                        "FINAL_CANDIDATE_TICK_PIN_FAILED cycle=%s pair=%s type=%s message=%s",
-                        cycle_id,candidate.get("pair"),
+                        "FINAL_CANDIDATE_TICK_PIN_FAILED cycle=%s pair=%s pass=%s type=%s message=%s",
+                        cycle_id,candidate.get("pair"),pass_no,
                         type(e).__name__,str(e)[:120]
                     )
 
                 log.info(
-                    "SCAN_CANDIDATE_SELECTED cycle=%s scan=%s pass=%s pair=%s "
+                    "SCAN_CANDIDATE_SELECTED cycle=%s scan=SCAN_%s pass=%s pair=%s "
                     "confidence=%s strategy=%s expiry=%s pool=%s deep=%s",
-                    cycle_id,scan_name,pass_no,candidate.get("pair"),
+                    cycle_id,pass_no,pass_no,candidate.get("pair"),
                     candidate.get("confidence"),candidate.get("strategy"),
                     candidate.get("expiry_minutes"),len(candidate_pool),
                     pass_no==5
                 )
             except asyncio.TimeoutError:
                 log.warning(
-                    "SCAN_EVALUATION_TIMEOUT cycle=%s scan=%s pass=%s remaining=%.2f",
-                    cycle_id,scan_name,pass_no,max(0,signal_at-time.time())
+                    "SCAN_EVALUATION_TIMEOUT cycle=%s scan=SCAN_%s pass=%s remaining=%.2f",
+                    cycle_id,pass_no,max(0,signal_at-time.time())
                 )
             except Exception as e:
                 log.exception(
-                    "SCAN_EVALUATION_FAILED cycle=%s scan=%s pass=%s type=%s message=%s",
-                    cycle_id,scan_name,pass_no,type(e).__name__,str(e)[:160]
+                    "SCAN_EVALUATION_FAILED cycle=%s scan=SCAN_%s pass=%s type=%s message=%s",
+                    cycle_id,pass_no,type(e).__name__,str(e)[:160]
                 )
 
-        # The next cycle is already queued conceptually; only the exact user-facing
-        # delivery boundary remains. Candidate validation is repeated using the
-        # latest live price + all MTF frames, but Brain is not rerun a sixth time.
+        # The final signal can only use a candidate produced by the fifth/deep
+        # pass. Earlier passes continue to inform Brain state and can keep ticks
+        # warm, but they cannot directly become the final signal.
         await asyncio.sleep(max(0,signal_at-time.time()))
         sent=False
+
+        final_candidates=[
+            x for x in candidate_pool.values()
+            if int(x.get("qualified_pass") or 0)==5
+        ]
         ranked_pool=sorted(
-            candidate_pool.values(),
+            final_candidates,
             key=lambda x:(
                 int(x.get("confidence") or 0),
                 float(x.get("strategy_margin") or 0),
@@ -2300,14 +2342,16 @@ async def cycle_loop():
             reverse=True
         )
         log.info(
-            "PREFETCH_POOL_READY cycle=%s candidates=%d signal_lead=%ss",
-            cycle_id,len(ranked_pool),int(signal_lead)
+            "PREFETCH_POOL_READY cycle=%s candidates=%d final_pass_candidates=%d signal_lead=%ss",
+            cycle_id,len(candidate_pool),len(ranked_pool),int(signal_lead)
         )
 
         if time.time()<=signal_at+0.20:
             for candidate in ranked_pool:
                 try:
-                    sent=await send_cycle_signal(candidate,target,signal_lead)
+                    sent=await send_cycle_signal(
+                        candidate,target,signal_lead,cycle_id
+                    )
                 except Exception as e:
                     log.exception(
                         "FINAL_SIGNAL_BUILD_FAILED cycle=%s pair=%s type=%s message=%s",
@@ -2321,7 +2365,7 @@ async def cycle_loop():
         if not sent:
             if ranked_pool:
                 log.info(
-                    "FIVE_SCAN_NO_VALID_SIGNAL cycle=%s candidates=%d "
+                    "FIVE_SCAN_NO_VALID_SIGNAL cycle=%s candidates=%s "
                     "signal_utc=%s now_utc=%s",
                     cycle_id,len(ranked_pool),
                     time.strftime("%H:%M:%S",time.gmtime(signal_at)),
@@ -2333,9 +2377,9 @@ async def cycle_loop():
                     cycle_id,len(STATE["analyses"])
                 )
 
-        # Roll immediately into preparation of the next target. Result tracking
-        # is independent and therefore cannot block this scheduler.
-
+        # Immediately iterate to the next 10-minute target. Because the first
+        # scan of the next target is 10m30s before that target, it becomes
+        # runnable immediately after the current 30s/40s signal boundary.
 async def audit_outbound_network():
     """
     Record the actual public egress identity used by the Render process.
