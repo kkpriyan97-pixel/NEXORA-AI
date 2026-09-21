@@ -79,10 +79,21 @@ def _content_json(content:Any)->dict[str,Any]:
 
 async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
     request=build_ai_request(snapshot)
-    prompt=("You are Candice Brain. Analyze only supplied live OHLC/market evidence. "
-            "Do not invent data. Return a single JSON object only with direction UP or DOWN, "
-            "confidence 0-100, and reason. This is DEMO read-only; never trade.\n"+
-            json.dumps(request,ensure_ascii=False,separators=(",",":")))
+    is_verifier=bool(getattr(snapshot,"technical_context",None))
+    if is_verifier:
+        prompt=("You are the independent verification layer for Candice Brain. "
+                "The local Brain already produced the candidate shown in technical_context. "
+                "Independently validate that exact candidate using only the supplied closed-candle "
+                "OHLC and technical evidence. Do not simply echo it. A contradictory direction "
+                "must be returned when the evidence supports the opposite direction; do not invent "
+                "missing data. Return one JSON object only with direction UP or DOWN, confidence "
+                "0-100, and a short reason. This is DEMO read-only; never trade.\n"+
+                json.dumps(request,ensure_ascii=False,separators=(",",":")))
+    else:
+        prompt=("You are Candice Brain. Analyze only supplied live OHLC/market evidence. "
+                "Do not invent data. Return a single JSON object only with direction UP or DOWN, "
+                "confidence 0-100, and reason. This is DEMO read-only; never trade.\n"+
+                json.dumps(request,ensure_ascii=False,separators=(",",":")))
     last=None
     http_timeout=min(3.0,max(1.5,float(os.getenv("AI_HTTP_TIMEOUT","2.0"))))
     connect_timeout=min(1.0,http_timeout)
