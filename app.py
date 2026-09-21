@@ -2169,23 +2169,19 @@ async def cycle_loop():
         asyncio.create_task(result_watch(key))
         return True
 
-    first_cycle=True
     cycle_sequence=0
+    target=None
 
     while True:
         now=time.time()
-        target=(int(now)//int(SIGNAL_INTERVAL)+1)*int(SIGNAL_INTERVAL)
-        signal_at=target-30.0
-
-        if first_cycle:
-            # On process startup, wait until the first analysis point for the
-            # upcoming 10-minute target. After that, each new cycle starts as
-            # soon as the previous signal is delivered.
-            first_cycle=False
-            try:
-                probe_sequence=max(1,cycle_sequence+1)
-            except Exception:
-                probe_sequence=1
+        if target is None:
+            # On process startup, align to the next exact 10-minute boundary.
+            target=(int(now)//int(SIGNAL_INTERVAL)+1)*int(SIGNAL_INTERVAL)
+        else:
+            # After the current signal is delivered, advance exactly one
+            # 10-minute target. This prevents the scheduler from repeating the
+            # same boundary while time is still before the target itself.
+            target += SIGNAL_INTERVAL
         cycle_id=int(target//SIGNAL_INTERVAL)
 
         # The 30s/40s lead remains in 10-cycle blocks. Use the cycle id so a
