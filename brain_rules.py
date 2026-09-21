@@ -91,16 +91,31 @@ class BrainState:
             return False
         return True
 
-    def filter_candidates(self,assets,now=None):
-        now=utc_now() if now is None else now
-        if self.is_account_cooldown(now): return []
+    def filter_candidates(self,assets):
+        """Return assets the Brain is allowed to analyze.
+        Cooldowns are signal-delivery controls, not analysis controls.
+        The Brain must keep reading every usable account asset during cooldown.
+        """
         return [a for a in assets if a.get("pair") and not a.get("locked")
-                and not a.get("locked_trading") and not a.get("disabled")
-                and not self.is_in_cooldown(str(a["pair"]),now)]
+                and not a.get("locked_trading") and not a.get("disabled")]
 
-    def can_send_cycle_signal(self,account_id=None):
-        if self.is_account_cooldown(): return False
-        if account_id is not None and self.learning_account_id is not None and int(account_id)!=int(self.learning_account_id): return False
+    def is_signal_blocked(self,pair=None,account_id=None,now=None):
+        """Apply account/pair cooldowns only at the signal-delivery boundary."""
+        now=utc_now() if now is None else float(now)
+        if self.is_account_cooldown(now):
+            return True
+        if pair and self.is_in_cooldown(str(pair),now):
+            return True
+        if account_id is not None and self.learning_account_id is not None:
+            try:
+                if int(account_id)!=int(self.learning_account_id):
+                    return True
+            except (TypeError,ValueError):
+                return True
+        return False
+
+    def can_send_cycle_signal(self,account_id=None,pair=None):
+        if self.is_signal_blocked(pair=pair,account_id=account_id): return False
         return not self.cycle_signal_sent
 
     def duplicate_key(self,pair,entry_candle_ts):
@@ -110,8 +125,8 @@ class BrainState:
         return self.duplicate_key(pair,entry_candle_ts) in self.sent_keys
 
     def mark_signal_sent(self,**kw):
-        if not self.can_send_cycle_signal(kw.get("account_id")):
-            raise RuntimeError("Final signal already sent for cycle")
+        if not self.can_send_cycle_signal(kw.get("account_id"),kw.get("pair")):
+            raise RuntimeError("Signal delivery blocked by cooldown/account/duplicate gate")
         if int(kw.get("confidence",0)) < MIN_CONFIDENCE:
             raise ValueError("Confidence below 90")
         key=self.duplicate_key(kw["pair"],kw["entry_candle_ts"])
