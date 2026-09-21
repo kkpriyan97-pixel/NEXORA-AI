@@ -786,35 +786,6 @@ async def member_access_active(telegram_id):
 def uae_time(ts):
     return datetime.fromtimestamp(float(ts),tz=UAE_TZ).strftime("%H:%M:%S")
 
-# Operational throughput target for DEMO signal generation. This is a target,
-# not a forced-signal quota: weak setups are never manufactured just to hit it.
-DAILY_SIGNAL_TARGET=150
-DAILY_SIGNAL_TARGET_SECONDS=86400.0
-DAILY_SIGNAL_TARGET_STATE={"date":"","sent":0}
-
-def daily_signal_target_snapshot(now=None):
-    now=float(time.time() if now is None else now)
-    day=datetime.fromtimestamp(now,tz=UAE_TZ).strftime("%Y-%m-%d")
-    if DAILY_SIGNAL_TARGET_STATE.get("date")!=day:
-        DAILY_SIGNAL_TARGET_STATE["date"]=day
-        DAILY_SIGNAL_TARGET_STATE["sent"]=0
-    sent=int(DAILY_SIGNAL_TARGET_STATE.get("sent") or 0)
-    elapsed=datetime.fromtimestamp(now,tz=UAE_TZ).hour*3600+datetime.fromtimestamp(now,tz=UAE_TZ).minute*60+datetime.fromtimestamp(now,tz=UAE_TZ).second
-    expected=DAILY_SIGNAL_TARGET*(elapsed/DAILY_SIGNAL_TARGET_SECONDS)
-    return {
-        "date":day,
-        "sent":sent,
-        "target":DAILY_SIGNAL_TARGET,
-        "remaining":max(0,DAILY_SIGNAL_TARGET-sent),
-        "pace_expected":round(expected,1),
-        "ahead_by":round(sent-expected,1),
-    }
-
-def record_daily_signal_target_sent(now=None):
-    snap=daily_signal_target_snapshot(now)
-    DAILY_SIGNAL_TARGET_STATE["sent"]=int(snap["sent"])+1
-    return daily_signal_target_snapshot(now)
-
 STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"network":{},"read_only":True,"cycle":0,"last_cycle":None,"account_id":None,"account_group":"demo","feed_source":"authenticated_websocket"}
 CANDLE_FETCH_SEM=asyncio.Semaphore(8)
 CANDLE_FETCH_LAST={}
@@ -1380,6 +1351,7 @@ async def telegram(text, chat_id=None):
 async def send_learning_summary(summary):
     if not summary:
         return
+    research=summary.get("research_progress") or {}
     lines=[
         "📚 CANDICE BRAIN • 10-SIGNAL LEARNING SUMMARY",
         "",
@@ -1389,6 +1361,10 @@ async def send_learning_summary(summary):
         f"🔴 LOSS → {summary.get('losses',0)}",
         f"🟡 TIE → {summary.get('ties',0)}",
         f"📈 Win Rate → {summary.get('win_rate',0):.1f}%",
+        "",
+        f"🌐 WEB RESEARCH → Day {research.get('day',1)}/{research.get('target_days',15)}",
+        f"📖 Topic → {research.get('topic','microstructure_and_noise')}",
+        f"🎯 15-Day Target → {'REACHED' if research.get('target_complete') else 'IN PROGRESS'}",
         "",
         "🧠 BRAIN STRATEGY RESULTS"
     ]
@@ -2459,9 +2435,11 @@ async def result_watch(key):
     await save_persistent_learning()
     batch_summary=BRAIN.consume_batch_summary()
     if batch_summary:
-        log.info("LEARNING_10_SIGNAL_SUMMARY batch=%s wins=%s losses=%s ties=%s cooldown_seconds=%s account_id=%s",
+        rp=batch_summary.get("research_progress") or {}
+        log.info("LEARNING_10_SIGNAL_SUMMARY batch=%s wins=%s losses=%s ties=%s cooldown_seconds=%s account_id=%s research_day=%s/%s research_topic=%s",
                  batch_summary.get("batch_no"),batch_summary.get("wins"),batch_summary.get("losses"),
-                 batch_summary.get("ties"),batch_summary.get("cooldown_seconds"),batch_summary.get("account_id"))
+                 batch_summary.get("ties"),batch_summary.get("cooldown_seconds"),batch_summary.get("account_id"),
+                 rp.get("day",1),rp.get("target_days",15),rp.get("topic",""))
         await send_learning_summary(batch_summary)
     label=rec["display_name"]
     direction_icon="⬆️" if rec["direction"]=="UP" else "⬇️"
