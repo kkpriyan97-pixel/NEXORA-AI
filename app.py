@@ -2985,7 +2985,8 @@ async def cycle_loop():
                                 "SCAN_CANDIDATE_SELECTED cycle=%s scan=SCAN_%s pass=%s pair=%s "
                                 "confidence=%s strategy=%s expiry=%s pool=%s deep=%s",
                                 cycle_id,pass_no,pass_no,item.get("pair"),
-                                item.get("confidence"),1,len(candidate_pool),pass_no==5
+                                item.get("confidence"),item.get("strategy"),item.get("expiry_minutes"),
+                                len(candidate_pool),pass_no==5
                             )
                 elif candidate is None:
                     log.info(
