@@ -7,7 +7,7 @@ from typing import Any
 
 COOLDOWN_SECONDS = 600
 MIN_CONFIDENCE = 90
-CYCLE_SECONDS = 300
+CYCLE_SECONDS = 180
 EXPIRIES = (1, 2, 3, 4, 5, 10, 15)
 
 def utc_now():
@@ -356,7 +356,8 @@ class BrainState:
         }
         self.learn(rec)
         if result=="LOSS":
-            self.cooldown_until[s.pair]=now+COOLDOWN_SECONDS
+            cooldown_until=now+COOLDOWN_SECONDS
+            self.cooldown_until[s.pair]=cooldown_until
         self.last_result=rec
         return rec
 
