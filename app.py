@@ -3228,6 +3228,14 @@ async def health(reader,writer):
         body=await reader.readexactly(content_length) if content_length else b""
 
         webhook_secret=os.getenv("TELEGRAM_WEBHOOK_SECRET","").strip()
+        if path == "/ping":
+            # Ultra-lightweight keepalive endpoint. It must never trigger
+            # market scans, AI review, Telegram delivery, or signal cycles.
+            payload=b'{"status":"ok","service":"CANDICE-AI"}'
+            writer.write(b"HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nContent-Length: "+str(len(payload)).encode()+b"\\r\\nCache-Control: no-store\\r\\nConnection: close\\r\\n\\r\\n"+payload)
+            await writer.drain()
+            log.info("PING_REQUEST status=200")
+            return
         if path.startswith("/health"):
             body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"account_id":STATE.get("account_id"),"account_group":STATE.get("account_group"),"feed_source":STATE.get("feed_source"),"network":STATE.get("network",{})}).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "+str(len(body_out)).encode()+b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
