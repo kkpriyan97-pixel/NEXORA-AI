@@ -785,6 +785,36 @@ async def member_access_active(telegram_id):
 
 def uae_time(ts):
     return datetime.fromtimestamp(float(ts),tz=UAE_TZ).strftime("%H:%M:%S")
+
+# Operational throughput target for DEMO signal generation. This is a target,
+# not a forced-signal quota: weak setups are never manufactured just to hit it.
+DAILY_SIGNAL_TARGET=150
+DAILY_SIGNAL_TARGET_SECONDS=86400.0
+DAILY_SIGNAL_TARGET_STATE={"date":"","sent":0}
+
+def daily_signal_target_snapshot(now=None):
+    now=float(time.time() if now is None else now)
+    day=datetime.fromtimestamp(now,tz=UAE_TZ).strftime("%Y-%m-%d")
+    if DAILY_SIGNAL_TARGET_STATE.get("date")!=day:
+        DAILY_SIGNAL_TARGET_STATE["date"]=day
+        DAILY_SIGNAL_TARGET_STATE["sent"]=0
+    sent=int(DAILY_SIGNAL_TARGET_STATE.get("sent") or 0)
+    elapsed=datetime.fromtimestamp(now,tz=UAE_TZ).hour*3600+datetime.fromtimestamp(now,tz=UAE_TZ).minute*60+datetime.fromtimestamp(now,tz=UAE_TZ).second
+    expected=DAILY_SIGNAL_TARGET*(elapsed/DAILY_SIGNAL_TARGET_SECONDS)
+    return {
+        "date":day,
+        "sent":sent,
+        "target":DAILY_SIGNAL_TARGET,
+        "remaining":max(0,DAILY_SIGNAL_TARGET-sent),
+        "pace_expected":round(expected,1),
+        "ahead_by":round(sent-expected,1),
+    }
+
+def record_daily_signal_target_sent(now=None):
+    snap=daily_signal_target_snapshot(now)
+    DAILY_SIGNAL_TARGET_STATE["sent"]=int(snap["sent"])+1
+    return daily_signal_target_snapshot(now)
+
 STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"network":{},"read_only":True,"cycle":0,"last_cycle":None,"account_id":None,"account_group":"demo","feed_source":"authenticated_websocket"}
 CANDLE_FETCH_SEM=asyncio.Semaphore(8)
 CANDLE_FETCH_LAST={}
@@ -1973,7 +2003,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
             "FINAL_RECOVERY_START seeds=%d deep=%s require_live=%s",
             len(seed_list),deep_analysis,require_live_price
         )
-        for seed in seed_list[:8]:
+        for seed in seed_list[:20]:
             pair=str(seed.get("pair"))
             if pair in recovery_seen:
                 continue
@@ -2047,7 +2077,10 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     # a fresh slot at that instant. Rank the closed-candle candidates first,
     # review them, then refresh live quotes one candidate at a time in ranked
     # order until one has a genuinely fresh authenticated tick.
-    top=raw[:(8 if deep_analysis else 5)]
+    # Keep the final pass broad enough to preserve the 150/day operational
+    # target without relaxing the Brain quality threshold. The final delivery
+    # gate will still reject weak candidates and fall through to the next asset.
+    top=raw[:(20 if deep_analysis else 5)]
     if require_live_price:
         log.info(            "LIVE_PRICE_SELECTION_MODE source=authenticated_event1 candidates=%d deep=%s",
             len(top),deep_analysis)
