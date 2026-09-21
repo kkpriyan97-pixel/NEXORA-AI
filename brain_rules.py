@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Any
+from research_brain import research_status, TARGET_DAYS as RESEARCH_TARGET_DAYS
 
 COOLDOWN_SECONDS = 600
 MIN_CONFIDENCE = 90
@@ -64,6 +65,11 @@ class BrainState:
     # Post-result AI lessons are stored separately from raw outcome statistics.
     post_result_lessons:dict[str,dict[str,Any]]=field(default_factory=dict)
     last_ai_review:dict[str,Any]|None=None
+    # Fifteen-day research target. This is a learning horizon, not a signal quota.
+    research_start_ts:float|None=None
+    research_day:int=1
+    research_target_days:int=RESEARCH_TARGET_DAYS
+    research_observations:int=0
 
     def bind_learning_account(self,account_id):
         try: account_id=int(account_id) if account_id is not None else None
@@ -72,6 +78,13 @@ class BrainState:
             self.learning_account_id=account_id
             self.batch_results.clear(); self.last_batch_summary=None
             self.account_cooldown_until=0.0; self.learning_batch_no=0
+            self.research_start_ts=utc_now(); self.research_day=1; self.research_observations=0
+
+    def research_progress(self, now=None):
+        now=utc_now() if now is None else float(now)
+        snap=research_status(self.research_start_ts,now)
+        self.research_day=int(snap.get("day",1) or 1)
+        return {**snap,"observations":int(self.research_observations),"days_remaining":max(0,int(self.research_target_days)-int(snap.get("day",1) or 1)),"target_complete":int(snap.get("day",1) or 1)>=int(self.research_target_days)}
 
     def is_account_cooldown(self,now=None):
         now=utc_now() if now is None else float(now)
@@ -176,6 +189,7 @@ class BrainState:
         except (TypeError,ValueError): rec_account=None
         if self.learning_account_id is None or rec_account != int(self.learning_account_id): return
         self.batch_results.append(dict(rec)); self.batch_results=self.batch_results[-10:]
+        if self.research_start_ts is None: self.research_start_ts=utc_now()
         # Exponential recency weighting without retaining raw candle history.
         weight=max(0.25,0.985 ** min(self.total_results,200))
         self._record_bucket(self._bucket(self.asset_stats,pair),result,weight)
@@ -203,6 +217,8 @@ class BrainState:
         indicator_key=f"DC:{dc_state}:{dc_exp}|ST:{st_zone}:{st_cross}"
         self._record_bucket(self._bucket(self.indicator_stats,indicator_key),result,weight)
         self.total_results+=1
+        self.research_observations+=1
+        research_progress=self.research_progress()
 
         if len(self.batch_results) >= 10:
             self.learning_batch_no += 1
@@ -248,7 +264,7 @@ class BrainState:
                 "signals":10,"wins":wins,"losses":losses,"ties":ties,
                 "win_rate":round(100*wins/10,1),"strategies":strategies,
                 "self_strategies":self_strategies,"expiries":expiries,
-                "assets":assets,"indicator_contexts":indicator_contexts,"lessons":lessons,"details":[{"pair":r.get("pair"),"direction":r.get("direction"),"strategy":r.get("strategy"),"self_strategy":r.get("self_strategy"),"expiry":r.get("expiry_minutes"),"confidence":r.get("confidence"),"result":r.get("result")} for r in batch],"cooldown_seconds":COOLDOWN_SECONDS
+                "assets":assets,"indicator_contexts":indicator_contexts,"lessons":lessons,"details":[{"pair":r.get("pair"),"direction":r.get("direction"),"strategy":r.get("strategy"),"self_strategy":r.get("self_strategy"),"expiry":r.get("expiry_minutes"),"confidence":r.get("confidence"),"result":r.get("result")} for r in batch],"cooldown_seconds":COOLDOWN_SECONDS,"research_progress":research_progress
             }
             # Learning summaries must never create an account-wide delivery pause.
             # Keep the field for backward-compatible persistence, but it is no longer
@@ -567,6 +583,10 @@ class BrainState:
             "indicator_stats": self.indicator_stats,
             "post_result_lessons": self.post_result_lessons,
             "last_ai_review": self.last_ai_review,
+            "research_start_ts": self.research_start_ts,
+            "research_day": self.research_day,
+            "research_target_days": self.research_target_days,
+            "research_observations": self.research_observations,
         }
 
     def import_learning(self, data):
@@ -591,6 +611,10 @@ class BrainState:
         self.indicator_stats=dict(data.get("indicator_stats") or {})
         self.post_result_lessons=dict(data.get("post_result_lessons") or {})
         self.last_ai_review=dict(data.get("last_ai_review") or {}) if data.get("last_ai_review") else None
+        self.research_start_ts=float(data.get("research_start_ts")) if data.get("research_start_ts") is not None else None
+        self.research_day=int(data.get("research_day",1) or 1)
+        self.research_target_days=int(data.get("research_target_days",RESEARCH_TARGET_DAYS) or RESEARCH_TARGET_DAYS)
+        self.research_observations=int(data.get("research_observations",0) or 0)
 
     def prune_expired_cooldowns(self,now=None):
         now=utc_now() if now is None else now
