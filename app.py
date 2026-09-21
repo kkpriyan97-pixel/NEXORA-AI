@@ -2490,6 +2490,7 @@ async def cycle_loop():
             return False
 
         p=candidate["pair"]
+        expected=str(candidate.get("direction") or "").upper()
         now=time.time()
 
         # Keep the final quote fresh without turning a transient rotating-tick
