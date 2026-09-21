@@ -2012,29 +2012,17 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         if len(closed)<45:
             return None
 
-        # Build multi-timeframe evidence before AI verification so the external
-        # verifier sees the exact frame-by-frame context. The 5s view is allowed
-        # to be incomplete here; once the candidate is selected it is pinned so
-        # real ticks can accumulate before the final boundary.
+        # Multi-timeframe confirmation is a FINAL delivery gate, not a
+        # candidate-discovery gate. Brain + AI must be allowed to rank multiple
+        # assets first. At the exact signal boundary we check 30s + 2m on the
+        # top candidate; if it fails, send_cycle_signal() immediately checks the
+        # next ranked asset. This prevents one asset's late confirmation failure
+        # from suppressing the whole cycle.
         cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
         mtf=build_multi_timeframe_context(x["pair"],closed,time.time())
         x["multi_timeframe"]=mtf
-        mtf_ok,mtf_diag=multi_timeframe_confirmation(mtf,x.get("direction"))
-        x["multi_timeframe_confirmed"]=bool(mtf_ok)
-        x["multi_timeframe_diagnostic"]=mtf_diag
-        if not mtf_ok and mtf_diag.get("reason")!="5s_insufficient":
-            log.info(
-                "MULTI_TF_GATE_REJECTED pair=%s direction=%s reason=%s diagnostic=%s",
-                x.get("pair"),x.get("direction"),mtf_diag.get("reason"),mtf_diag
-            )
-            CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
-            return None
-        if not mtf_ok and mtf_diag.get("reason")=="5s_insufficient":
-            log.info(
-                "MULTI_TF_WAIT_5S pair=%s direction=%s bars=%s",
-                x.get("pair"),x.get("direction"),mtf_diag.get("bars",0)
-            )
-
+        x["multi_timeframe_confirmed"]=False
+        x["multi_timeframe_diagnostic"]={"reason":"FINAL_ONLY"}
         # The local Candice Brain remains the primary technical engine, but a
         # qualified candidate must now receive a real external AI verification
         # pass when time permits. The verifier gets the same closed-candle
@@ -2462,24 +2450,53 @@ async def cycle_loop():
             )
             return False
 
-        # Final live re-check: 5s + every requested 1m..15m frame must still
-        # agree before the user-facing signal is released.
+        # LAST-SECOND CONFIRMATION ONLY:
+        # Candice Brain + AI rank the assets first. Only now, immediately before
+        # delivery, confirm the requested closed 30s and 2m candle conditions.
+        # 2m confirmation includes trend + candle body + transaction volume.
+        # If this asset fails, the caller immediately tries the next ranked asset
+        # inside the same 30-second delivery window.
         final_mtf=build_multi_timeframe_context(
             p,STATE["candles"].get(p,[]),time.time(),candidate.get("direction")
         )
-        final_mtf_ok,final_mtf_diag=multi_timeframe_confirmation(
-            final_mtf,candidate.get("direction")
-        )
-        if not final_mtf_ok:
+        frames=final_mtf.get("frames") or {}
+        thirty=frames.get("30s") or {}
+        two=(frames.get("2m") or {}).get("candle_confirmation") or {}
+        expected=str(candidate.get("direction") or "").upper()
+        final_mtf_diag={
+            "30s":thirty.get("direction","NEUTRAL"),
+            "30s_bars":thirty.get("bars",0),
+            "2m":two.get("direction","NEUTRAL"),
+            "2m_same_direction_candles":two.get("same_direction_candles",0),
+            "2m_candle_direction":two.get("candle_direction","NEUTRAL"),
+            "2m_body_ratio":two.get("body_ratio",0),
+            "2m_volume_ratio":two.get("volume_ratio",0),
+            "2m_volume_available":two.get("volume_available",False),
+        }
+        confirm_reason=None
+        if thirty.get("status")!="READY":
+            confirm_reason="30s_confirmation_insufficient"
+        elif thirty.get("direction")!=expected:
+            confirm_reason="30s_candle_trend_conflict"
+        elif two.get("status")!="READY":
+            confirm_reason="2m_confirmation_insufficient"
+        elif two.get("direction")!=expected:
+            confirm_reason="2m_candle_trend_conflict"
+        elif not two.get("trend_ok") or not two.get("candle_ok"):
+            confirm_reason="2m_candle_strength_insufficient"
+        elif not two.get("volume_ok"):
+            confirm_reason="2m_volume_confirmation_failed"
+
+        if confirm_reason:
             log.info(
-                "FINAL_MULTI_TF_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s",
-                cycle_id,p,candidate.get("direction"),
-                final_mtf_diag.get("reason"),final_mtf_diag
+                "FINAL_30S_2M_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
+                cycle_id,p,expected,confirm_reason,final_mtf_diag
             )
             return False
+
         log.info(
-            "FINAL_MULTI_TF_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
-            cycle_id,p,candidate.get("direction"),final_mtf_diag
+            "FINAL_30S_2M_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
+            cycle_id,p,expected,final_mtf_diag
         )
 
         confidence=int(candidate.get("confidence") or 0)
