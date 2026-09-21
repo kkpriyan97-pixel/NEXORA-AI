@@ -1659,6 +1659,7 @@ def _aggregate_closed_minutes(candles,minutes,reference_ts):
             "high":max(float(x.get("high",x.get("h"))) for x in g),
             "low":min(float(x.get("low",x.get("l"))) for x in g),
             "close":float(g[-1].get("close",g[-1].get("c"))),
+            "volume":sum(float(x.get("volume",x.get("v",0)) or 0) for x in g),
         })
     return out
 
@@ -1709,8 +1710,116 @@ def _frame_bias(bars):
         direction="NEUTRAL"
     return {"status":"READY","direction":direction,"bars":len(bars),"strength":round(strength,3)}
 
-def build_multi_timeframe_context(pair,candles,reference_ts=None):
-    """Analyze 5s + every complete 1m..15m frame without altering Brain strategy."""
+def _indicator_confirmation_2m(bars,expected):
+    """Strict 2m confirmation: direction + core indicators + candle/volume."""
+    expected=str(expected or "").upper()
+    if expected not in {"UP","DOWN"} or len(bars)<35:
+        return {"status":"INSUFFICIENT","direction":"NEUTRAL","reason":"2m_bars_insufficient"}
+
+    closes=[float(x["close"]) for x in bars]
+    opens=[float(x["open"]) for x in bars]
+    highs=[float(x["high"]) for x in bars]
+    lows=[float(x["low"]) for x in bars]
+
+    def ema_local(values,n):
+        k=2.0/(n+1.0)
+        e=values[0]
+        for v in values[1:]:
+            e=v*k+e*(1-k)
+        return e
+
+    def rsi_local(values,n=14):
+        if len(values)<n+1:return 50.0
+        gains=[];losses=[]
+        for a,b in zip(values[-n-1:-1],values[-n:]):
+            d=b-a;gains.append(max(d,0));losses.append(max(-d,0))
+        ag=sum(gains)/n;al=sum(losses)/n
+        return 100.0 if al<=1e-12 else 100.0-(100.0/(1.0+ag/al))
+
+    def stoch_local():
+        if len(bars)<20:return 50.0,50.0
+        raw=[]
+        for i in range(14,len(bars)+1):
+            w=bars[i-14:i];hi=max(float(x["high"]) for x in w);lo=min(float(x["low"]) for x in w)
+            raw.append(100.0*(float(bars[i-1]["close"])-lo)/max(hi-lo,1e-12))
+        smooth=[sum(raw[i-3:i])/3.0 for i in range(3,len(raw)+1)]
+        k=smooth[-1];d=sum(smooth[-3:])/min(3,len(smooth))
+        return k,d
+
+    e9=ema_local(closes[-40:],9);e21=ema_local(closes[-40:],21)
+    rr=rsi_local(closes)
+    sk,sd=stoch_local()
+    last=bars[-1];body=float(last["close"])-float(last["open"])
+    rng=max(float(last["high"])-float(last["low"]),1e-12)
+    body_ratio=min(1.0,abs(body)/rng)
+
+    bb_n=30
+    bb_mid=sum(closes[-bb_n:])/bb_n
+    bb_var=sum((x-bb_mid)**2 for x in closes[-bb_n:])/bb_n
+    bb_sd=bb_var**0.5
+    bb_upper=bb_mid+2.2*bb_sd;bb_lower=bb_mid-2.2*bb_sd
+    bb_signal="UP" if closes[-1]>=bb_mid else "DOWN"
+
+    prior_high=max(highs[-31:-1]);prior_low=min(lows[-31:-1])
+    dc_state="BREAKOUT_UP" if closes[-1]>prior_high else "BREAKOUT_DOWN" if closes[-1]<prior_low else "INSIDE"
+    dc_signal="UP" if closes[-1]>=((prior_high+prior_low)/2.0) else "DOWN"
+
+    candle_direction="UP" if body>0 else "DOWN" if body<0 else "NEUTRAL"
+    volume_values=[float(x.get("volume",0) or 0) for x in bars[-12:]]
+    current_volume=volume_values[-1]
+    prior_volumes=volume_values[:-1]
+    avg_volume=(sum(prior_volumes)/len(prior_volumes)) if prior_volumes else 0.0
+    volume_available=current_volume>0 and avg_volume>0
+    volume_ratio=(current_volume/avg_volume) if avg_volume>0 else 0.0
+
+    if expected=="UP":
+        checks={
+            "ema":e9>e21 and closes[-1]>=e9,
+            "rsi":50.0<rr<75.0,
+            "stochastic":sk>sd and sk>=50.0,
+            "bollinger":bb_signal=="UP",
+            "donchian":dc_state=="BREAKOUT_UP" or dc_signal=="UP",
+            "candle":candle_direction=="UP" and body_ratio>=0.45,
+        }
+    else:
+        checks={
+            "ema":e9<e21 and closes[-1]<=e9,
+            "rsi":25.0<rr<50.0,
+            "stochastic":sk<sd and sk<=50.0,
+            "bollinger":bb_signal=="DOWN",
+            "donchian":dc_state=="BREAKOUT_DOWN" or dc_signal=="DOWN",
+            "candle":candle_direction=="DOWN" and body_ratio>=0.45,
+        }
+
+    # Transaction volume is a hard confirmation, not a cosmetic score.
+    volume_ok=volume_available and volume_ratio>=1.00
+    checks["volume"]=volume_ok
+    passed=sum(1 for v in checks.values() if v)
+    direction_ok=all(checks.values())
+
+    return {
+        "status":"READY",
+        "direction":expected if direction_ok else "NEUTRAL",
+        "all_indicators":checks,
+        "passed":passed,
+        "required":len(checks),
+        "volume":current_volume,
+        "avg_volume":avg_volume,
+        "volume_ratio":round(volume_ratio,3),
+        "volume_available":volume_available,
+        "rsi":round(rr,2),
+        "stoch_k":round(sk,2),
+        "stoch_d":round(sd,2),
+        "ema9":e9,
+        "ema21":e21,
+        "bb_signal":bb_signal,
+        "donchian":dc_state,
+        "candle":candle_direction,
+        "body_ratio":round(body_ratio,3),
+    }
+
+def build_multi_timeframe_context(pair,candles,reference_ts=None,expected=None):
+    """Analyze 30s microstructure + 2m full indicator/volume confirmation + existing 1m..15m frames."""
     reference=time.time() if reference_ts is None else float(reference_ts)
     frames={}
     tick5=_aggregate_closed_5s_ticks(pair,reference)
@@ -1718,11 +1827,30 @@ def build_multi_timeframe_context(pair,candles,reference_ts=None):
     frames["5s"]["bars"]=len(tick5)
     source_5s="ticks"
 
+    tick_items=list(TICK_HISTORY.get(pair,()))
+    tick30=[]
+    cutoff=reference-180.0
+    groups={}
+    for received,price in tick_items:
+        if cutoff<received<reference:
+            bucket=int(received//30)*30
+            groups.setdefault(bucket,[]).append(float(price))
+    for bucket in sorted(groups):
+        prices=groups[bucket]
+        if bucket+30>reference or not prices: continue
+        tick30.append({"time":bucket,"open":prices[0],"high":max(prices),"low":min(prices),"close":prices[-1],"volume":len(prices)})
+    frames["30s"]=_frame_bias(tick30)
+    frames["30s"]["bars"]=len(tick30)
+    frames["30s"]["transaction_count"]=len(tick_items)
+
     closed=list(candles or [])
     for minutes in range(1,16):
         bars=_aggregate_closed_minutes(closed,minutes,reference)
         frames[f"{minutes}m"]=_frame_bias(bars)
-        frames[f"{minutes}m"]["bars"]=len(bars)
+
+    if expected in {"UP","DOWN"}:
+        bars2=_aggregate_closed_minutes(closed,2,reference)
+        frames["2m"]["indicator_confirmation"]=_indicator_confirmation_2m(bars2,expected)
 
     return {
         "frames":frames,
@@ -1738,6 +1866,31 @@ def multi_timeframe_confirmation(context,expected):
         return False,{"reason":"invalid_direction"}
 
     five=frames.get("5s",{})
+    thirty=frames.get("30s",{})
+    two=frames.get("2m",{}).get("indicator_confirmation") or {}
+
+    # New DEMO 1-minute confirmation gate:
+    # 30s direction must agree, and the completed 2m candle must have every
+    # configured core indicator + candle direction + transaction volume aligned.
+    if thirty.get("status")!="READY":
+        return False,{"reason":"30s_confirmation_insufficient","bars":thirty.get("bars",0)}
+    if thirty.get("direction")!=expected:
+        return False,{"reason":"30s_direction_conflict","direction":thirty.get("direction","NEUTRAL")}
+    if two.get("status")!="READY":
+        return False,{"reason":"2m_confirmation_insufficient"}
+    if two.get("direction")!=expected or not all((two.get("all_indicators") or {}).values()):
+        return False,{
+            "reason":"2m_indicator_confirmation_failed",
+            "direction":two.get("direction","NEUTRAL"),
+            "passed":two.get("passed",0),
+            "required":two.get("required",0),
+            "volume_ratio":two.get("volume_ratio",0),
+            "indicators":two.get("all_indicators",{}),
+        }
+
+    # 5s remains diagnostic microstructure; it is not promoted to a hard veto.
+    # This preserves the earlier structural fix where a brief 5s reversal cannot
+    # erase a confirmed 1m/2m setup.
     # 5s is microstructure context, not a hard veto on the Candice Brain.
     # A brief 5s reversal must not erase an otherwise valid 1m..15m setup.
     five_status=five.get("status")
@@ -1772,6 +1925,11 @@ def multi_timeframe_confirmation(context,expected):
 
     return True,{
         "reason":"multi_timeframe_confirmed",
+        "30s":thirty.get("direction","NEUTRAL"),
+        "30s_bars":thirty.get("bars",0),
+        "2m_indicators":two.get("all_indicators",{}),
+        "2m_volume_ratio":two.get("volume_ratio",0),
+        "2m_volume_available":two.get("volume_available",False),
         "5s":five_direction,
         "5s_warning":five_warning,
         "short_align":short_align,
@@ -2369,7 +2527,7 @@ async def cycle_loop():
         # Final live re-check: 5s + every requested 1m..15m frame must still
         # agree before the user-facing signal is released.
         final_mtf=build_multi_timeframe_context(
-            p,STATE["candles"].get(p,[]),time.time()
+            p,STATE["candles"].get(p,[]),time.time(),candidate.get("direction")
         )
         final_mtf_ok,final_mtf_diag=multi_timeframe_confirmation(
             final_mtf,candidate.get("direction")
