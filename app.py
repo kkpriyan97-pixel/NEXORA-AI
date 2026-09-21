@@ -522,6 +522,18 @@ async def enqueue_result_watch(watch_id,s):
                   watch_id,type(e).__name__,str(e)[:180])
         return False
 
+async def persist_result_watch_background(watch_id,s):
+    """Persist the watch outside the signal-critical path so DB latency cannot affect timing."""
+    try:
+        ok=await asyncio.wait_for(enqueue_result_watch(watch_id,s),timeout=5.0)
+        if not ok:
+            log.warning("RESULT_WATCH_BACKGROUND_PERSIST_FAILED watch_id=%s",watch_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.warning("RESULT_WATCH_BACKGROUND_PERSIST_FAILED watch_id=%s type=%s message=%s",
+                    watch_id,type(e).__name__,str(e)[:160])
+
 async def complete_result_watch(watch_id):
     if not LEARNING_DB_URL:return False
     try:
@@ -2136,13 +2148,18 @@ async def result_watch(key):
             updated_payload=_result_watch_payload(s)
             updated_payload["actual_entry_source"]=entry_source
             def _persist_entry():
+                payload=json.dumps(updated_payload,separators=(",",":"),ensure_ascii=False,default=str)
                 with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
                     with db.cursor() as cur:
                         cur.execute("""
-                            UPDATE candice_result_watch_queue
-                            SET record=%s::jsonb,updated_at=NOW(),last_error=NULL,status='PROCESSING'
-                            WHERE watch_id=%s
-                        """,(json.dumps(updated_payload,separators=(",",":"),ensure_ascii=False,default=str),watch_id))
+                            INSERT INTO candice_result_watch_queue(watch_id,record,status,last_error,updated_at)
+                            VALUES(%s,%s::jsonb,'PROCESSING',NULL,NOW())
+                            ON CONFLICT(watch_id) DO UPDATE
+                            SET record=EXCLUDED.record,
+                                updated_at=NOW(),
+                                last_error=NULL,
+                                status='PROCESSING'
+                        """,(watch_id,payload))
                     db.commit()
             await asyncio.to_thread(_persist_entry)
             log.info("RESULT_WATCH_ENTRY_PERSISTED watch_id=%s pair=%s entry=%.12g",watch_id,s.pair,s.entry_price)
@@ -2374,13 +2391,10 @@ async def cycle_loop():
         asyncio.create_task(
             telegram_background(msg,f"{s.cycle_id}:{s.pair}:{s.entry_ts}")
         )
-        try:
-            await asyncio.wait_for(enqueue_result_watch(key,s),timeout=0.20)
-        except Exception as e:
-            log.warning(
-                "RESULT_WATCH_PERSIST_BEFORE_START_FAILED watch_id=%s type=%s message=%s",
-                key,type(e).__name__,str(e)[:140]
-            )
+        # Durable result-watch persistence is deliberately asynchronous. A slow
+        # database must never consume the 30-second signal window or delay the
+        # scheduler; result_watch() remains the live source of truth.
+        asyncio.create_task(persist_result_watch_background(key,s))
         asyncio.create_task(result_watch(key))
         return True
 
