@@ -580,13 +580,10 @@ def rank_signal_candidates(candidates):
     q=[x for x in candidates if int(x.get("confidence") or 0)>=MIN_CONFIDENCE
        and str(x.get("direction","")).upper() in {"UP","DOWN"}
        and not bool(x.get("ai_learning_blocked"))
-       and not (
-           str(x.get("trend_15m") or "").upper() in {"UP","DOWN"}
-           and (
-               str(x.get("direction") or "").upper() != str(x.get("trend_15m") or "").upper()
-               or float(x.get("direction_agreement") or 0.0) < 1.0
-           )
-       )]
+       # Do not hard-block on a momentary tick-direction disagreement here.
+       # The independent pre-signal AI verifier is responsible for checking
+       # that exact live direction conflict, while this ranking layer remains
+       # permissive so a transient tick refresh cannot erase the cycle.
     return sorted(q,key=lambda x:(
         int(x.get("confidence") or 0),
         float(x.get("strategy_margin") or 0),
