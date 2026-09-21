@@ -1815,24 +1815,17 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     # candidates before spending the final 30-second window on AI review.
     # This guarantees that a stale top-ranked asset cannot block the next
     # qualified asset that has a usable live price.
+    # Pass-5 live-price handling is deliberately separated from technical
+    # ranking. A hard pre-filter on the broker's two rotating tick slots can
+    # starve a strong candidate simply because another asset happened to occupy
+    # a fresh slot at that instant. Rank the closed-candle candidates first,
+    # review them, then refresh live quotes one candidate at a time in ranked
+    # order until one has a genuinely fresh authenticated tick.
+    top=raw[:(8 if deep_analysis else 5)]
     if require_live_price:
-        live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
-        if not live_raw:
-            # Do not call the library tick-resubscription API here: the deployed
-            # OlympTrade library sends events 12/280, which the broker currently
-            # rejects with invalid_request. Use the read-only short-interval
-            # quote snapshot instead; it is timestamped locally and never
-            # fabricates a price.
-            retry_pairs=[x["pair"] for x in raw[:16]]
-            await ensure_candidate_quotes(retry_pairs)
-            live_raw=[x for x in raw if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
-            log.info("LIVE_PRICE_GUARD source=authenticated_event1 requested=%d fresh=%d",
-                     len(retry_pairs),len(live_raw))
-        if not live_raw:
-            return None
-        top=live_raw[:(8 if deep_analysis else 5)]
-    else:
-        top=raw[:(8 if deep_analysis else 5)]
+        log.info(
+            "LIVE_PRICE_SELECTION_MODE source=authenticated_event1 candidates=%d deep=%s",
+            len(top),deep_analysis)
     now=time.time()
     reviewed=[]
     async def review_one(x):
@@ -2035,9 +2028,35 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         elif r:
             reviewed.append(r)
     ranked=rank_signal_candidates(reviewed)
-    if require_live_price:
-        ranked=[x for x in ranked if has_fresh_live_price(x["pair"],time.time(),LIVE_TICK_MAX_AGE)]
-    if ranked:
+    if ranked and require_live_price:
+        # The broker only keeps a small number of event-1 tick slots active.
+        # Refresh candidates sequentially after Brain/AI qualification so a
+        # fresh quote is obtained for the actual ranked choice instead of
+        # arbitrarily filtering on whichever slot happened to be hot.
+        attempted=0
+        for candidate in ranked[:min(8,len(ranked))]:
+            attempted+=1
+            p=candidate["pair"]
+            now_live=time.time()
+            if not has_fresh_live_price(p,now_live,LIVE_TICK_MAX_AGE):
+                try:
+                    await ensure_candidate_quotes([p])
+                except Exception as e:
+                    log.warning(
+                        "FINAL_LIVE_QUOTE_REFRESH_FAILED pair=%s type=%s message=%s",
+                        p,type(e).__name__,str(e)[:120]
+                    )
+            if has_fresh_live_price(p,time.time(),LIVE_TICK_MAX_AGE):
+                log.info(
+                    "FINAL_LIVE_CANDIDATE_READY pair=%s confidence=%s attempted=%d",
+                    p,candidate.get("confidence"),attempted
+                )
+                return candidate
+        log.info(
+            "FINAL_LIVE_CANDIDATE_NONE ranked=%d attempted=%d",
+            len(ranked),attempted
+        )
+    elif ranked:
         return ranked[0]
 
     # Exact-boundary resilience: if this cycle already completed a valid Brain
