@@ -4,7 +4,9 @@ It is advisory only; candice_brain.py remains the final evidence gate.
 """
 from __future__ import annotations
 
-VERSION = "SELF-MARKET-V3"
+VERSION = "SELF-MARKET-V4"
+
+from research_brain import strategy_research_prior
 
 
 def _f(x, default=0.0):
@@ -35,6 +37,20 @@ def discover(*, trend, structure, rsi_value, momentum, atr_value,
     sk = _f(stochastic_k,50.0)
     sd = _f(stochastic_d,50.0)
     dc_exp = bool(donchian_expansion)
+
+    research_prior = strategy_research_prior(
+        trend=trend,
+        trend_persistence=tp,
+        momentum_norm=mom_norm,
+        body_ratio=br,
+        efficiency=eff,
+        breakout=bool(breakout_up or breakout_down),
+        donchian_expansion=dc_exp,
+        near_support=bool(near_support),
+        near_resistance=bool(near_resistance),
+        pattern=pattern,
+        volatility_ratio=vr,
+    )
 
     if isinstance(structure_quality, dict):
         sq = {
@@ -155,6 +171,12 @@ def discover(*, trend, structure, rsi_value, momentum, atr_value,
             vv += 4
         weights["VOLATILITY"] = vv
 
+    # Evidence-led web research is only a bounded prior. Local authenticated
+    # outcomes remain the source of truth for live adaptation.
+    for strategy, prior in research_prior.items():
+        if strategy in weights:
+            weights[strategy] += float(prior)
+
     ordered = sorted(weights.items(), key=lambda item: item[1], reverse=True)
     strategy, best = ordered[0]
     second = ordered[1][1] if len(ordered) > 1 else 0.0
@@ -172,6 +194,8 @@ def discover(*, trend, structure, rsi_value, momentum, atr_value,
         "strength": round(strength, 2),
         "margin": round(margin, 2),
         "weights": {k: round(v, 2) for k, v in weights.items()},
+        "research_version": "WEB-RESEARCH-V1",
+        "research_prior": dict(research_prior),
         "regime": {
             "trend": trend,
             "structure": structure,
