@@ -1,4 +1,5 @@
 import asyncio,json,logging,os,time,secrets,hashlib,re
+from collections import defaultdict,deque
 from datetime import datetime,timezone,timedelta
 from zoneinfo import ZoneInfo
 from typing import Any
@@ -593,6 +594,13 @@ CANDLE_FETCH_RETRY_DELAY=0.25
 CANDLE_UNAVAILABLE_UNTIL={}
 CANDLE_UNAVAILABLE_BACKOFF=300.0
 CANDLE_GOOD_ONCE=set()
+# Bounded local tick history powers a real 5-second micro-candle view. It never
+# fabricates missing ticks; unavailable coverage is reported explicitly.
+TICK_HISTORY=defaultdict(lambda: deque(maxlen=720))
+MULTI_TF_FRAMES=tuple(range(1,16))
+MULTI_TF_MIN_COMPLETE_BARS=3
+MULTI_TF_5S_SECONDS=5
+MULTI_TF_5S_MIN_COMPLETE_BARS=4
 TICK_RESUB_SEM=asyncio.Semaphore(3)
 TICK_RESUB_TIMEOUT=1.5
 LIVE_TICK_MAX_AGE=5.0
@@ -911,6 +919,7 @@ async def sync_account_assets(client, reason="periodic"):
         STATE["candles"].pop(pair,None)
         STATE["analyses"].pop(pair,None)
         QUOTE_SNAPSHOT_LAST.pop(pair,None)
+        TICK_HISTORY.pop(pair,None)
         CANDLE_FETCH_LAST.pop(pair,None)
         CANDLE_UNAVAILABLE_UNTIL.pop(pair,None)
         CANDLE_GOOD_ONCE.discard(pair)
@@ -1207,8 +1216,12 @@ async def on_tick(message):
                 # Keep broker time for audit, but use local receive time for
                 # freshness decisions because small broker/local clock skew can
                 # otherwise make a genuinely live tick look stale/future.
-                STATE["prices"][p]=(float(q),broker_ts,received_at)
+                price_value=float(q)
+                STATE["prices"][p]=(price_value,broker_ts,received_at)
                 STATE["price_source"][p]="tick"
+                # Keep only a bounded receipt-time tick history. This is local
+                # market-data history used for 5s confirmation and is read-only.
+                TICK_HISTORY[p].append((received_at,price_value))
                 updated+=1
             except Exception:
                 pass
@@ -1406,6 +1419,153 @@ def has_fresh_live_price(pair,reference_ts=None,max_age=LIVE_TICK_MAX_AGE):
     except Exception:return False
     return 0 <= age <= float(max_age)
 
+def _aggregate_closed_minutes(candles,minutes,reference_ts):
+    """Aggregate complete closed 1m candles into an exact N-minute timeframe."""
+    if minutes==1:
+        return list(candles or [])
+    seconds=int(minutes)*60
+    groups={}
+    for c in candles or []:
+        ts=_candle_epoch(c)
+        if ts is None:
+            continue
+        bucket=(int(ts)//seconds)*seconds
+        g=groups.setdefault(bucket,[])
+        g.append(c)
+    out=[]
+    for bucket in sorted(groups):
+        g=sorted(groups[bucket],key=lambda x: _candle_epoch(x) or 0)
+        expected={_candle_epoch(x) for x in g}
+        complete=len(g)==minutes and all(
+            (bucket + i*60) in expected for i in range(minutes)
+        )
+        if not complete:
+            continue
+        end=bucket+seconds
+        if end>float(reference_ts):
+            continue
+        out.append({
+            "time":bucket,
+            "open":float(g[0].get("open",g[0].get("o"))),
+            "high":max(float(x.get("high",x.get("h"))) for x in g),
+            "low":min(float(x.get("low",x.get("l"))) for x in g),
+            "close":float(g[-1].get("close",g[-1].get("c"))),
+        })
+    return out
+
+def _aggregate_closed_5s_ticks(pair,reference_ts):
+    """Build completed 5s micro-candles from real received ticks only."""
+    items=list(TICK_HISTORY.get(pair,()))
+    if not items:
+        return []
+    seconds=MULTI_TF_5S_SECONDS
+    groups={}
+    cutoff=float(reference_ts)-90.0
+    for received,price in items:
+        if received>cutoff and received<reference_ts:
+            bucket=int(received//seconds)*seconds
+            groups.setdefault(bucket,[]).append(float(price))
+    out=[]
+    for bucket in sorted(groups):
+        prices=groups[bucket]
+        if not prices:
+            continue
+        if bucket+seconds>float(reference_ts):
+            continue
+        out.append({
+            "time":bucket,
+            "open":prices[0],
+            "high":max(prices),
+            "low":min(prices),
+            "close":prices[-1],
+        })
+    return out
+
+def _frame_bias(bars):
+    if len(bars)<MULTI_TF_MIN_COMPLETE_BARS:
+        return {"status":"INSUFFICIENT","direction":"NEUTRAL","bars":len(bars),"strength":0.0}
+    recent=bars[-3:]
+    moves=[float(x["close"])-float(x["open"]) for x in recent]
+    last=recent[-1]
+    net=float(last["close"])-float(recent[0]["open"])
+    avg_range=sum(max(float(x["high"])-float(x["low"]),1e-12) for x in recent)/len(recent)
+    strength=min(1.0,abs(net)/max(avg_range*1.5,1e-12))
+    up=sum(1 for x in moves if x>0)
+    down=sum(1 for x in moves if x<0)
+    if net>0 and up>=2:
+        direction="UP"
+    elif net<0 and down>=2:
+        direction="DOWN"
+    else:
+        direction="NEUTRAL"
+    return {"status":"READY","direction":direction,"bars":len(bars),"strength":round(strength,3)}
+
+def build_multi_timeframe_context(pair,candles,reference_ts=None):
+    """Analyze 5s + every complete 1m..15m frame without altering Brain strategy."""
+    reference=time.time() if reference_ts is None else float(reference_ts)
+    frames={}
+    tick5=_aggregate_closed_5s_ticks(pair,reference)
+    frames["5s"]=_frame_bias(tick5)
+    frames["5s"]["bars"]=len(tick5)
+    source_5s="ticks"
+
+    closed=list(candles or [])
+    for minutes in range(1,16):
+        bars=_aggregate_closed_minutes(closed,minutes,reference)
+        frames[f"{minutes}m"]=_frame_bias(bars)
+        frames[f"{minutes}m"]["bars"]=len(bars)
+
+    return {
+        "frames":frames,
+        "source_5s":source_5s,
+        "generated_at":reference,
+    }
+
+def multi_timeframe_confirmation(context,expected):
+    """Final local confirmation gate using all available requested frames."""
+    expected=str(expected or "").upper()
+    frames=dict((context or {}).get("frames") or {})
+    if expected not in {"UP","DOWN"}:
+        return False,{"reason":"invalid_direction"}
+
+    five=frames.get("5s",{})
+    if five.get("status")!="READY":
+        return False,{"reason":"5s_insufficient","bars":five.get("bars",0)}
+    if five.get("direction") not in {expected,"NEUTRAL"}:
+        return False,{"reason":"5s_opposite","direction":five.get("direction")}
+
+    short=[frames.get(f"{m}m",{}) for m in (1,2,3,4)]
+    short=[x for x in short if x.get("status")=="READY"]
+    if len(short)<3:
+        return False,{"reason":"short_frames_insufficient","ready":len(short)}
+    short_align=sum(1 for x in short if x.get("direction")==expected)
+    short_opp=sum(1 for x in short if x.get("direction") not in {expected,"NEUTRAL"})
+    if short_align<3 or short_opp>1:
+        return False,{"reason":"short_frame_conflict","align":short_align,"opp":short_opp}
+
+    all_ready=[]
+    for m in range(5,16):
+        x=frames.get(f"{m}m",{})
+        if x.get("status")=="READY":
+            all_ready.append(x)
+    directional=[x for x in all_ready if x.get("direction") in {"UP","DOWN"}]
+    align=sum(1 for x in directional if x.get("direction")==expected)
+    opp=sum(1 for x in directional if x.get("direction") not in {expected,"NEUTRAL"})
+    agreement=(align/max(1,len(directional)))
+    if directional and (agreement<0.60 or opp>2):
+        return False,{"reason":"higher_frame_conflict","align":align,"opp":opp,"directional":len(directional),"agreement":round(agreement,3)}
+
+    return True,{
+        "reason":"multi_timeframe_confirmed",
+        "5s":five.get("direction"),
+        "short_align":short_align,
+        "short_opp":short_opp,
+        "higher_align":align,
+        "higher_opp":opp,
+        "higher_directional":len(directional),
+        "agreement":round(agreement,3),
+    }
+
 def live_price_age(pair,reference_ts=None):
     received=tick_received_at(pair)
     if received is None:return None
@@ -1496,6 +1656,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
             "pattern":str(x.get("pattern") or ""),
             "direction_agreement":float(x.get("direction_agreement") or 0.0),
             "strategy_margin":float(x.get("strategy_margin") or 0.0),
+            "multi_timeframe":dict(x.get("multi_timeframe") or {}),
             "indicators":dict(x.get("indicators") or {}),
             "evidence":dict(x.get("evidence") or {}),
         }
@@ -1551,6 +1712,18 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
                       else x.get("breakout_distance_down") or 0.0),
                 float(x.get("body_ratio") or 0.0),float(x.get("momentum_norm") or 0.0),
                 float(x.get("efficiency") or 0.0)
+            )
+            return None
+
+        mtf=build_multi_timeframe_context(x["pair"],closed,time.time())
+        mtf_ok,mtf_diag=multi_timeframe_confirmation(mtf,x.get("direction"))
+        x["multi_timeframe"]=mtf
+        x["multi_timeframe_confirmed"]=bool(mtf_ok)
+        x["multi_timeframe_diagnostic"]=mtf_diag
+        if not mtf_ok:
+            log.info(
+                "MULTI_TF_GATE_REJECTED pair=%s direction=%s reason=%s diagnostic=%s",
+                x.get("pair"),x.get("direction"),mtf_diag.get("reason"),mtf_diag
             )
             return None
 
@@ -1862,6 +2035,20 @@ async def cycle_loop():
                      int(target//300),p)
             return False
 
+        # Recompute all requested frames immediately before delivery so the
+        # final signal is based on the latest closed 1m-derived frames plus
+        # real completed 5s tick micro-candles gathered while the candidate was pinned.
+        final_mtf=build_multi_timeframe_context(
+            p,STATE["candles"].get(p,[]),time.time()
+        )
+        final_mtf_ok,final_mtf_diag=multi_timeframe_confirmation(final_mtf,candidate.get("direction"))
+        if not final_mtf_ok:
+            log.info(
+                "FINAL_MULTI_TF_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s",
+                int(target//300),p,candidate.get("direction"),
+                final_mtf_diag.get("reason"),final_mtf_diag
+            )
+            return False
         confidence=int(candidate.get("confidence") or 0)
         if confidence < 90:
             log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=confidence_%s",
