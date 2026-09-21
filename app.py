@@ -2527,36 +2527,61 @@ async def cycle_loop():
             )
             return False
 
-        # LAST-SECOND 2M CANDLE-ONLY CONFIRMATION:
-        # Brain + AI rank assets first. Immediately before delivery, inspect
-        # ONLY the latest completed 2m candle. No 30s check, indicators,
-        # volume, body-strength, 1m gate, or higher-timeframe gate participates
-        # in this final decision.
+        # LAST-SECOND FINAL CONFIRMATION:
+        # 30s is intentionally removed. Immediately before delivery, keep the
+        # requested 2m candle confirmation PLUS volume/body-strength, 1m candle
+        # gate, and higher-timeframe gate. Indicators are not used here.
         reference=time.time()
         closed_1m=_closed_candles(STATE["candles"].get(p,[]),reference)
         bars2=_aggregate_closed_minutes(closed_1m,2,reference)
-        two=_latest_closed_candle_direction(bars2)
-        expected=str(candidate.get("direction") or "").upper()
+        two=_candle_confirmation_2m(bars2,expected)
+        one=_latest_closed_candle_direction(closed_1m)
+        final_mtf=build_multi_timeframe_context(p,closed_1m,reference,expected)
+        frames=final_mtf.get("frames") or {}
+        higher=[frames.get(f"{m}m",{}) for m in range(5,16)]
+        higher=[x for x in higher if x.get("status")=="READY" and x.get("direction") in {"UP","DOWN"}]
+        higher_align=sum(1 for x in higher if x.get("direction")==expected)
+        higher_opp=sum(1 for x in higher if x.get("direction")!=expected)
+        higher_agreement=higher_align/max(1,len(higher))
         final_mtf_diag={
-            "2m":two.get("direction","NEUTRAL"),
-            "2m_bars":two.get("bars",0),
+            "2m":two.get("candle_direction",two.get("direction","NEUTRAL")),
+            "2m_bars":len(bars2),
+            "2m_volume_ok":two.get("volume_ok",False),
+            "2m_volume_ratio":two.get("volume_ratio",0),
+            "2m_body_ratio":two.get("body_ratio",0),
+            "1m":one.get("direction","NEUTRAL"),
+            "higher_align":higher_align,
+            "higher_opp":higher_opp,
+            "higher_agreement":round(higher_agreement,3),
         }
 
         confirm_reason=None
         if two.get("status")!="READY":
             confirm_reason="2m_candle_not_ready"
-        elif two.get("direction")!=expected:
+        elif two.get("candle_direction")!=expected:
             confirm_reason="2m_candle_trend_conflict"
+        elif not two.get("candle_ok"):
+            confirm_reason="2m_body_strength_failed"
+        elif not two.get("volume_ok"):
+            confirm_reason="2m_volume_confirmation_failed"
+        elif one.get("status")!="READY":
+            confirm_reason="1m_candle_not_ready"
+        elif one.get("direction")!=expected:
+            confirm_reason="1m_candle_trend_conflict"
+        elif len(higher)<1:
+            confirm_reason="higher_timeframe_not_ready"
+        elif higher_agreement<0.60 or higher_opp>2:
+            confirm_reason="higher_timeframe_conflict"
 
         if confirm_reason:
             log.info(
-                "FINAL_2M_CANDLE_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
+                "FINAL_2M_VOLUME_BODY_1M_HIGHER_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
                 cycle_id,p,expected,confirm_reason,final_mtf_diag
             )
             return False
 
         log.info(
-            "FINAL_2M_CANDLE_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
+            "FINAL_2M_VOLUME_BODY_1M_HIGHER_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
             cycle_id,p,expected,final_mtf_diag
         )
 
