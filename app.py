@@ -2330,7 +2330,7 @@ async def cycle_loop():
         s=BRAIN.mark_signal_sent(
             account_id=STATE.get("account_id"),
             pair=p,display_name=candidate["display_name"],
-            direction=candidate["direction"],expiry_minutes=candidate["expiry_minutes"],
+            direction=candidate["direction"],expiry_minutes=1,
             # This is the pre-entry reference shown in the alert. The actual
             # entry price is captured at target by result_watch().
             entry_price=entry,entry_ts=target,
@@ -2445,7 +2445,7 @@ async def cycle_loop():
         # Root-cause guard: cycle analysis must never start with an empty or
         # unauthenticated account snapshot. A restart immediately before the
         # signal boundary cannot complete five passes safely, so skip that
-        # boundary and preserve the next full 10-minute window.
+        # boundary and preserve the next full 3-minute window.
         signal_in=max(0.0,signal_at-time.time())
         log.info(
             "CYCLE_ACCOUNT_READY_GUARD cycle=%s account_ready=%s assets=%d "
@@ -2493,7 +2493,7 @@ async def cycle_loop():
         log.info(
             "SIGNAL_LEAD_PROFILE cycle=%s sequence=%s lead_seconds=%s block=%s",
             cycle_id,cycle_sequence,int(signal_lead),
-            "30S" if signal_lead==30.0 else "40S"
+            "30S"
         )
 
         catchup_mode=False
@@ -2616,6 +2616,10 @@ async def cycle_loop():
                     )
                 else:
                     candidate=candidate.copy()
+                    # Every delivered signal in this DEMO 3-minute mode has a
+                    # fixed 1-minute expiry. This does not change the Candice
+                    # Brain direction/strategy/evidence or the AI verification.
+                    candidate["expiry_minutes"]=1
                     candidate["qualified_pass"]=pass_no
                     key=(
                         candidate.get("pair"),
