@@ -64,7 +64,9 @@ BRAIN=BrainState()
 UAE_TZ=ZoneInfo("Asia/Dubai")
 # Cycle-state persistence is recovery metadata only. It must never be allowed
 # to block the market/signal scheduler when the database stalls.
-CYCLE_STATE_IO_TIMEOUT=2.5
+CYCLE_STATE_IO_TIMEOUT=0.75
+CYCLE_STATE_DB_COOLDOWN=30.0
+CYCLE_STATE_DB_BLOCKED_UNTIL=0.0
 AI_REVIEW_QUEUE_POLL_SECONDS=2.0
 AI_REVIEW_QUEUE_STALE_SECONDS=600.0
 AI_REVIEW_QUEUE_RETRY_DELAYS=(5,15,30,60,120,300)
@@ -126,7 +128,10 @@ async def save_cycle_state(
     cycle_id,target_epoch,signal_epoch,signal_lead,completed_pass,
     candidate_pool,status="ACTIVE",reason=""
 ):
+    global CYCLE_STATE_DB_BLOCKED_UNTIL
     if not LEARNING_DB_URL:
+        return False
+    if time.time() < CYCLE_STATE_DB_BLOCKED_UNTIL:
         return False
     try:
         import psycopg
@@ -170,9 +175,10 @@ async def save_cycle_state(
         )
         return True
     except asyncio.TimeoutError:
+        CYCLE_STATE_DB_BLOCKED_UNTIL=time.time()+CYCLE_STATE_DB_COOLDOWN
         log.warning(
-            "CYCLE_STATE_SAVE_FAILED cycle=%s type=TimeoutError message=database_write_timeout timeout=%.1fs",
-            cycle_id,CYCLE_STATE_IO_TIMEOUT
+            "CYCLE_STATE_SAVE_FAILED cycle=%s type=TimeoutError message=database_write_timeout timeout=%.2fs cooldown=%.0fs",
+            cycle_id,CYCLE_STATE_IO_TIMEOUT,CYCLE_STATE_DB_COOLDOWN
         )
         return False
     except Exception as e:
@@ -181,7 +187,10 @@ async def save_cycle_state(
         return False
 
 async def load_recoverable_cycle_state(now=None):
+    global CYCLE_STATE_DB_BLOCKED_UNTIL
     if not LEARNING_DB_URL:
+        return None
+    if time.time() < CYCLE_STATE_DB_BLOCKED_UNTIL:
         return None
     now=float(now or time.time())
     try:
@@ -226,9 +235,10 @@ async def load_recoverable_cycle_state(now=None):
             "candidate_pool":pool,
         }
     except asyncio.TimeoutError:
+        CYCLE_STATE_DB_BLOCKED_UNTIL=time.time()+CYCLE_STATE_DB_COOLDOWN
         log.warning(
-            "CYCLE_STATE_RECOVERY_READ_FAILED type=TimeoutError message=database_read_timeout timeout=%.1fs",
-            CYCLE_STATE_IO_TIMEOUT
+            "CYCLE_STATE_RECOVERY_READ_FAILED type=TimeoutError message=database_read_timeout timeout=%.2fs cooldown=%.0fs",
+            CYCLE_STATE_IO_TIMEOUT,CYCLE_STATE_DB_COOLDOWN
         )
         return None
     except Exception as e:
@@ -2064,7 +2074,10 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     # Keep the final pass broad enough to preserve the 150/day operational
     # target without relaxing the Brain quality threshold. The final delivery
     # gate will still reject weak candidates and fall through to the next asset.
-    top=raw[:(20 if deep_analysis else 5)]
+    # Preliminary passes only seed the candidate pool. External AI verification
+    # is reserved for the final/deep pass so provider rate limits and latency
+    # cannot consume the five-pass timing window.
+    top=raw[:(8 if deep_analysis else 5)]
     if require_live_price:
         log.info(            "LIVE_PRICE_SELECTION_MODE source=authenticated_event1 candidates=%d deep=%s",
             len(top),deep_analysis)
@@ -2116,7 +2129,9 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         )
         cached=AI_REVIEW_CACHE.get(cache_key)
         ttl=AI_REVIEW_TTL if cached and cached[1] else AI_REVIEW_FAIL_TTL
-        if cached and time.time()-cached[0] < ttl:
+        if not deep_analysis:
+            d=None
+        elif cached and time.time()-cached[0] < ttl:
             d=cached[1]
         elif use_cached_only:
             d=None
@@ -2779,11 +2794,12 @@ async def cycle_loop():
         # universe before Brain state for this cycle is created.
         BRAIN.start_cycle(cycle_id)
         STATE["cycle"]=cycle_id
-        await save_cycle_state(
+        # Recovery metadata is best-effort; never block the signal scheduler on DB I/O.
+        asyncio.create_task(save_cycle_state(
             cycle_id,target,signal_at,signal_lead,resume_completed_pass,
             candidate_pool,status="ACTIVE",
             reason="cycle_resumed" if recovered else "cycle_started"
-        )
+        ))
 
         log.info(
             "CYCLE_WINDOW_START cycle=%s sequence=%s interval=%ss signal_lead=%ss "
@@ -3089,11 +3105,12 @@ async def cycle_loop():
             # Persist each completed pass immediately. If Render replaces
             # this process, the next instance resumes from the next unfinished
             # pass and keeps the candidates already discovered.
-            await save_cycle_state(
+            # Recovery metadata is best-effort; never block the signal scheduler on DB I/O.
+            asyncio.create_task(save_cycle_state(
                 cycle_id,target,signal_at,signal_lead,pass_no,
                 candidate_pool,status="ACTIVE",
                 reason=f"scan_{pass_no}_completed"
-            )
+            ))
             if catchup_mode and pass_no<5:
                 catchup_next_at=target-SCAN_OFFSETS[pass_no]
         # The final signal can only use a candidate produced by the fifth/deep
