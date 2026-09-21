@@ -620,6 +620,11 @@ AI_REVIEW_FAIL_TTL=20.0
 # after it has already passed the Brain + live-price gates.
 CANDIDATE_CACHE={}
 CANDIDATE_CACHE_TTL=75.0
+# Once a specific candidate/candle is explicitly rejected by a hard
+# qualification gate, do not resurrect that same decision through the
+# exact-boundary cache fallback. A later scan can still produce a new key
+# when a new closed candle forms.
+CANDIDATE_CACHE_HARD_REJECTED={}
 AI_PROVIDER_COOLDOWN={}
 AI_REVIEW_TIMEOUT=2.4
 # Rotating account-wide live quote scan. It does not touch Brain timing; it only
@@ -1573,7 +1578,7 @@ def live_price_age(pair,reference_ts=None):
     try:return max(0.0,ref-received)
     except Exception:return None
 
-async def final_candidate(use_cached_only=False,require_live_price=False):
+async def final_candidate(use_cached_only=False,require_live_price=False,deep_analysis=False):
     BRAIN.prune_expired_cooldowns()
 
     # Hard account boundary: Brain may select/analyze an asset only after the
@@ -1626,9 +1631,9 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
                      len(retry_pairs),len(live_raw))
         if not live_raw:
             return None
-        top=live_raw[:5]
+        top=live_raw[:(8 if deep_analysis else 5)]
     else:
-        top=raw[:5]
+        top=raw[:(8 if deep_analysis else 5)]
     now=time.time()
     reviewed=[]
     async def review_one(x):
@@ -1645,6 +1650,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
         # verifier sees the exact frame-by-frame context. The 5s view is allowed
         # to be incomplete here; once the candidate is selected it is pinned so
         # real ticks can accumulate before the final boundary.
+        cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
         mtf=build_multi_timeframe_context(x["pair"],closed,time.time())
         x["multi_timeframe"]=mtf
         mtf_ok,mtf_diag=multi_timeframe_confirmation(mtf,x.get("direction"))
@@ -1655,6 +1661,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
                 "MULTI_TF_GATE_REJECTED pair=%s direction=%s reason=%s diagnostic=%s",
                 x.get("pair"),x.get("direction"),mtf_diag.get("reason"),mtf_diag
             )
+            CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
             return None
         if not mtf_ok and mtf_diag.get("reason")=="5s_insufficient":
             log.info(
@@ -1685,8 +1692,6 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
             asset,closed,price,now,
             technical_context=technical_context
         )
-        cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
-
         cached=AI_REVIEW_CACHE.get(cache_key)
         ttl=AI_REVIEW_TTL if cached and cached[1] else AI_REVIEW_FAIL_TTL
         if cached and time.time()-cached[0] < ttl:
@@ -1734,6 +1739,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
                 float(x.get("body_ratio") or 0.0),float(x.get("momentum_norm") or 0.0),
                 float(x.get("efficiency") or 0.0)
             )
+            CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
             return None
 
         strategy_name=str(x.get("strategy") or "").upper()
@@ -1763,6 +1769,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
                 float(x.get("body_ratio") or 0.0),float(x.get("efficiency") or 0.0),
                 evidence.get("recent_aligned_candles"),x.get("pattern")
             )
+            CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
             return None
 
         if local_confidence>=90:
@@ -1842,6 +1849,11 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
     now_cache=time.time()
     for x in top:
         key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
+        rejected_at=CANDIDATE_CACHE_HARD_REJECTED.get(key)
+        if rejected_at is not None:
+            if now_cache-rejected_at <= CANDIDATE_CACHE_TTL:
+                continue
+            CANDIDATE_CACHE_HARD_REJECTED.pop(key,None)
         cached=CANDIDATE_CACHE.get(key)
         if not cached:
             continue
@@ -2010,11 +2022,17 @@ async def result_watch(key):
     )
 
 async def cycle_loop():
-    # Internal analysis starts 75s before the 5-minute boundary.
-    # The user-facing signal is emitted exactly 30s before entry.
-    # No signal is ever emitted at/after the entry boundary.
-    PRE_ANALYSIS_LEAD=75.0
-    SIGNAL_LEAD=30.0
+    # Rolling preselection pipeline:
+    # - Prepare the next 5-minute target before its final signal window.
+    # - Run exactly five Brain passes over the account-visible market.
+    # - The first ten cycles use a 30s signal lead; the next ten use 40s,
+    #   then repeat in ten-cycle blocks.
+    # - Pass 5 widens the external verification set for a slightly deeper review.
+    # - Keep a candidate pool so a late MTF rejection can fall through to the
+    #   next independently prepared candidate without restarting the cycle.
+    SIGNAL_LEADS=(30.0,40.0)
+    SCAN_OFFSETS=(270.0,210.0,150.0,90.0,60.0)
+    cycle_sequence=0
     last_target=0
 
     async def send_cycle_signal(candidate,target):
@@ -2128,146 +2146,195 @@ async def cycle_loop():
         asyncio.create_task(result_watch(key))
         return True
 
+
     while True:
         now=time.time()
         target=(int(now)//300+1)*300
         if target<=last_target:
             target=last_target+300
-        analysis_start=target-PRE_ANALYSIS_LEAD
-        signal_at=target-SIGNAL_LEAD
 
-        await asyncio.sleep(max(0,analysis_start-time.time()))
+        cycle_sequence+=1
+        signal_lead=SIGNAL_LEADS[((cycle_sequence-1)//10)%2]
+        analysis_start=target-SCAN_OFFSETS[0]
+        signal_at=target-signal_lead
         cycle_id=int(target//300)
+
+        # Begin preselection as soon as this target enters the rolling window.
+        await asyncio.sleep(max(0,analysis_start-time.time()))
         BRAIN.start_cycle(cycle_id)
         STATE["cycle"]=cycle_id
         last_target=target
+
+        candidate_pool={}
         log.info(
-            "CYCLE_WINDOW_START cycle=%s analysis_start_utc=%s signal_utc=%s target_utc=%s "
-            "analysis_start_uae=%s signal_uae=%s target_uae=%s",
-            cycle_id,
+            "CYCLE_WINDOW_START cycle=%s sequence=%s signal_lead=%ss "
+            "analysis_start_utc=%s signal_utc=%s target_utc=%s analysis_passes=5",
+            cycle_id,cycle_sequence,int(signal_lead),
             time.strftime("%H:%M:%S",time.gmtime(analysis_start)),
             time.strftime("%H:%M:%S",time.gmtime(signal_at)),
-            time.strftime("%H:%M:%S",time.gmtime(target)),
-            time.strftime("%H:%M:%S",time.gmtime(analysis_start+4*3600)),
-            time.strftime("%H:%M:%S",time.gmtime(signal_at+4*3600)),
-            time.strftime("%H:%M:%S",time.gmtime(target+4*3600))
+            time.strftime("%H:%M:%S",time.gmtime(target))
+        )
+        log.info(
+            "SIGNAL_LEAD_PROFILE cycle=%s sequence=%s lead_seconds=%s block=%s",
+            cycle_id,cycle_sequence,int(signal_lead),
+            "30S" if signal_lead==30.0 else "40S"
         )
 
-        candidate=None
-        # Three full-account scans are intentional: the account has many assets,
-        # and one snapshot can miss a setup that forms a few seconds later.
-        # Scan 1 = 75s before entry, Scan 2 = 50s, Scan 3 = 40s.
-        # The third scan is deliberately moved earlier so its full 52-asset
-        # candle refresh can finish without consuming the exact 30s signal
-        # deadline. All three scans remain inside the same 5-minute cycle.
-        scan_plan=(
-            ("SCAN_1",target-75.0),
-            ("SCAN_2",target-50.0),
-            ("SCAN_3",target-40.0),
-        )
-        for scan_name,scan_at in scan_plan:
+        for pass_no,offset in enumerate(SCAN_OFFSETS,1):
+            scan_name=f"SCAN_{pass_no}"
+            scan_at=target-offset
             await asyncio.sleep(max(0,scan_at-time.time()))
-            if time.time() >= signal_at:
-                break
-            try:
-                # Never allow a full-account refresh to consume the exact
-                # 30-second signal deadline. Preserve the previous scan's valid
-                # candidate if this pass overruns its bounded budget.
-                scan_budget=max(0.75,signal_at-time.time()-1.0)
-                await asyncio.wait_for(refresh_candles(force=True),timeout=scan_budget)
+
+            remaining=max(0,signal_at-time.time())
+            if remaining<=2.0:
                 log.info(
-                    "ACCOUNT_FULL_SCAN cycle=%s scan=%s assets=%d analyzed=%d seconds_to_signal=%.2f",
-                    cycle_id,scan_name,len(STATE["assets"]),len(STATE["analyses"]),
-                    max(0,signal_at-time.time())
+                    "FIVE_SCAN_WINDOW_CLOSED cycle=%s scan=%s remaining=%.2f",
+                    cycle_id,scan_name,remaining
+                )
+                break
+
+            scan_budget=max(0.75,remaining-3.0)
+            try:
+                await asyncio.wait_for(
+                    refresh_candles(force=True),
+                    timeout=scan_budget
+                )
+                log.info(
+                    "ACCOUNT_FULL_SCAN cycle=%s scan=%s pass=%s assets=%d analyzed=%d "
+                    "seconds_to_signal=%.2f deep=%s",
+                    cycle_id,scan_name,pass_no,len(STATE["assets"]),
+                    len(STATE["analyses"]),max(0,signal_at-time.time()),
+                    pass_no==5
                 )
             except asyncio.TimeoutError:
                 log.warning(
-                    "ACCOUNT_FULL_SCAN_TIMEOUT cycle=%s scan=%s budget=%.2f seconds_to_signal=%.2f",
-                    cycle_id,scan_name,scan_budget,max(0,signal_at-time.time())
+                    "ACCOUNT_FULL_SCAN_TIMEOUT cycle=%s scan=%s pass=%s budget=%.2f "
+                    "seconds_to_signal=%.2f",
+                    cycle_id,scan_name,pass_no,scan_budget,
+                    max(0,signal_at-time.time())
                 )
             except Exception as e:
                 log.warning(
-                    "ACCOUNT_FULL_SCAN_FAILED cycle=%s scan=%s type=%s message=%s",
-                    cycle_id,scan_name,type(e).__name__,str(e)[:160]
+                    "ACCOUNT_FULL_SCAN_FAILED cycle=%s scan=%s pass=%s type=%s message=%s",
+                    cycle_id,scan_name,pass_no,type(e).__name__,str(e)[:160]
                 )
 
             remaining=max(0,signal_at-time.time())
-            if remaining <= 0.75:
+            if remaining<=2.0:
                 break
+
             try:
-                new_candidate=await asyncio.wait_for(
-                    final_candidate(require_live_price=True),
-                    timeout=max(0.75,remaining-0.20)
+                candidate=await asyncio.wait_for(
+                    final_candidate(
+                        require_live_price=True,
+                        deep_analysis=(pass_no==5)
+                    ),
+                    timeout=max(0.75,remaining-0.50)
                 )
-                if new_candidate is not None:
-                    candidate=new_candidate
-                    # Preserve the selected candidate on an authenticated event-1
-                    # tick slot until the exact entry boundary. The previous
-                    # rotation worker could evict a valid candidate 5-20s after
-                    # selection, leaving send_cycle_signal without a fresh quote
-                    # at target even though Brain had already qualified it.
-                    pin_ttl=max(12.0,target-time.time()+5.0)
-                    try:
-                        await pin_account_tick_pairs([new_candidate.get("pair")],ttl=pin_ttl)
-                        log.info(
-                            "FINAL_CANDIDATE_TICK_PINNED cycle=%s pair=%s ttl=%.1f target_utc=%s",
-                            cycle_id,new_candidate.get("pair"),pin_ttl,
-                            datetime.fromtimestamp(target,tz=timezone.utc).strftime("%H:%M:%S")
-                        )
-                    except Exception as e:
-                        log.warning(
-                            "FINAL_CANDIDATE_TICK_PIN_FAILED cycle=%s pair=%s type=%s message=%s",
-                            cycle_id,new_candidate.get("pair"),type(e).__name__,str(e)[:120]
-                        )
-                    log.info(
-                        "SCAN_CANDIDATE_SELECTED cycle=%s scan=%s pair=%s confidence=%s strategy=%s expiry=%s",
-                        cycle_id,scan_name,new_candidate.get("pair"),
-                        new_candidate.get("confidence"),new_candidate.get("strategy"),
-                        new_candidate.get("expiry_minutes")
-                    )
-                else:
+                if candidate is None:
                     log.info(
                         "SCAN_COMPLETE cycle=%s scan=%s candidate=none analyzed=%d",
                         cycle_id,scan_name,len(STATE["analyses"])
                     )
+                    continue
+
+                key=(
+                    candidate.get("pair"),
+                    str(candidate.get("entry_candle_ts")),
+                    str(candidate.get("direction") or "").upper()
+                )
+                candidate_pool[key]=candidate.copy()
+
+                pin_ttl=max(12.0,target-time.time()+5.0)
+                try:
+                    await pin_account_tick_pairs(
+                        [candidate.get("pair")],ttl=pin_ttl
+                    )
+                    log.info(
+                        "FINAL_CANDIDATE_TICK_PINNED cycle=%s pair=%s ttl=%.1f target_utc=%s",
+                        cycle_id,candidate.get("pair"),pin_ttl,
+                        datetime.fromtimestamp(
+                            target,tz=timezone.utc
+                        ).strftime("%H:%M:%S")
+                    )
+                except Exception as e:
+                    log.warning(
+                        "FINAL_CANDIDATE_TICK_PIN_FAILED cycle=%s pair=%s type=%s message=%s",
+                        cycle_id,candidate.get("pair"),
+                        type(e).__name__,str(e)[:120]
+                    )
+
+                log.info(
+                    "SCAN_CANDIDATE_SELECTED cycle=%s scan=%s pass=%s pair=%s "
+                    "confidence=%s strategy=%s expiry=%s pool=%s deep=%s",
+                    cycle_id,scan_name,pass_no,candidate.get("pair"),
+                    candidate.get("confidence"),candidate.get("strategy"),
+                    candidate.get("expiry_minutes"),len(candidate_pool),
+                    pass_no==5
+                )
             except asyncio.TimeoutError:
                 log.warning(
-                    "SCAN_EVALUATION_TIMEOUT cycle=%s scan=%s remaining=%.2f",
-                    cycle_id,scan_name,max(0,signal_at-time.time())
+                    "SCAN_EVALUATION_TIMEOUT cycle=%s scan=%s pass=%s remaining=%.2f",
+                    cycle_id,scan_name,pass_no,max(0,signal_at-time.time())
                 )
-
-        # Give the third scan's candidate the final live-price check without
-        # performing another full network/candle refresh at the exact deadline.
-        await asyncio.sleep(max(0,signal_at-time.time()))
-        sent=False
-        if candidate and time.time() <= signal_at+0.20:
-            try:
-                sent=await send_cycle_signal(candidate,target)
             except Exception as e:
                 log.exception(
-                    "FINAL_SIGNAL_BUILD_FAILED cycle=%s type=%s message=%s",
-                    cycle_id,type(e).__name__,str(e)[:160]
+                    "SCAN_EVALUATION_FAILED cycle=%s scan=%s pass=%s type=%s message=%s",
+                    cycle_id,scan_name,pass_no,type(e).__name__,str(e)[:160]
                 )
 
+        # The next cycle is already queued conceptually; only the exact user-facing
+        # delivery boundary remains. Candidate validation is repeated using the
+        # latest live price + all MTF frames, but Brain is not rerun a sixth time.
+        await asyncio.sleep(max(0,signal_at-time.time()))
+        sent=False
+        ranked_pool=sorted(
+            candidate_pool.values(),
+            key=lambda x:(
+                int(x.get("confidence") or 0),
+                float(x.get("strategy_margin") or 0),
+                float(x.get("direction_agreement") or 0),
+                float(x.get("market_quality") or 0),
+                float(x.get("learning_bonus") or 0)
+            ),
+            reverse=True
+        )
+        log.info(
+            "PREFETCH_POOL_READY cycle=%s candidates=%d signal_lead=%ss",
+            cycle_id,len(ranked_pool),int(signal_lead)
+        )
+
+        if time.time()<=signal_at+0.20:
+            for candidate in ranked_pool:
+                try:
+                    sent=await send_cycle_signal(candidate,target)
+                except Exception as e:
+                    log.exception(
+                        "FINAL_SIGNAL_BUILD_FAILED cycle=%s pair=%s type=%s message=%s",
+                        cycle_id,candidate.get("pair"),
+                        type(e).__name__,str(e)[:160]
+                    )
+                    sent=False
+                if sent:
+                    break
+
         if not sent:
-            if candidate:
+            if ranked_pool:
                 log.info(
-                    "FINAL_SIGNAL_NOT_SENT cycle=%s candidate=%s confidence=%s signal_utc=%s now_utc=%s",
-                    cycle_id,candidate.get("pair"),candidate.get("confidence"),
+                    "FIVE_SCAN_NO_VALID_SIGNAL cycle=%s candidates=%d "
+                    "signal_utc=%s now_utc=%s",
+                    cycle_id,len(ranked_pool),
                     time.strftime("%H:%M:%S",time.gmtime(signal_at)),
                     time.strftime("%H:%M:%S",time.gmtime(time.time()))
                 )
             else:
-                # Internal diagnostic only; never sent as a member notification.
                 log.info(
-                    "THREE_SCAN_NO_QUALIFIED_SETUP cycle=%s scans=3 analyzed=%d",
+                    "FIVE_SCAN_NO_QUALIFIED_SETUP cycle=%s scans=5 analyzed=%d",
                     cycle_id,len(STATE["analyses"])
                 )
 
-        # Keep the loop aligned to the next 5-minute boundary. Result tracking
-        # uses the stored exact entry timestamp, so no extra boundary evaluation
-        # is performed here.
-        await asyncio.sleep(max(0,target+0.25-time.time()))
+        # Roll immediately into preparation of the next target. Result tracking
+        # is independent and therefore cannot block this scheduler.
 
 async def audit_outbound_network():
     """
