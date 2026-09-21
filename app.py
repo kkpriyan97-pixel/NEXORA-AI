@@ -2035,7 +2035,7 @@ async def cycle_loop():
     cycle_sequence=0
     last_target=0
 
-    async def send_cycle_signal(candidate,target):
+    async def send_cycle_signal(candidate,target,signal_lead):
         if not candidate or not BRAIN.can_send_cycle_signal(
             STATE.get("account_id"),candidate.get("pair")
         ):
@@ -2086,7 +2086,7 @@ async def cycle_loop():
                      int(target//300),p,confidence)
             return False
 
-        ts=target-SIGNAL_LEAD
+        ts=target-signal_lead
         if time.time() > ts+0.25:
             log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=deadline_passed",
                      int(target//300),p)
@@ -2307,7 +2307,7 @@ async def cycle_loop():
         if time.time()<=signal_at+0.20:
             for candidate in ranked_pool:
                 try:
-                    sent=await send_cycle_signal(candidate,target)
+                    sent=await send_cycle_signal(candidate,target,signal_lead)
                 except Exception as e:
                     log.exception(
                         "FINAL_SIGNAL_BUILD_FAILED cycle=%s pair=%s type=%s message=%s",
