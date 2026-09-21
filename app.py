@@ -1466,9 +1466,9 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
                      len(retry_pairs),len(live_raw))
         if not live_raw:
             return None
-        top=live_raw[:20]
+        top=live_raw[:5]
     else:
-        top=raw[:20]
+        top=raw[:5]
     now=time.time()
     reviewed=[]
     async def review_one(x):
@@ -1480,27 +1480,30 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
         closed=_closed_candles(cs,now)
         if len(closed)<45:
             return None
-        snap=snapshot_from_asset(asset,closed,price,now)
-        cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
 
-        # Candice Brain is the PRIMARY decision engine. External LLM providers
-        # are validation only and must never block a qualified local setup.
-        # This prevents an OpenAI/Gemini quota outage from deleting the
-        # 30-second signal window.
-        local_confidence=int(x.get("confidence") or 0)
-        if local_confidence>=90:
-            y=x.copy()
-            y.update({
-                "confidence":local_confidence,
-                "reason":x.get("reason") or "Candice local Brain verified closed-candle evidence",
-                "ai_provider":"CANDICE_LOCAL_BRAIN_PRIMARY"
-            })
-            CANDIDATE_CACHE[cache_key]=(time.time(),y.copy())
-            log.info("BRAIN_PRIMARY_CANDIDATE pair=%s confidence=%s strategy=%s margin=%s dir_agree=%s expiry_hint=%s five_minute_eligible=%s",
-                     x["pair"],local_confidence,x.get("strategy"),
-                     x.get("strategy_margin",0),x.get("direction_agreement",0),
-                     x.get("expiry_minutes",0),x.get("five_minute_eligible",False))
-            return y
+        # The local Candice Brain remains the primary technical engine, but a
+        # qualified candidate must now receive a real external AI verification
+        # pass when time permits. The verifier gets the same closed-candle
+        # technical context that produced the candidate and can veto a direct
+        # directional contradiction. Provider failure is fail-open to the local
+        # Brain, so outages never stop signal generation or the 30s timing path.
+        technical_context={
+            "local_candidate_direction":str(x.get("direction") or "").upper(),
+            "local_candidate_strategy":str(x.get("strategy") or ""),
+            "local_candidate_confidence":int(x.get("confidence") or 0),
+            "trend_15m":str(x.get("trend_15m") or ""),
+            "structure_1m":str(x.get("structure_1m") or ""),
+            "pattern":str(x.get("pattern") or ""),
+            "direction_agreement":float(x.get("direction_agreement") or 0.0),
+            "strategy_margin":float(x.get("strategy_margin") or 0.0),
+            "indicators":dict(x.get("indicators") or {}),
+            "evidence":dict(x.get("evidence") or {}),
+        }
+        snap=snapshot_from_asset(
+            asset,closed,price,now,
+            technical_context=technical_context
+        )
+        cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
 
         cached=AI_REVIEW_CACHE.get(cache_key)
         ttl=AI_REVIEW_TTL if cached and cached[1] else AI_REVIEW_FAIL_TTL
@@ -1514,48 +1517,73 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
                 d=await asyncio.wait_for(analyze_with_fallback(snap),timeout=AI_REVIEW_TIMEOUT)
                 AI_REVIEW_CACHE[cache_key]=(time.time(),d)
             except Exception as e:
-                log.warning("AI_REVIEW_FAILED pair=%s type=%s message=%s",x["pair"],type(e).__name__,str(e)[:120])
+                log.warning("AI_PRE_SIGNAL_VERIFY_FAILED pair=%s local_direction=%s type=%s message=%s",
+                            x["pair"],x.get("direction"),type(e).__name__,str(e)[:120])
                 AI_REVIEW_CACHE[cache_key]=(time.time(),None)
-        if d and int(d.get("confidence",0))>=90:
-            y=x.copy()
-            y.update({"confidence":int(d["confidence"]),"reason":d.get("reason") or x["reason"],"ai_provider":d.get("provider")})
-            CANDIDATE_CACHE[cache_key]=(time.time(),y.copy())
-            return y
-        # When every external LLM provider is unavailable, preserve the live
-        # evidence-first Candice Brain decision instead of losing the whole
-        # 5-minute cycle. This fallback never bypasses the 90% Brain threshold,
-        # the live-candle evidence, the 15m conflict gate, or DEMO/read-only mode.
-        # An external provider can return a valid JSON decision but with
-        # confidence below Candice's 90% send threshold. Treat that the same as
-        # provider unavailability for the final gate: the evidence-first local
-        # Brain result remains eligible if it already passed the same 90%
-        # technical threshold. Do not downgrade a qualified market setup merely
-        # because an external provider produced a low-confidence review.
-        external_confidence=int(d.get("confidence",0)) if isinstance(d,dict) else 0
-        if not use_cached_only and external_confidence < 90 and int(x.get("confidence") or 0) >= 90:
+
+        local_confidence=int(x.get("confidence") or 0)
+        local=x.copy()
+        local.update({
+            "confidence":local_confidence,
+            "reason":x.get("reason") or "Candice local Brain verified closed-candle evidence",
+            "ai_provider":"CANDICE_LOCAL_BRAIN_PRIMARY"
+        })
+
+        if local_confidence>=90:
+            if isinstance(d,dict) and str(d.get("direction") or "").upper() in {"UP","DOWN"}:
+                ai_direction=str(d.get("direction") or "").upper()
+                try:
+                    ai_confidence=max(0,min(100,int(float(d.get("confidence") or 0))))
+                except (TypeError,ValueError):
+                    ai_confidence=0
+
+                # A confident external contradiction is a hard veto for this
+                # exact candidate. We do not swap the direction; the next ranked
+                # candidate may still be selected. This preserves the Brain's
+                # strategy and timing while closing the old "AI bypass" hole.
+                if ai_confidence>=75 and ai_direction!=str(x.get("direction") or "").upper():
+                    log.warning(
+                        "AI_PRE_SIGNAL_CONFLICT pair=%s local_direction=%s ai_direction=%s "
+                        "local_confidence=%s ai_confidence=%s provider=%s strategy=%s",
+                        x["pair"],x.get("direction"),ai_direction,local_confidence,
+                        ai_confidence,d.get("provider"),x.get("strategy")
+                    )
+                    return None
+
+                log.info(
+                    "AI_PRE_SIGNAL_VERIFY pair=%s local_direction=%s ai_direction=%s "
+                    "local_confidence=%s ai_confidence=%s provider=%s verdict=AGREE_OR_UNCERTAIN",
+                    x["pair"],x.get("direction"),ai_direction,local_confidence,
+                    ai_confidence,d.get("provider")
+                )
+                # Never let the external model inflate or rewrite the Brain's
+                # technical confidence; it is only a verifier here.
+                local["ai_provider"]=d.get("provider")
+            else:
+                log.info(
+                    "AI_PRE_SIGNAL_VERIFY pair=%s local_direction=%s local_confidence=%s verdict=LOCAL_FALLBACK",
+                    x["pair"],x.get("direction"),local_confidence
+                )
+            CANDIDATE_CACHE[cache_key]=(time.time(),local.copy())
+            return local
+
+        # Sub-90 local candidates still use the original external-AI qualification
+        # path. This keeps the existing signal threshold and fallback behavior.
+        if isinstance(d,dict) and int(d.get("confidence",0))>=90:
             y=x.copy()
             y.update({
-                "confidence":int(x.get("confidence") or 0),
-                "reason":x.get("reason") or "Candice local Brain verified live market evidence",
-                "ai_provider":"CANDICE_LOCAL_BRAIN"
-            })
-            # Persist the completed local decision in the same short-lived
-            # cache used by the exact-boundary check. The previous version
-            # cached None on provider failure, so the valid local result could
-            # disappear before the 5-minute boundary.
-            AI_REVIEW_CACHE[cache_key]=(time.time(),{
-                "decision":"SIGNAL",
-                "direction":y["direction"],
-                "confidence":y["confidence"],
-                "reason":y["reason"],
-                "display_name":y["display_name"],
-                "pair":y["pair"],
-                "provider":"CANDICE_LOCAL_BRAIN"
+                "confidence":int(d["confidence"]),
+                "reason":d.get("reason") or x["reason"],
+                "ai_provider":d.get("provider")
             })
             CANDIDATE_CACHE[cache_key]=(time.time(),y.copy())
-            log.warning("AI_EXTERNAL_FALLBACK_LOCAL pair=%s confidence=%s strategy=%s",
-                        x["pair"],x.get("confidence"),x.get("strategy"))
             return y
+
+        # Provider unavailable / low-confidence AI: preserve the local result only
+        # when it already meets the Brain threshold. No signal timing is extended.
+        if not use_cached_only and local_confidence>=90:
+            CANDIDATE_CACHE[cache_key]=(time.time(),local.copy())
+            return local
         return None
 
     results=await asyncio.gather(*(review_one(x) for x in top),return_exceptions=True)
