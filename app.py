@@ -209,6 +209,12 @@ async def load_recoverable_cycle_state(now=None):
             "completed_pass":int(completed_pass or 0),
             "candidate_pool":pool,
         }
+    except Exception as e:
+        log.warning(
+            "CYCLE_STATE_RECOVERY_READ_FAILED type=%s message=%s",
+            type(e).__name__,str(e)[:160]
+        )
+        return None
 
 async def mark_cycle_state(cycle_id,status,reason=""):
     if not LEARNING_DB_URL:
