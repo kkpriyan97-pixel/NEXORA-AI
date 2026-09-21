@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Any
 
-COOLDOWN_SECONDS = 900
+COOLDOWN_SECONDS = 600
 MIN_CONFIDENCE = 90
 CYCLE_SECONDS = 300
 EXPIRIES = (1, 2, 3, 4, 5, 10, 15)
