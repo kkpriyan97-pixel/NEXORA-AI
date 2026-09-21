@@ -2297,8 +2297,13 @@ async def cycle_loop():
                         break
             elif not catchup_mode:
                 await asyncio.sleep(max(0.0,scan_at-time.time()))
-            elif catchup_next_at is not None:
-                await asyncio.sleep(max(0.0,catchup_next_at-time.time()))
+            elif catchup_mode:
+                # Recovery must not squeeze all five passes toward the signal
+                # deadline.  Run an overdue pass immediately, then preserve the
+                # original wall-clock timestamp for each future pass.  This keeps
+                # pass 5 at target-150s instead of accidentally moving it to the
+                # last few seconds before Telegram delivery.
+                await asyncio.sleep(max(0.0,scan_at-time.time()))
 
             remaining=max(0,signal_at-time.time())
             if remaining<=3.0:
@@ -2403,10 +2408,13 @@ async def cycle_loop():
             # passes into the available pre-signal window. In normal operation
             # the exact scheduled timestamps above remain unchanged.
             if catchup_mode and pass_no<5:
-                remaining_passes=5-pass_no
-                window=max(0.0,signal_at-time.time()-5.0)
-                spacing=max(15.0,window/max(1,remaining_passes))
-                catchup_next_at=time.time()+spacing
+                # Do not dynamically compress the remaining passes.  The next
+                # pass keeps its original scheduled timestamp; if that timestamp
+                # is already past, the next iteration runs it immediately.
+                # This prevents catch-up from starving pass 5 and producing a
+                # false "no qualified setup" merely because analysis finished
+                # after the signal deadline.
+                catchup_next_at=target-SCAN_OFFSETS[pass_no]
         # The final signal can only use a candidate produced by the fifth/deep
         # pass. Earlier passes continue to inform Brain state and can keep ticks
         # warm, but they cannot directly become the final signal.
