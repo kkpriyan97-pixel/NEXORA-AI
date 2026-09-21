@@ -2212,9 +2212,9 @@ async def cycle_loop():
     # Five-minute signal cycle with five pre-signal analysis passes.
     # For target T: passes at T-5:30, T-4:30, T-3:30, T-2:30, T-1:30;
     # final signal remains at T-0:30.
-    SIGNAL_INTERVAL=300.0
+    SIGNAL_INTERVAL=600.0
     SIGNAL_LEADS=(30.0,40.0)
-    SCAN_OFFSETS=(330.0,270.0,210.0,150.0,90.0)
+    SCAN_OFFSETS=(630.0,510.0,390.0,270.0,150.0)
 
     async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
         if not candidate or not BRAIN.can_send_cycle_signal(
