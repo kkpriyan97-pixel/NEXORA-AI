@@ -2245,7 +2245,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         # Pass 5 may provide several Brain+AI-qualified candidates. The delivery
         # stage will check the final candle/quote on each candidate in rank order.
         # This is the key fallback that prevents one asset from suppressing a cycle.
-        return ranked[:8]
+        return ranked[:20]
     if ranked and require_live_price:
         # The broker only keeps a small number of event-1 tick slots active.
         # Refresh candidates sequentially after Brain/AI qualification so a
@@ -2869,7 +2869,7 @@ async def cycle_loop():
                     timeout=max(1.0,remaining-0.50)
                 )
                 if isinstance(candidate,list):
-                    selected=candidate[:8]
+                    selected=candidate[:20]
                     if not selected:
                         log.info(
                             "SCAN_COMPLETE cycle=%s scan=SCAN_%s candidate=none analyzed=%d",
