@@ -1641,6 +1641,27 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
         if len(closed)<45:
             return None
 
+        # Build multi-timeframe evidence before AI verification so the external
+        # verifier sees the exact frame-by-frame context. The 5s view is allowed
+        # to be incomplete here; once the candidate is selected it is pinned so
+        # real ticks can accumulate before the final boundary.
+        mtf=build_multi_timeframe_context(x["pair"],closed,time.time())
+        x["multi_timeframe"]=mtf
+        mtf_ok,mtf_diag=multi_timeframe_confirmation(mtf,x.get("direction"))
+        x["multi_timeframe_confirmed"]=bool(mtf_ok)
+        x["multi_timeframe_diagnostic"]=mtf_diag
+        if not mtf_ok and mtf_diag.get("reason")!="5s_insufficient":
+            log.info(
+                "MULTI_TF_GATE_REJECTED pair=%s direction=%s reason=%s diagnostic=%s",
+                x.get("pair"),x.get("direction"),mtf_diag.get("reason"),mtf_diag
+            )
+            return None
+        if not mtf_ok and mtf_diag.get("reason")=="5s_insufficient":
+            log.info(
+                "MULTI_TF_WAIT_5S pair=%s direction=%s bars=%s",
+                x.get("pair"),x.get("direction"),mtf_diag.get("bars",0)
+            )
+
         # The local Candice Brain remains the primary technical engine, but a
         # qualified candidate must now receive a real external AI verification
         # pass when time permits. The verifier gets the same closed-candle
@@ -1712,18 +1733,6 @@ async def final_candidate(use_cached_only=False,require_live_price=False):
                       else x.get("breakout_distance_down") or 0.0),
                 float(x.get("body_ratio") or 0.0),float(x.get("momentum_norm") or 0.0),
                 float(x.get("efficiency") or 0.0)
-            )
-            return None
-
-        mtf=build_multi_timeframe_context(x["pair"],closed,time.time())
-        mtf_ok,mtf_diag=multi_timeframe_confirmation(mtf,x.get("direction"))
-        x["multi_timeframe"]=mtf
-        x["multi_timeframe_confirmed"]=bool(mtf_ok)
-        x["multi_timeframe_diagnostic"]=mtf_diag
-        if not mtf_ok:
-            log.info(
-                "MULTI_TF_GATE_REJECTED pair=%s direction=%s reason=%s diagnostic=%s",
-                x.get("pair"),x.get("direction"),mtf_diag.get("reason"),mtf_diag
             )
             return None
 
@@ -2049,6 +2058,10 @@ async def cycle_loop():
                 final_mtf_diag.get("reason"),final_mtf_diag
             )
             return False
+        log.info(
+            "FINAL_MULTI_TF_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
+            int(target//300),p,candidate.get("direction"),final_mtf_diag
+        )
         confidence=int(candidate.get("confidence") or 0)
         if confidence < 90:
             log.info("NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=confidence_%s",
