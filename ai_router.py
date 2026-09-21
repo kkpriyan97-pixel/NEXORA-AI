@@ -86,7 +86,11 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                 "Independently validate that exact candidate using only the supplied closed-candle "
                 "OHLC and technical evidence. Do not simply echo it. A contradictory direction "
                 "must be returned when the evidence supports the opposite direction; do not invent "
-                "missing data. Return one JSON object only with direction UP or DOWN, confidence "
+                "missing data. For BREAKOUT candidates, independently verify real breakout strength "
+                "and continuation evidence, not direction alone: meaningful ATR displacement, strong "
+                "breakout body, momentum/efficiency, and matching Donchian or level confirmation "
+                "must support the setup. Treat a marginal/weak breakout as uncertain rather than "
+                "agreeing with it. Return one JSON object only with direction UP or DOWN, confidence "
                 "0-100, and a short reason. This is DEMO read-only; never trade.\n"+
                 json.dumps(request,ensure_ascii=False,separators=(",",":")))
     else:
