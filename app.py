@@ -2172,6 +2172,19 @@ async def cycle_loop():
     cycle_sequence=0
     target=None
 
+    def account_ready_now():
+        return bool(
+            CLIENT
+            and getattr(CLIENT.connection,"is_connected",False)
+            and STATE.get("account_group")=="demo"
+            and STATE.get("account_id")
+            and STATE.get("feed_source") in {
+                "authenticated_websocket:event_182",
+                "authenticated_websocket:event_183",
+            }
+            and len(STATE.get("assets") or [])>0
+        )
+
     while True:
         now=time.time()
         if target is None:
@@ -2190,9 +2203,39 @@ async def cycle_loop():
         signal_lead=SIGNAL_LEADS[0 if cycle_sequence<=10 else 1]
         signal_at=target-signal_lead
 
-        # First-cycle startup aligns to the first scan. Later cycles enter
-        # immediately after the previous signal; missed scan timestamps are
-        # executed immediately rather than waiting for another cycle.
+        # Root-cause guard: cycle analysis must never start with an empty or
+        # unauthenticated account snapshot. A restart immediately before the
+        # signal boundary cannot complete five passes safely, so skip that
+        # boundary and preserve the next full 10-minute window.
+        signal_in=max(0.0,signal_at-time.time())
+        log.info(
+            "CYCLE_ACCOUNT_READY_GUARD cycle=%s account_ready=%s assets=%d "
+            "signal_in=%.2f signal_utc=%s",
+            cycle_id,account_ready_now(),len(STATE.get("assets") or []),signal_in,
+            time.strftime("%H:%M:%S",time.gmtime(signal_at))
+        )
+        if signal_in < 20.0:
+            log.warning(
+                "CYCLE_SKIPPED_LATE_START cycle=%s signal_utc=%s signal_in=%.2f "
+                "reason=insufficient_window_for_account_and_five_passes",
+                cycle_id,time.strftime("%H:%M:%S",time.gmtime(signal_at)),signal_in
+            )
+            continue
+
+        if not account_ready_now():
+            ready_deadline=signal_at-20.0
+            while time.time()<ready_deadline and not account_ready_now():
+                await asyncio.sleep(0.5)
+            if not account_ready_now():
+                log.warning(
+                    "CYCLE_SKIPPED_ACCOUNT_NOT_READY cycle=%s signal_utc=%s "
+                    "reason=account_not_ready_by_safe_window",
+                    cycle_id,time.strftime("%H:%M:%S",time.gmtime(signal_at))
+                )
+                continue
+
+        # Account/feed is now authenticated and has a non-empty account asset
+        # universe before Brain state for this cycle is created.
         BRAIN.start_cycle(cycle_id)
         STATE["cycle"]=cycle_id
         candidate_pool={}
@@ -2243,17 +2286,7 @@ async def cycle_loop():
                         if account_ready:
                             break
                         await asyncio.sleep(1.0)
-                    account_ready=bool(
-                        CLIENT
-                        and getattr(CLIENT.connection,"is_connected",False)
-                        and STATE.get("account_group")=="demo"
-                        and STATE.get("account_id")
-                        and STATE.get("feed_source") in {
-                            "authenticated_websocket:event_182",
-                            "authenticated_websocket:event_183",
-                        }
-                        and len(STATE.get("assets") or [])>0
-                    )
+                    account_ready=account_ready_now()
                     if not account_ready:
                         log.warning(
                             "FIVE_SCAN_ACCOUNT_NOT_READY cycle=%s signal_utc=%s now_utc=%s",
