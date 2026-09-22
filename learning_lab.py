@@ -34,6 +34,7 @@ RESULT_WATCH_POLL_SECONDS = max(2, min(15, int(os.getenv("LEARNING_RESULT_WATCH_
 RESULT_WATCH_EXTRA_SECONDS = max(60, min(300, int(os.getenv("LEARNING_RESULT_WATCH_EXTRA_SECONDS","180"))))
 LEARNING_TRADE_RETENTION_HOURS = 48
 COUNCIL_REFRESH_SECONDS = max(300, min(1800, int(os.getenv("LEARNING_COUNCIL_REFRESH_SECONDS","900"))))
+COUNCIL_CALL_TIMEOUT_SECONDS = max(5, min(15, int(os.getenv("LEARNING_COUNCIL_CALL_TIMEOUT_SECONDS","8"))))
 _council_cache = {"session_id":"", "created_at":0.0, "data":{}}
 _pending = {}
 _open = {}
@@ -410,7 +411,13 @@ async def _build_candidate():
         )
     else:
         try:
-            council=await strategy_council_with_fallback(council_payload)
+            council=await asyncio.wait_for(
+                strategy_council_with_fallback(council_payload),
+                timeout=COUNCIL_CALL_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            council={}
+            print(f"AI_STRATEGY_COUNCIL_TIMEOUT seconds={COUNCIL_CALL_TIMEOUT_SECONDS} fallback=local_brain")
         except Exception as e:
             council={}
             print(f"AI_STRATEGY_COUNCIL_FAILED type={type(e).__name__} message={str(e)[:140]} fallback=local_brain")
