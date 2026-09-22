@@ -3228,82 +3228,129 @@ async def cycle_loop():
                     cycle_id,pass_no,type(e).__name__,str(e)[:160]
                 )
 
-            # Final recovery window: if the scheduled deep pass returns no
-            # eligible candidate, re-check the candidates found in earlier passes using
-            # the latest closed candles. This is a fresh Brain decision, not a stale
-            # candidate bypass. Keep a hard time budget so the exact 30s lead is never
-            # sacrificed.
-            if candidate is None and pass_no==5 and candidate_pool:
-                recovery_remaining=max(0,signal_at-time.time())
-                if recovery_remaining>=8.0:
-                    try:
-                        recovery_timeout=min(10.0,max(1.0,recovery_remaining-6.0))
+            # Final recovery window: a narrow pass-5 result is still recoverable.
+            # The previous condition only retried when pass 5 returned NO candidate.
+            # If pass 5 returned exactly one candidate and that candidate failed the
+            # last-second closed-candle gate, the cycle had no fallback even when an
+            # earlier-pass candidate remained available in candidate_pool.
+            #
+            # Recovery does NOT relax any safety rule and never changes direction:
+            # it simply re-runs the Brain/AI qualification against the latest closed
+            # candles for unused candidates already discovered in this same cycle.
+            if pass_no==5 and candidate_pool:
+                prepared_keys=set()
+                if isinstance(candidate,list):
+                    for _item in candidate:
+                        if isinstance(_item,dict) and _item.get("pair"):
+                            prepared_keys.add((
+                                _item.get("pair"),
+                                str(_item.get("entry_candle_ts")),
+                                str(_item.get("direction") or "").upper()
+                            ))
+                recovery_seeds=[]
+                for _key,_item in candidate_pool.items():
+                    if not isinstance(_item,dict) or not _item.get("pair"):
+                        continue
+                    item_key=(
+                        _item.get("pair"),
+                        str(_item.get("entry_candle_ts")),
+                        str(_item.get("direction") or "").upper()
+                    )
+                    if item_key in prepared_keys:
+                        continue
+                    recovery_seeds.append(_item)
+                # Recover only when the deep pool is narrower than two candidates.
+                # This is an availability/resilience aid; the authoritative send
+                # gate below remains unchanged.
+                pass5_depth=len(prepared_keys)
+                if pass5_depth < 2 and recovery_seeds:
+                    recovery_remaining=max(0,signal_at-time.time())
+                    if recovery_remaining>=10.0:
+                        recovery_timeout=min(8.0,max(1.0,recovery_remaining-8.0))
                         log.info(
-                            "FINAL_RECOVERY_WINDOW cycle=%s seeds=%d timeout=%.2f "
-                            "seconds_to_signal=%.2f",
-                            cycle_id,len(candidate_pool),recovery_timeout,
+                            "FINAL_RECOVERY_NARROW_POOL cycle=%s pass5_candidates=%s "
+                            "unused_seeds=%s timeout=%.2f seconds_to_signal=%.2f",
+                            cycle_id,pass5_depth,len(recovery_seeds),recovery_timeout,
                             recovery_remaining
                         )
-                        candidate=await asyncio.wait_for(
-                            final_candidate(
-                                require_live_price=True,
-                                deep_analysis=True,
-                                seed_candidates=list(candidate_pool.values())
-                            ),
-                            timeout=recovery_timeout
-                        )
-                        if candidate is not None:
-                            candidate=candidate.copy()
-                            candidate["expiry_minutes"]=1
-                            candidate["qualified_pass"]=5
-                            candidate["deep_verified"]=True
-                            candidate["final_prepared_pass"]=5
-                            key=(
-                                candidate.get("pair"),
-                                str(candidate.get("entry_candle_ts")),
-                                str(candidate.get("direction") or "").upper()
+                        try:
+                            recovered=await asyncio.wait_for(
+                                final_candidate(
+                                    require_live_price=False,
+                                    deep_analysis=True,
+                                    use_cached_only=True,
+                                    seed_candidates=recovery_seeds,
+                                    return_ranked=True,
+                                ),
+                                timeout=recovery_timeout
                             )
-                            candidate_pool[key]=candidate
-                            try:
-                                pin_ttl=max(
-                                    8.0,
-                                    target-time.time()+8.0
-                                )
-                                await pin_account_tick_pairs(
-                                    [candidate.get("pair")],ttl=pin_ttl
-                                )
-                            except Exception as e:
-                                log.warning(
-                                    "FINAL_RECOVERY_TICK_PIN_FAILED cycle=%s pair=%s type=%s message=%s",
-                                    cycle_id,candidate.get("pair"),
-                                    type(e).__name__,str(e)[:120]
-                                )
-                            log.info(
-                                "FINAL_RECOVERY_READY cycle=%s pair=%s confidence=%s "
-                                "strategy=%s direction=%s seconds_to_signal=%.2f",
-                                cycle_id,candidate.get("pair"),
-                                candidate.get("confidence"),
-                                candidate.get("strategy"),
-                                candidate.get("direction"),
-                                max(0,signal_at-time.time())
+                            recovered_list=recovered if isinstance(recovered,list) else (
+                                [recovered] if isinstance(recovered,dict) else []
                             )
-                        else:
-                            log.info(
-                                "FINAL_RECOVERY_NONE cycle=%s seeds=%d seconds_to_signal=%.2f",
-                                cycle_id,len(candidate_pool),
-                                max(0,signal_at-time.time())
+                            added=0
+                            final_reference=time.time()
+                            for raw_recovered in recovered_list[:6]:
+                                if not isinstance(raw_recovered,dict) or not raw_recovered.get("pair"):
+                                    continue
+                                item=raw_recovered.copy()
+                                item["expiry_minutes"]=1
+                                item["qualified_pass"]=5
+                                item["deep_verified"]=True
+                                item["final_prepared_pass"]=5
+                                item["final_delivery_precheck"]=_final_delivery_precheck(
+                                    item,final_reference
+                                )
+                                item_key=(
+                                    item.get("pair"),
+                                    str(item.get("entry_candle_ts")),
+                                    str(item.get("direction") or "").upper()
+                                )
+                                candidate_pool[item_key]=item
+                                added+=1
+                            if added:
+                                rescue_items=sorted(
+                                    candidate_pool.values(),
+                                    key=lambda x:(
+                                        float(x.get("final_delivery_precheck") or -900.0),
+                                        int(x.get("confidence") or 0),
+                                        float(x.get("strategy_margin") or 0),
+                                        float(x.get("direction_agreement") or 0),
+                                        float(x.get("market_quality") or 0)
+                                    ),
+                                    reverse=True
+                                )[:ACCOUNT_TICK_PIN_SLOTS]
+                                try:
+                                    pin_ttl=max(30.0,target-time.time()+12.0)
+                                    active_prep=await pin_account_tick_pairs(
+                                        [x.get("pair") for x in rescue_items],ttl=pin_ttl
+                                    )
+                                    log.info(
+                                        "FINAL_RECOVERY_READY cycle=%s added=%s pool=%s "
+                                        "active=%s seconds_to_signal=%.2f",
+                                        cycle_id,added,len(candidate_pool),active_prep,
+                                        max(0,signal_at-time.time())
+                                    )
+                                except Exception as e:
+                                    log.warning(
+                                        "FINAL_RECOVERY_TICK_PIN_FAILED cycle=%s type=%s message=%s",
+                                        cycle_id,type(e).__name__,str(e)[:120]
+                                    )
+                            else:
+                                log.info(
+                                    "FINAL_RECOVERY_NONE cycle=%s seeds=%s seconds_to_signal=%.2f",
+                                    cycle_id,len(recovery_seeds),
+                                    max(0,signal_at-time.time())
+                                )
+                        except asyncio.TimeoutError:
+                            log.warning(
+                                "FINAL_RECOVERY_TIMEOUT cycle=%s seeds=%s seconds_to_signal=%.2f",
+                                cycle_id,len(recovery_seeds),max(0,signal_at-time.time())
                             )
-                    except asyncio.TimeoutError:
-                        log.warning(
-                            "FINAL_RECOVERY_TIMEOUT cycle=%s seeds=%d seconds_to_signal=%.2f",
-                            cycle_id,len(candidate_pool),
-                            max(0,signal_at-time.time())
-                        )
-                    except Exception as e:
-                        log.warning(
-                            "FINAL_RECOVERY_FAILED cycle=%s type=%s message=%s",
-                            cycle_id,type(e).__name__,str(e)[:160]
-                        )
+                        except Exception as e:
+                            log.warning(
+                                "FINAL_RECOVERY_FAILED cycle=%s type=%s message=%s",
+                                cycle_id,type(e).__name__,str(e)[:160]
+                            )
 
             # When starting after a restart, compress the remaining missed
             # passes into the available pre-signal window. In normal operation
