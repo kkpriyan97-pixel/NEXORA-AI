@@ -2996,8 +2996,16 @@ async def cycle_loop():
                 candidate_pool={}
                 for item in recovered.get("candidate_pool") or []:
                     if isinstance(item,dict) and item.get("pair"):
-                        key=(item.get("pair"),str(item.get("entry_candle_ts")),
-                             str(item.get("direction") or "").upper())
+                        # Strategy is part of candidate identity. A single asset/candle
+                        # may have multiple independently-qualified techniques; recovery
+                        # must not collapse them back into one entry after a restart.
+                        key=(
+                            item.get("pair"),
+                            str(item.get("entry_candle_ts")),
+                            str(item.get("direction") or "").upper(),
+                            str(item.get("strategy") or "").upper(),
+                            str(item.get("self_strategy_version") or "")
+                        )
                         candidate_pool[key]=item
                 log.info(
                     "CYCLE_RESUME_AFTER_RESTART cycle=%s completed_pass=%s candidates=%s",
@@ -3393,7 +3401,9 @@ async def cycle_loop():
                             prepared_keys.add((
                                 _item.get("pair"),
                                 str(_item.get("entry_candle_ts")),
-                                str(_item.get("direction") or "").upper()
+                                str(_item.get("direction") or "").upper(),
+                                str(_item.get("strategy") or "").upper(),
+                                str(_item.get("self_strategy_version") or "")
                             ))
                 recovery_seeds=[]
                 for _key,_item in candidate_pool.items():
@@ -3402,7 +3412,9 @@ async def cycle_loop():
                     item_key=(
                         _item.get("pair"),
                         str(_item.get("entry_candle_ts")),
-                        str(_item.get("direction") or "").upper()
+                        str(_item.get("direction") or "").upper(),
+                        str(_item.get("strategy") or "").upper(),
+                        str(_item.get("self_strategy_version") or "")
                     )
                     if item_key in prepared_keys:
                         continue
@@ -3448,10 +3460,15 @@ async def cycle_loop():
                                 item["final_delivery_precheck"]=_final_delivery_precheck(
                                     item,final_reference
                                 )
+                                # Preserve the recovered technique identity too.
+                                # Recovery is not allowed to overwrite another strategy
+                                # for the same pair/candle/direction.
                                 item_key=(
                                     item.get("pair"),
                                     str(item.get("entry_candle_ts")),
-                                    str(item.get("direction") or "").upper()
+                                    str(item.get("direction") or "").upper(),
+                                    str(item.get("strategy") or "").upper(),
+                                    str(item.get("self_strategy_version") or "")
                                 )
                                 candidate_pool[item_key]=item
                                 added+=1
