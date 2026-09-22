@@ -673,6 +673,7 @@ ACCESS_TTL=timedelta(hours=24)
 ACCESS_CODE_TTL=timedelta(hours=24)
 ACCESS_CODE_DIGITS=10
 ADMIN_TELEGRAM_ID=os.getenv("ADMIN_TELEGRAM_ID","").strip()
+ADMIN_LIFETIME_CODE=os.getenv("ADMIN_LIFETIME_CODE","").strip()
 ADMIN_EMAIL=os.getenv("ADMIN_EMAIL","").strip()
 MAKE_ACCESS_CODE_WEBHOOK=os.getenv("MAKE_ACCESS_CODE_WEBHOOK","").strip()
 RESEND_API_KEY=os.getenv("RESEND_API_KEY","").strip()
@@ -3773,6 +3774,15 @@ async def handle_telegram_command(msg):
     txt=str(msg.get("text") or "").strip()
     if uid is None or chat_id is None: return
     cmd=txt.split()[0].lower() if txt else ""
+    if cmd=="/adminverify":
+        parts=txt.split(maxsplit=1); code=parts[1].strip() if len(parts)==2 else ""
+        if str(uid)!=ADMIN_TELEGRAM_ID:
+            await audit_access("UNAUTHORIZED_ADMIN_VERIFY_ATTEMPT",int(uid)); await telegram("❌ Admin only.",chat_id=chat_id); return
+        if ADMIN_LIFETIME_CODE and code and secrets.compare_digest(code,ADMIN_LIFETIME_CODE):
+            await telegram("✅ LIFETIME ADMIN ACCESS VERIFIED.\\n\\nThis code does not expire. Keep it private like a master password.",chat_id=chat_id)
+        else:
+            await telegram("❌ Invalid lifetime admin code.",chat_id=chat_id)
+        return
     if cmd=="/mbcode":
         if str(uid)!=ADMIN_TELEGRAM_ID:
             await audit_access("UNAUTHORIZED_MBCODE_ATTEMPT",int(uid)); await telegram("❌ Admin only.",chat_id=chat_id); return
