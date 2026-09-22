@@ -9,6 +9,7 @@ KIMI_MIN_INTERVAL_SECONDS=max(300.0,min(3600.0,float(os.getenv("KIMI_RESEARCH_MI
 _KIMI_NEXT_ALLOWED=0.0
 
 DEFAULT_RESEARCH_FALLBACKS=("GEMINI","GROQ","OPENROUTER","MISTRAL","OPENAI")
+KIMI_PRIMARY_ENABLED=os.getenv("KIMI_RESEARCH_PRIMARY_ENABLED","true").strip().lower()!="false"
 
 def _fallback_providers():
     raw=os.getenv("AI_RESEARCH_FALLBACK_PROVIDERS",",".join(DEFAULT_RESEARCH_FALLBACKS))
@@ -35,6 +36,9 @@ def _provider_configured(name):
         model={"GEMINI":"gemini-3.8-flash","GROQ":"openai/gpt-oss-20b","NVIDIA":"openai/gpt-oss-20b","OPENROUTER":"openrouter/free","MISTRAL":"mistral-small-latest"}.get(name,"")
     if not model: model=os.getenv("AI_MODEL","").strip()
     return (base,model,key) if base and model and key else None
+
+def primary_enabled():
+    return KIMI_PRIMARY_ENABLED
 
 def provider_configured():
     return bool(os.getenv("KIMI_RESEARCH_ENABLED","true").strip().lower()!="false" and os.getenv("KIMI_RESEARCH_API_KEY","").strip())
@@ -68,6 +72,8 @@ async def analyze(stage, evidence):
     compact=[]
     for e in evidence[:18]:
         compact.append({"method_id":e.get("method_id"),"domain":e.get("domain"),"language":e.get("language"),"score":e.get("evidence_score"),"evidence":e.get("evidence")})
+    if not primary_enabled():
+        log.info("KIMI_RESEARCH_PRIMARY_DISABLED reason=provider_balance_issue fallback=ENABLED")
     prompt=("You are a research-only analyst for a DEMO M1 next-candle lab. Use only supplied evidence. "
             "Do not output a live UP/DOWN signal and do not modify any live technical Brain. "
             "Separate evidence from hypotheses. Treat marketing claims as unverified. Return JSON only with items[]. "
@@ -78,7 +84,7 @@ async def analyze(stage, evidence):
     timeout=max(5.0,min(20.0,float(os.getenv("KIMI_RESEARCH_TIMEOUT","10"))))
     key=os.getenv("KIMI_RESEARCH_API_KEY","").strip()
     now=time.time()
-    if provider_configured() and now>=_KIMI_NEXT_ALLOWED:
+    if primary_enabled() and provider_configured() and now>=_KIMI_NEXT_ALLOWED:
         _KIMI_NEXT_ALLOWED=now+KIMI_MIN_INTERVAL_SECONDS
         base=os.getenv("KIMI_RESEARCH_API_BASE","https://api.moonshot.ai/v1").strip().rstrip("/")
         model=os.getenv("KIMI_RESEARCH_MODEL","kimi-k2.6").strip()
@@ -100,7 +106,7 @@ async def analyze(stage, evidence):
                 log.warning("KIMI_RESEARCH_ERROR status=%s fallback=ENABLED detail=%s",status,detail)
         except Exception as exc:
             log.warning("KIMI_RESEARCH_ERROR type=%s fallback=ENABLED message=%s",type(exc).__name__,str(exc)[:180])
-    elif provider_configured() and now<_KIMI_NEXT_ALLOWED:
+    elif primary_enabled() and provider_configured() and now<_KIMI_NEXT_ALLOWED:
         log.info("KIMI_RESEARCH_COOLDOWN remaining=%.1fs fallback=ENABLED",_KIMI_NEXT_ALLOWED-now)
 
     fallback_timeout=max(4.0,min(10.0,float(os.getenv("KIMI_RESEARCH_FALLBACK_TIMEOUT","7"))))
