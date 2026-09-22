@@ -1040,27 +1040,20 @@ def asset_key(value):
     text=_norm_text(value)
     return " ".join(text.replace("/"," ").replace("_"," ").split())
 def screenshot_asset_allowed(x):
-    if not isinstance(x,dict): return False
-    p=pair_name(x)
-    # Current event-182 payloads expose the exact instrument ID (p/id), while
-    # some older payloads also carry a human-readable title. The screenshot
-    # baseline is therefore enforced primarily by the authenticated raw pair.
-    if p in SCREENSHOT_OPEN_PAIRS:
-        return True
-    title=display_name(x)
-    return asset_key(title) in SCREENSHOT_OPEN_PAIRS
+    # Kept for backward compatibility with older callers, but the authenticated
+    # account feed is now the sole authority for the asset universe.
+    return isinstance(x,dict) and bool(pair_name(x))
 
 def is_flex_time_asset(x):
     if not isinstance(x,dict): return False
-    # The user explicitly asked for the exact 53-asset Flex universe shown in
-    # the supplied OlympTrade screenshots: no broker-side extras and no
-    # synthetic/global market symbols. The account WebSocket remains the source
-    # of the raw asset payload and live prices.
-    return screenshot_asset_allowed(x)
+    # Never widen the universe from a public/global asset list. Every candidate
+    # must come from the authenticated account-scoped event-182 response.
+    # Open/locked/disabled state is filtered below in build_assets().
+    return bool(pair_name(x))
 
 def build_assets(client,raw):
-    # Account-scoped assets are authoritative, but the user's requested
-    # screenshot baseline is the exact permitted Flex universe.
+    # The authenticated account-scoped asset response is the sole universe.
+    # Do NOT intersect it with the old 53-item screenshot baseline.
     prof={}
     for x in raw or []:
         if not isinstance(x,dict): continue
@@ -1070,17 +1063,10 @@ def build_assets(client,raw):
 
     out=[]; seen=set(); rejected=[]
     raw_pairs={pair_name(x) for x in (raw or []) if isinstance(x,dict) and pair_name(x)}
-    matched=raw_pairs & SCREENSHOT_OPEN_PAIRS
-    missing=sorted(SCREENSHOT_OPEN_PAIRS-raw_pairs)
-    extra=sorted(raw_pairs-SCREENSHOT_OPEN_PAIRS)
     log.info(
-        "ACCOUNT_SCREENSHOT_ASSET_COMPARE expected=%d matched=%d missing=%d extra=%d",
-        len(SCREENSHOT_OPEN_PAIRS),len(matched),len(missing),len(extra)
+        "ACCOUNT_AUTHENTICATED_ASSET_UNIVERSE raw=%d unique=%d source=event_182",
+        len(raw or []),len(raw_pairs)
     )
-    if missing:
-        log.warning("ACCOUNT_SCREENSHOT_ASSET_MISSING %s",missing)
-    if extra:
-        log.info("ACCOUNT_SCREENSHOT_ASSET_EXTRA %s",extra)
     for x in raw or []:
         if not isinstance(x,dict) or not is_flex_time_asset(x):
             p=pair_name(x) if isinstance(x,dict) else ""
@@ -1116,12 +1102,12 @@ def build_assets(client,raw):
             "mode":"OTC" if "_OTC" in p.upper() else "REAL",
             "trading_mode":"FLEX_TIME","signal_eligible":not quickler
         })
-    log.info("ACCOUNT_ASSET_FILTER raw=%d accepted=%d rejected=%d",len(raw or []),len(out),len(rejected))
+    log.info("ACCOUNT_ASSET_FILTER source=authenticated_account raw=%d accepted_open=%d rejected=%d",len(raw or []),len(out),len(rejected))
     if rejected:
         log.info("ACCOUNT_ASSET_REJECTED sample=%s",rejected[:25])
     # Audit the exact account-facing/raw names that Candice accepted.
     log.info(
-        "ACCOUNT_ASSET_NAMES %s",
+        "ACCOUNT_OPEN_ASSET_NAMES %s",
         [{"pair":a["pair"],"account_name":a["display_name"]} for a in out]
     )
     return out
