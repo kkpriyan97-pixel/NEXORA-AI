@@ -881,10 +881,13 @@ ACCOUNT_TICK_SUB_SEM=asyncio.Semaphore(1)
 ACCOUNT_TICK_SUB_BATCH=4
 ACCOUNT_TICK_SUB_RETRY=2.0
 ACCOUNT_TICK_SUB_DELAY=0.35
-# Keep the broker-proven two normal coverage slots; final candidates use those
-# same slots but are prepared well before the exact signal boundary.
-ACCOUNT_TICK_MAX_SLOTS=2
-ACCOUNT_TICK_PIN_SLOTS=2
+# The authenticated broker feed has been observed to accept four simultaneous
+# event-1 pair subscriptions. Use all four slots so the final fallback pool can
+# keep multiple independent candidates live at the exact signal boundary.
+# This does not change Brain direction/quality gates; it only preserves live
+# quote coverage for fallback candidates.
+ACCOUNT_TICK_MAX_SLOTS=4
+ACCOUNT_TICK_PIN_SLOTS=4
 ACCOUNT_TICK_ROTATE_INTERVAL=15.0
 ACCOUNT_TICK_SUBSCRIBED=set()
 ACCOUNT_TICK_LAST_ATTEMPT={}
@@ -1147,6 +1150,9 @@ async def scan_account_live_feed():
 
 
 async def account_live_feed_worker():
+    # This worker is observability only. Actual event-1 tick reception is
+    # continuous in on_tick(); the audit interval must not create avoidable CPU
+    # and log pressure on the free Render instance.
     while True:
         try:
             await scan_account_live_feed()
@@ -1154,7 +1160,7 @@ async def account_live_feed_worker():
             raise
         except Exception as e:
             log.warning("ACCOUNT_LIVE_FEED_WORKER_ERROR type=%s message=%s",type(e).__name__,str(e)[:160])
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(2.0)
 
 
 async def _unsubscribe_account_tick(pair):
@@ -1249,9 +1255,10 @@ async def pin_account_tick_pairs(pairs,ttl=12.0):
 async def ensure_account_tick_subscriptions():
     """Rotate the authenticated event-1 tick slots across the exact account asset universe.
 
-    The broker currently accepts only a small number of simultaneous per-connection
-    pair subscriptions (observed at four). Do not hammer the same connection with
-    requests for all 53 pairs; rotate the four live slots and pin final candidates.
+    The authenticated broker feed has been observed to accept four simultaneous
+    per-connection pair subscriptions. Rotate those four live slots across the
+    complete account universe and pin final candidates before the exact boundary.
+    Never attempt to subscribe all account assets at once.
     """
     global ACCOUNT_TICK_ROTATE_CURSOR, ACCOUNT_TICK_LAST_ROTATION
     client=CLIENT
@@ -3010,9 +3017,11 @@ async def cycle_loop():
 
                         if pass_no==4:
                             # Prepare the authenticated tick slots well before the
-                            # exact 30-second signal boundary. Any broker
-                            # subscribe/unsubscribe latency is absorbed here,
-                            # never at signal send time.
+                            # exact 30-second signal boundary. Keep up to four
+                            # independent final candidates live so the fallback
+                            # loop can continue even when one or more fail the
+                            # final candle gate. Any broker latency is absorbed
+                            # here, never at signal send time.
                             prep_reference=time.time()
                             for _item in prepared_selected:
                                 _item["final_delivery_precheck"]=_final_delivery_precheck(_item,prep_reference)
