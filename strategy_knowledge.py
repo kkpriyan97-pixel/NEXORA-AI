@@ -370,7 +370,7 @@ async def promote_campaign_strategy(strategy_id: str, samples: int, wins: int, l
     if not DB_URL or not strategy_id:
         return False
     samples=int(samples or 0); wins=int(wins or 0); losses=int(losses or 0)
-    if samples < 100 or wins / max(1,wins+losses) < 0.85:
+    if samples < 100 or wins / max(1,samples) < 0.85:
         return False
     import psycopg
     try:
@@ -393,7 +393,7 @@ async def promote_campaign_strategy(strategy_id: str, samples: int, wins: int, l
                             "samples":samples,
                             "wins":wins,
                             "losses":losses,
-                            "win_rate":round(100*wins/max(1,wins+losses),2),
+                            "win_rate":round(100*wins/max(1,samples),2),
                             "gate":"100_DEMO_TRADES_AND_85_PERCENT_MIN",
                         },separators=(",",":")),
                         str(strategy_id).upper()
