@@ -1248,7 +1248,7 @@ def _tick_pinned_pairs():
     return [p for p,until in ACCOUNT_TICK_PINNED.items() if float(until)>now]
 
 async def pin_account_tick_pairs(pairs,ttl=12.0):
-    """Pin final candidate tick slots atomically against the rotation worker."""
+    """Pin final candidate tick slots without destroying healthy fallback coverage."""
     global ACCOUNT_TICK_LAST_ROTATION
     async with ACCOUNT_TICK_CONTROL_LOCK:
         unique=[]
@@ -1261,8 +1261,13 @@ async def pin_account_tick_pairs(pairs,ttl=12.0):
         until=time.time()+float(ttl)
         for p in targets:
             ACCOUNT_TICK_PINNED[p]=until
-        current=set(ACCOUNT_TICK_SUBSCRIBED)
-        for p in list(current):
+
+        # Never turn a transient event-12 rejection into zero live-tick coverage.
+        # Remember healthy slots and restore any unused slot when a target cannot
+        # be subscribed. The Brain candidate/direction is unchanged; this is only
+        # read-only quote-feed resilience.
+        previous_active=set(ACCOUNT_TICK_SUBSCRIBED)
+        for p in list(previous_active):
             if p not in targets:
                 await _unsubscribe_account_tick(p)
 
@@ -1270,10 +1275,22 @@ async def pin_account_tick_pairs(pairs,ttl=12.0):
             if p not in ACCOUNT_TICK_SUBSCRIBED:
                 await _subscribe_account_tick(p)
 
+        restored=[]
+        for p in sorted(previous_active):
+            if len(ACCOUNT_TICK_SUBSCRIBED)>=ACCOUNT_TICK_MAX_SLOTS:
+                break
+            if p in targets or p in ACCOUNT_TICK_SUBSCRIBED:
+                continue
+            if await _subscribe_account_tick(p):
+                restored.append(p)
+
+        active_targets=sum(1 for p in targets if p in ACCOUNT_TICK_SUBSCRIBED)
         ACCOUNT_TICK_LAST_ROTATION=time.time()
-        log.info("ACCOUNT_TICK_PIN targets=%s active=%s ttl=%.1f",
-                 targets,sorted(ACCOUNT_TICK_SUBSCRIBED),float(ttl))
-        return sum(1 for p in targets if p in ACCOUNT_TICK_SUBSCRIBED)
+        log.info(
+            "ACCOUNT_TICK_PIN targets=%s active=%s active_targets=%d restored=%s ttl=%.1f",
+            targets,sorted(ACCOUNT_TICK_SUBSCRIBED),active_targets,restored,float(ttl)
+        )
+        return active_targets
 
 async def ensure_account_tick_subscriptions():
     """Rotate the authenticated event-1 tick slots across the exact account asset universe.
@@ -2906,16 +2923,22 @@ async def cycle_loop():
 
             scan_budget=max(1.0,remaining-4.0)
             try:
+                # Pass 5 is the delivery-critical pass. Earlier passes already
+                # refreshed the 60-second candle dataset, so forcing another full
+                # 52-asset broker fetch here can consume the exact 30s lead window.
+                # Reuse healthy recent candles on pass 5; stale/failed assets still
+                # refresh through refresh_candles()'s normal due/stale logic.
+                force_refresh=(pass_no!=5)
                 await asyncio.wait_for(
-                    refresh_candles(force=True),
+                    refresh_candles(force=force_refresh),
                     timeout=scan_budget
                 )
                 log.info(
-                    "ACCOUNT_FULL_SCAN cycle=%s scan=SCAN_%s pass=%s assets=%d analyzed=%d "
-                    "seconds_to_signal=%.2f deep=%s catchup=%s",
+                    "ACCOUNT_FULL_SCAN cycle=%s scan=SCAN_%s pass=%s assets=%s analyzed=%s "
+                    "seconds_to_signal=%.2f deep=%s catchup=%s force_refresh=%s",
                     cycle_id,pass_no,pass_no,len(STATE["assets"]),
                     len(STATE["analyses"]),max(0,signal_at-time.time()),
-                    pass_no==5,catchup_mode
+                    pass_no==5,catchup_mode,force_refresh
                 )
             except asyncio.TimeoutError:
                 log.warning(
@@ -3162,21 +3185,10 @@ async def cycle_loop():
             cycle_id,len(candidate_pool),len(ranked_pool),int(signal_lead)
         )
 
-        # Warm several final candidates before the exact boundary. The broker
-        # rotates a small number of live-tick slots, so one stale top quote must
-        # not turn the entire cycle into a no-signal result.
-        if ranked_pool:
-            try:
-                await pin_account_tick_pairs(
-                    [x.get("pair") for x in ranked_pool[:4] if x.get("pair")],
-                    ttl=max(8.0,target-time.time()+6.0)
-                )
-            except Exception as e:
-                log.warning(
-                    "FINAL_POOL_QUOTE_PIN_FAILED cycle=%s type=%s message=%s",
-                    cycle_id,type(e).__name__,str(e)[:120]
-                )
-
+        # Do not perform awaited broker subscription work at the exact
+        # 30s signal boundary. Pass 5 already pre-pins its strongest candidates
+        # before reaching this point; any second pin here can consume the final
+        # delivery milliseconds and make a valid cycle miss its own signal slot.
         if time.time()<=signal_at+0.20:
             for candidate in ranked_pool:
                 try:
