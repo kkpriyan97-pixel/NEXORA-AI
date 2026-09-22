@@ -426,17 +426,10 @@ def analyze_asset(asset, candles, price=None):
             return min(94.0, s)
 
         if strategy == "MOMENTUM":
-            # In a SIDEWAYS 15m regime, a single strong 1m candle is not enough.
-            # Require stronger displacement, repeated directional candles, and
-            # directional efficiency before allowing a 1m momentum candidate.
+            # Momentum is a continuation technique in this 1m system. A SIDEWAYS
+            # 15m regime is excluded completely to avoid single-candle range noise.
             if trend == "SIDEWAYS":
-                if (
-                    momentum_norm < 0.50
-                    or body_ratio < 0.55
-                    or aligned_recent(direction) < 2
-                    or _efficiency(v, 8) < 0.50
-                ):
-                    return -1.0
+                return -1.0
             if momentum_norm < 0.30 or body_ratio < 0.45:
                 return -1.0
             if (direction == "UP" and momentum <= 0) or (direction == "DOWN" and momentum >= 0):
