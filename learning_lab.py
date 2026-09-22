@@ -259,8 +259,8 @@ async def _advance_campaign_if_complete():
     s=CAMPAIGN_STATE
     if s.get("status")!="ACTIVE" or int(s.get("sampled") or 0)<CAMPAIGN_MIN_TRADES:
         return False
-    decided=max(1,int(s.get("wins") or 0)+int(s.get("losses") or 0))
-    rate=float(s.get("wins") or 0)/decided
+    total=int(s.get("sampled") or 0)
+    rate=float(s.get("wins") or 0)/max(1,total)
     strategy=str(s.get("strategy") or "").upper()
     if rate>=CAMPAIGN_MIN_WIN_RATE:
         s["status"]="VALIDATED"
@@ -312,7 +312,7 @@ async def _campaign_result(result, strategy):
     print(
         f"LEARNING_STRATEGY_PROGRESS strategy={s['strategy']} "
         f"sample={s['sampled']}/100 win={s['wins']} loss={s['losses']} tie={s['ties']} "
-        f"rate={(100*s['wins']/max(1,s['wins']+s['losses'])):.2f}%"
+        f"rate={(100*s['wins']/max(1,s['sampled'])):.2f}%"
     )
     await _save_campaign()
     if s["sampled"]>=CAMPAIGN_MIN_TRADES:
