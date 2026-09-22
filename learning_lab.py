@@ -291,6 +291,7 @@ async def _place_demo(rec, actor_id):
     if direction not in {"up","down"} or not pair:
         return False,"INVALID_DIRECTION_OR_PAIR",None
     try:
+        print(f"LEARNING_ORDER_ATTEMPT pair={pair} direction={direction.upper()} account_id={account_id} group=demo amount={AMOUNT} duration={DURATION_SECONDS}")
         # The group is hard-coded to demo and verified again immediately before
         # the broker request. No real/live group is accepted by this layer.
         result=await asyncio.wait_for(
@@ -338,6 +339,7 @@ async def _place_demo(rec, actor_id):
         "placed_at":now,"entry_ts":now,"entry_price":entry_price,
     })
     _open[str(trade_id)]=rec
+    print(f"LEARNING_ORDER_CONFIRMED pair={pair} trade_id={trade_id} entry={entry_price} account_id={account_id} group=demo")
     return True,"PLACED",rec
 
 async def handle_callback(query):
@@ -510,7 +512,7 @@ async def run_forever():
                         log_msg=(f"PRACTICE_WINDOW_ACTIVE day={day} start={START_HOUR:02d}:{START_MINUTE:02d} duration=2h "
                                  f"strategy={candidate['strategy']} pair={candidate['pair']} source={candidate['source']}")
                         print(log_msg)
-                        print(f"LEARNING_PRACTICE_ROTATION cursor={_practice_cursor} assets={len((await asyncio.to_thread(lambda:list((_cfg.get('snapshot_provider')() or {}).get('assets') or [])))) if _cfg.get('snapshot_provider') else 0}")
+                        print(f"LEARNING_PRACTICE_ROTATION cursor={_practice_cursor}")
                 else:
                     # Keep checking within the 2h window; a valid setup can appear
                     # later as candles change.
@@ -520,7 +522,7 @@ async def run_forever():
             for tid,rec in list(_open.items()):
                 asyncio.create_task(_fallback_watch(rec)) if not rec.get("_watch_started") else None
                 rec["_watch_started"]=True
-            # Expire stale approvals.
+            # Expire stale execution requests.
             for token,rec in list(_pending.items()):
                 if time.time()>float(rec.get("expires_at",0)):
                     _pending.pop(token,None)
