@@ -763,6 +763,59 @@ async def _send_request(candidate, notify=True):
         print(f"LEARNING_ORDER_REPORT_FAILED type={type(exc).__name__} message={str(exc)[:120]}")
         return True if rec.get("trade_id") else False
 
+
+async def _send_campaign_batch(candidates):
+    strategy=str(CAMPAIGN_STATE.get("strategy") or "").upper()
+    if not strategy or not isinstance(candidates,list):
+        return 0
+    remaining=CAMPAIGN_MIN_TRADES-int(CAMPAIGN_STATE.get("sampled") or 0)
+    if remaining<=0:
+        return 0
+    unique=[]; seen=set()
+    for item in candidates:
+        if not isinstance(item,dict):
+            continue
+        if str(item.get("strategy") or "").upper()!=strategy:
+            continue
+        pair=str(item.get("pair") or "")
+        if not pair or pair in seen:
+            continue
+        seen.add(pair)
+        unique.append(item)
+        if len(unique)>=remaining:
+            break
+    if not unique:
+        print(f"LEARNING_CAMPAIGN_NO_ELIGIBLE_ASSETS strategy={strategy} reason=no_valid_fixed_strategy_setup")
+        return 0
+
+    async def one(item):
+        async with CAMPAIGN_ASSET_SEM:
+            return await _send_request(item,notify=False)
+
+    results=await asyncio.gather(*(one(item) for item in unique),return_exceptions=True)
+    accepted=sum(1 for r in results if r is True)
+    failed=sum(1 for r in results if r is not True)
+    minute=int(time.time()//60)
+    print(
+        f"LEARNING_CAMPAIGN_BATCH strategy={strategy} minute={minute} "
+        f"evaluated={len(candidates)} selected={len(unique)} accepted={accepted} failed={failed} "
+        f"completed={CAMPAIGN_STATE.get('sampled',0)}/100"
+    )
+    if accepted:
+        try:
+            await _cfg["send_message"](
+                "🧠 DEMO LEARNING BATCH\n\n"
+                f"🧩 Strategy → {strategy}\n"
+                f"📊 Account assets evaluated → {len(candidates)}\n"
+                f"🤖 DEMO trades started → {accepted}\n"
+                f"🎯 Campaign progress → {CAMPAIGN_STATE.get('sampled',0)}/100 completed\n"
+                "🔐 DEMO ACCOUNT ONLY",
+                chat_id=_cfg.get("admin_id") or None
+            )
+        except Exception:
+            pass
+    return accepted
+
 async def _place_demo(rec, actor_id):
     if not practice_active():
         return False,"LEARNING_WINDOW_CLOSED",None
@@ -1225,7 +1278,15 @@ async def run_forever():
         print("LEARNING_TRADE_RESTORE_TIMEOUT seconds=5 fallback=memory_only")
     except Exception as e:
         print(f"LEARNING_TRADE_RESTORE_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]} fallback=memory_only")
-    print("LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=18:00-06:00 timezone=Asia/Dubai demo_only=True ai_council=True")
+    try:
+        await asyncio.wait_for(ensure_campaign_table(),timeout=5.0)
+    except Exception as e:
+        print(f"LEARNING_CAMPAIGN_INIT_FAILED type={type(e).__name__} message={str(e)[:120]}")
+    print(
+        "LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=18:00-06:00 "
+        "timezone=Asia/Dubai demo_only=True ai_council=True "
+        "campaign=ONE_STRATEGY_AT_A_TIME target=100 min_win_rate=85% target=90%"
+    )
     last_heartbeat=0.0
     last_scan=0.0
     while True:
@@ -1240,41 +1301,38 @@ async def run_forever():
             if now >= window_end and _last_report_day != day:
                 await _send_daily_report(day)
                 _last_report_day = day
-            if practice_active(now) and not _pending and not _open:
+            if practice_active(now):
                 if time.time()-last_heartbeat >= 60:
                     last_heartbeat=time.time()
                     print(
                         f"LEARNING_HEARTBEAT day={day} active=True pending={len(_pending)} "
                         f"open={len(_open)} placed={_daily['placed']} win={_daily['win']} "
-                        f"loss={_daily['loss']} tie={_daily['tie']} blocked={_daily['blocked']}"
+                        f"loss={_daily['loss']} tie={_daily['tie']} blocked={_daily['blocked']} "
+                        f"campaign_strategy={CAMPAIGN_STATE.get('strategy') or 'INIT'} "
+                        f"campaign_progress={CAMPAIGN_STATE.get('sampled',0)}/100"
                     )
-                if time.time()-last_scan >= LOOP_SECONDS:
+                if CAMPAIGN_STATE.get("session_id")!=str(day) or not CAMPAIGN_STATE.get("strategy"):
+                    await _initialize_campaign(str(day))
+                if CAMPAIGN_STATE.get("status")=="ACTIVE" and time.time()-last_scan >= LOOP_SECONDS:
                     last_scan=time.time()
-                    print(f"LEARNING_WINDOW_ACTIVE day={day} start=18:00 end=06:00 timezone=Asia/Dubai ai_council=True")
+                    strategy=str(CAMPAIGN_STATE.get("strategy") or "").upper()
+                    print(
+                        f"LEARNING_WINDOW_ACTIVE day={day} start=18:00 end=06:00 "
+                        f"timezone=Asia/Dubai ai_council=True fixed_strategy={strategy} "
+                        f"target=100 min_win_rate=85%"
+                    )
                     try:
-                        candidate=await asyncio.wait_for(
-                            _build_candidate(),
+                        candidates=await asyncio.wait_for(
+                            _build_candidate(strategy,return_all=True),
                             timeout=LEARNING_SCAN_TIMEOUT_SECONDS,
                         )
                     except asyncio.TimeoutError:
-                        candidate=None
+                        candidates=[]
                         print(f"LEARNING_SCAN_TIMEOUT seconds={LEARNING_SCAN_TIMEOUT_SECONDS} fallback=next_scan")
                     except Exception as e:
-                        candidate=None
+                        candidates=[]
                         print(f"LEARNING_SCAN_FAILED type={type(e).__name__} message={str(e)[:160]} fallback=next_scan")
-                else:
-                    candidate=None
-                if candidate:
-                    sent = await _send_request(candidate)
-                    if sent:
-                        log_msg=(f"PRACTICE_WINDOW_ACTIVE day={day} start={START_HOUR:02d}:{START_MINUTE:02d} duration=12h "
-                                 f"strategy={candidate['strategy']} pair={candidate['pair']} source={candidate['source']}")
-                        print(log_msg)
-                        print(f"LEARNING_PRACTICE_ROTATION cursor={_practice_cursor}")
-                else:
-                    # Keep checking within the 2h window; a valid setup can appear
-                    # later as candles change.
-                    pass
+                    await _send_campaign_batch(candidates)
             # While the 2h window is active, allow another candidate only after the
             # previous order has completed. This prevents overlapping demo orders.
             for tid,rec in list(_open.items()):
