@@ -223,7 +223,7 @@ def _efficiency(v, n=8):
     return min(1.0, abs(window[-1] - window[0]) / total)
 
 
-def analyze_asset(asset, candles, price=None):
+def analyze_asset(asset, candles, price=None, forced_strategy=None):
     cs = [_norm(c) for c in candles if isinstance(c, dict)]
     if len(cs) < 45:
         return None
@@ -539,8 +539,13 @@ def analyze_asset(asset, candles, price=None):
         "VOLATILITY",
     )
 
+    forced = str(forced_strategy or "").upper().strip()
+    if forced and forced not in strategies:
+        return None
+    active_strategies = (forced,) if forced else strategies
+
     candidates = []
-    for strategy in strategies:
+    for strategy in active_strategies:
         for direction in ("UP", "DOWN"):
             sc = score(direction, strategy)
             if sc < 0:
