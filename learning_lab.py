@@ -353,13 +353,26 @@ async def _build_candidate():
         "TREND_FOLLOWING","MOMENTUM","BREAKOUT","PULLBACK",
         "REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY"
     ]
+    print(
+        f"LEARNING_CANDIDATE_SCAN assets={len(assets)} candles={len(candles)} "
+        f"prices={len(prices)} preferred={','.join(preferred[:12])}"
+    )
     batch=max(1,int(os.getenv("LEARNING_ASSET_BATCH","8")))
     global _practice_cursor
     offset=_practice_cursor
     _practice_cursor=(offset+batch)%max(1,len(assets)) if assets else 0
-    return await asyncio.to_thread(
+    candidate=await asyncio.to_thread(
         _analyze_snapshot_sync,assets,candles,prices,preferred,hints,batch,offset
     )
+    if candidate:
+        print(
+            f"LEARNING_CANDIDATE_READY pair={candidate.get('pair')} "
+            f"direction={candidate.get('direction')} confidence={candidate.get('confidence')} "
+            f"strategy={candidate.get('strategy')} source={candidate.get('source')}"
+        )
+    else:
+        print(f"LEARNING_CANDIDATE_NONE batch={batch} cursor={offset} reason=no_qualified_candidate")
+    return candidate
 
 async def _send_request(candidate):
     token=os.urandom(12).hex()
@@ -680,6 +693,31 @@ async def _fallback_watch(rec):
                 chat_id=_cfg.get("admin_id") or None
             )
 
+
+async def _strategy_validation_snapshot(strategy_id):
+    """Read current strategy-learning status without changing Brain decisions."""
+    if not DB_URL or not strategy_id:
+        return None
+    try:
+        import psycopg
+        def read():
+            with psycopg.connect(DB_URL,connect_timeout=5) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        SELECT samples,wins,losses,status
+                        FROM nexora_strategy_knowledge
+                        WHERE strategy_id=%s
+                    """,(str(strategy_id),))
+                    return cur.fetchone()
+        row=await asyncio.to_thread(read)
+        if not row:
+            return None
+        samples,wins,losses,status=row
+        return {"samples":int(samples or 0),"wins":int(wins or 0),
+                "losses":int(losses or 0),"status":str(status or "CANDIDATE")}
+    except Exception as e:
+        print(f"LEARNING_VALIDATION_SNAPSHOT_FAILED strategy={strategy_id} type={type(e).__name__} message={str(e)[:120]}")
+        return None
 
 async def _validated_strategy_ids():
     if not DB_URL:
