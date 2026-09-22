@@ -853,9 +853,9 @@ ACCOUNT_LIVE_SCAN_CURSOR=0
 ACCOUNT_TICK_SUB_SEM=asyncio.Semaphore(1)
 ACCOUNT_TICK_SUB_BATCH=4
 ACCOUNT_TICK_SUB_RETRY=2.0
-ACCOUNT_TICK_SUB_DELAY=0.15
+ACCOUNT_TICK_SUB_DELAY=0.35
 ACCOUNT_TICK_MAX_SLOTS=2
-ACCOUNT_TICK_ROTATE_INTERVAL=1.0
+ACCOUNT_TICK_ROTATE_INTERVAL=6.0
 ACCOUNT_TICK_SUBSCRIBED=set()
 ACCOUNT_TICK_LAST_ATTEMPT={}
 ACCOUNT_TICK_PINNED={}
@@ -1227,6 +1227,10 @@ async def _subscribe_account_tick(pair):
         return False
     async with ACCOUNT_TICK_SUB_SEM:
         try:
+            # Broker-side event-12/13 rejects are transient when subscription
+            # churn is too fast. Keep the authenticated feed stable and retry
+            # on the next rotation instead of hammering the same connection.
+            await asyncio.sleep(ACCOUNT_TICK_SUB_DELAY)
             await asyncio.wait_for(client.market.subscribe_ticks(pair),timeout=6.0)
             ACCOUNT_TICK_SUBSCRIBED.add(pair)
             ACCOUNT_TICK_LAST_ATTEMPT[pair]=time.time()
