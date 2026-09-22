@@ -1535,7 +1535,7 @@ async def refresh_candles(force=False):
         p=a["pair"]
         # Every authenticated account asset is analyzed for coverage. The
         # signal-eligibility flag is applied later by final_candidate(); this
-        # keeps the account-wide 52/52 scan complete without allowing a
+        # keeps the account-wide 104/104 catalog analysis complete without allowing a
         # non-signal asset into the send gate.
         async with CANDLE_FETCH_SEM:
             last_reason="unknown"
@@ -2008,7 +2008,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     BRAIN.prune_expired_cooldowns()
 
     # Hard account boundary: Brain may select/analyze an asset only after the
-    # authenticated OlympTrade account-scoped asset feed is ready.
+    # fixed user-supplied 104-asset catalog is loaded for the authenticated demo session.
     if not CLIENT or STATE.get("account_group") != "demo" or not STATE.get("account_id"):
         log.info("BRAIN_ACCOUNT_GATE blocked=account_not_ready")
         return None
@@ -3504,9 +3504,8 @@ async def market_worker():
             # preserves the explicitly requested account_id and separately
             # reports the e:55 balance accounts. The previous app-level guard
             # incorrectly treated absence from e:55.account_id as proof that
-            # the token belonged to another account. That caused a valid session
-            # to be rejected before the account-scoped e:182 asset API was even
-            # tested.
+            # the token belonged to another account. That could reject a valid
+            # authenticated session before the static asset catalog was loaded.
             event55_accounts=[]
             for msg in client.get_cached_events(parameters.E_BALANCE_UPDATE):
                 event55_accounts.extend(extract_account_ids(msg,"demo"))
