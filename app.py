@@ -1074,14 +1074,28 @@ def build_assets(client,raw):
             continue
         p=pair_name(x)
         if not p or p in seen: continue
-        if x.get("disabled") is True or x.get("locked") is True or x.get("locked_trading") is True:
-            rejected.append(p)
-            continue
+        # API availability flags are metadata only. An instrument already
+        # returned by the authenticated account-scoped Event 182 remains inside
+        # the account scan universe; an API lock/disabled flag cannot delete it
+        # or stop the cycle. Signal eligibility can use the flag separately.
+        api_blocked=bool(
+            x.get("disabled") is True
+            or x.get("locked") is True
+            or x.get("locked_trading") is True
+            or any(
+                x.get(k) is False
+                for k in ("active","available","tradable","is_active","is_available","is_tradable")
+                if k in x
+            )
+            or str(x.get("status") or x.get("state") or "").strip().lower()
+                in {"disabled","locked","inactive","unavailable","closed","off"}
+        )
         seen.add(p)
         # Preserve a genuine account-facing name when the authenticated payload
         # supplies one. If the payload omits the display label, keep the same
         # authenticated account instrument in the scan using its pair as the
-        # internal/display fallback; never source assets from a public API universe.
+        # internal/display fallback; never source assets from a public/global
+        # catalogue and never let API metadata remove it from the universe.
         title=display_name(x) or p
         v=prof.get(p,x.get("profitability",0))
         try: profitability=int(v)
@@ -1094,9 +1108,13 @@ def build_assets(client,raw):
         out.append({
             "pair":p,"display_name":title,"title":title,
             "signal_asset_label":title,"profitability":profitability,
-            "locked":False,"locked_trading":False,"disabled":False,
+            "locked":bool(x.get("locked") is True),
+            "locked_trading":bool(x.get("locked_trading") is True),
+            "disabled":bool(x.get("disabled") is True),
+            "api_blocked":api_blocked,
             "mode":"OTC" if "_OTC" in p.upper() else "REAL",
-            "trading_mode":"FLEX_TIME","signal_eligible":not quickler
+            "trading_mode":"FLEX_TIME",
+            "signal_eligible":not quickler and not api_blocked
         })
     log.info("ACCOUNT_ASSET_FILTER source=authenticated_account raw=%d accepted_open=%d rejected=%d",len(raw or []),len(out),len(rejected))
     if rejected:
@@ -1109,15 +1127,17 @@ def build_assets(client,raw):
     return out
 
 async def sync_account_assets(client, reason="periodic"):
-    """Refresh account-visible assets directly from the authenticated WebSocket session."""
+    """Refresh the canonical asset universe from the authenticated account session."""
     if not client or not client.account_id:
         return False
     try:
-        # Use the library's authenticated account-scoped availability filter.
-        # It removes assets explicitly marked unavailable/locked/inactive/closed
-        # while preserving every currently available asset from this account.
+        # Event 182 is the authenticated/account-scoped source. Do NOT use
+        # get_available_assets(), because that helper applies API-side
+        # availability filtering before Candice gets to see the account universe.
+        # The raw account response is authoritative; API metadata is retained
+        # per asset but cannot remove an account asset from the scan universe.
         raw=await asyncio.wait_for(
-            client.market.get_available_assets(client.account_id),
+            client.market.get_profitability(client.account_id),
             timeout=10.0
         )
     except Exception as e:
@@ -1130,63 +1150,9 @@ async def sync_account_assets(client, reason="periodic"):
                     client.account_id,reason,len(STATE["assets"]))
         return False
 
-    # Event 182 is authenticated/account-scoped, but the broker can still include
-    # instruments whose market session is currently closed.  Respect the broker's
-    # own trading schedule fields when they are present; never invent an allowlist
-    # or use a public/global asset catalogue. OTC instruments remain eligible unless
-    # the account feed explicitly marks them unavailable/locked.
-    def _asset_is_currently_open(item, now_ts):
-        pair=str(item.get("pair") or item.get("p") or item.get("symbol") or item.get("instrument") or item.get("id") or "")
-        if "_OTC" in pair.upper():
-            return True
-        for key in ("disabled","locked","locked_trading"):
-            if item.get(key) is True:
-                return False
-        status=str(item.get("status") or item.get("state") or "").strip().lower()
-        if status in {"disabled","locked","inactive","unavailable","closed","off"}:
-            return False
-
-        def _ts(*keys):
-            for key in keys:
-                value=item.get(key)
-                try:
-                    if value is not None:
-                        return float(value)
-                except (TypeError,ValueError):
-                    pass
-            return None
-
-        open_ts=_ts("time_open_trading","time_open")
-        close_ts=_ts("time_close_trading","time_close")
-        if open_ts is None and close_ts is None:
-            # No broker schedule evidence: keep the authenticated account asset.
-            return True
-        if open_ts is not None and now_ts < open_ts:
-            return False
-        if close_ts is not None and now_ts > close_ts:
-            return False
-        return True
-
-    now_ts=time.time()
-    scheduled_open=[]
-    schedule_rejected=[]
-    for item in raw:
-        if not isinstance(item,dict):
-            continue
-        if _asset_is_currently_open(item,now_ts):
-            scheduled_open.append(item)
-        else:
-            p=pair_name(item)
-            if p:
-                schedule_rejected.append(p)
-    log.info(
-        "ACCOUNT_OPEN_SCHEDULE_FILTER account_id=%s raw_authenticated=%d open_now=%d rejected_closed=%d",
-        client.account_id,len(raw),len(scheduled_open),len(schedule_rejected)
-    )
-    if schedule_rejected:
-        log.info("ACCOUNT_ASSET_CLOSED_BY_BROKER_SCHEDULE sample=%s",schedule_rejected[:25])
-
-    assets=build_assets(client,scheduled_open)
+    # The authenticated account response is the only asset universe. Do not
+    # intersect it with the old screenshot list or any public/global API list.
+    assets=build_assets(client,raw)
     if not assets:
         log.warning("ACCOUNT_ASSET_SYNC_ZERO account_id=%s reason=%s keep_count=%d",
                     client.account_id,reason,len(STATE["assets"]))
@@ -1199,7 +1165,7 @@ async def sync_account_assets(client, reason="periodic"):
     STATE["assets"]=assets
     STATE["account_id"]=client.account_id
     STATE["account_group"]="demo"
-    STATE["feed_source"]="authenticated_websocket:event_182"
+    STATE["feed_source"]="authenticated_websocket:event_182_account_universe"
 
     for pair in removed:
         STATE["prices"].pop(pair,None)
@@ -1212,8 +1178,11 @@ async def sync_account_assets(client, reason="periodic"):
         CANDLE_UNAVAILABLE_UNTIL.pop(pair,None)
         CANDLE_GOOD_ONCE.discard(pair)
 
-    log.info("ACCOUNT_ASSET_SYNC source=authenticated_account:event_182_filtered account_id=%s reason=%s raw_open=%d accepted=%d added=%d removed=%d total=%d",
-             client.account_id,reason,len(raw),len(assets),len(added),len(removed),len(assets))
+    account_blocked=sum(1 for a in assets if a.get("api_blocked"))
+    log.info(
+        "ACCOUNT_ASSET_SYNC source=authenticated_account:event_182_raw account_id=%s reason=%s raw_account=%d universe=%d api_blocked_metadata=%d added=%d removed=%d total=%d",
+        client.account_id,reason,len(raw),len(assets),account_blocked,len(added),len(removed),len(assets)
+    )
     if added: log.info("ACCOUNT_ASSET_ADDED sample=%s",added[:25])
     if removed: log.info("ACCOUNT_ASSET_REMOVED sample=%s",removed[:25])
     return True
