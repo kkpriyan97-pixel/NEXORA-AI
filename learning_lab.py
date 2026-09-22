@@ -666,8 +666,38 @@ async def _fallback_watch(rec):
             snap=provider() if provider else {}
             candles=(snap.get("candles") or {}) if isinstance(snap,dict) else {}
             pair=str(rec.get("pair") or "")
+            pair_candles=list(candles.get(pair,[]) or [])
+            # The learning snapshot is read-only and can briefly lag behind the
+            # broker candle feed. After expiry, fetch a small closed-candle window
+            # directly from the authenticated DEMO market session before giving up.
+            if not pair_candles:
+                client_provider=_cfg.get("client_provider")
+                client=client_provider() if client_provider else None
+                if client and getattr(client,"connection",None) and getattr(client.connection,"is_connected",False):
+                    try:
+                        fresh=await asyncio.wait_for(
+                            client.market.get_candles(pair,size=60,count=5),
+                            timeout=3.0,
+                        )
+                        if isinstance(fresh,list):
+                            pair_candles=[]
+                            for item in fresh:
+                                if isinstance(item,dict) and isinstance(item.get("candles"),list):
+                                    pair_candles.extend(x for x in item["candles"] if isinstance(x,dict))
+                                elif isinstance(item,dict) and any(k in item for k in ("open","o","high","h","low","l","close","c")):
+                                    pair_candles.append(item)
+                            print(
+                                f"LEARNING_RESULT_DIRECT_CANDLE_FETCH pair={pair} "
+                                f"count={len(pair_candles)} attempt={attempts}"
+                            )
+                    except Exception as exc:
+                        print(
+                            f"LEARNING_RESULT_DIRECT_CANDLE_RETRY pair={pair} "
+                            f"attempt={attempts} type={type(exc).__name__} "
+                            f"message={str(exc)[:120]}"
+                        )
             eligible=[]
-            for c in candles.get(pair,[]) or []:
+            for c in pair_candles:
                 if not isinstance(c,dict):continue
                 try:
                     t=float(c.get("time",c.get("t")))
