@@ -33,6 +33,8 @@ REQUEST_TTL = 45.0
 RESULT_WATCH_POLL_SECONDS = max(2, min(15, int(os.getenv("LEARNING_RESULT_WATCH_POLL_SECONDS","5"))))
 RESULT_WATCH_EXTRA_SECONDS = max(60, min(300, int(os.getenv("LEARNING_RESULT_WATCH_EXTRA_SECONDS","180"))))
 LEARNING_TRADE_RETENTION_HOURS = 48
+COUNCIL_REFRESH_SECONDS = max(300, min(1800, int(os.getenv("LEARNING_COUNCIL_REFRESH_SECONDS","900"))))
+_council_cache = {"session_id":"", "created_at":0.0, "data":{}}
 _pending = {}
 _open = {}
 _finalized = set()
@@ -395,13 +397,28 @@ async def _build_candidate():
         "research_hints":[{"strategy":st,"source":sid} for st,sid in hints[:16]],
         "allowed_strategies":base_preferred,
     }
-    try:
-        council=await strategy_council_with_fallback(council_payload)
-    except Exception as e:
-        council={}
-        print(f"AI_STRATEGY_COUNCIL_FAILED type={type(e).__name__} message={str(e)[:140]} fallback=local_brain")
-    if council.get("proposals"):
-        await record_strategy_council(session_id,council)
+    global _council_cache
+    council=_council_cache.get("data") if (
+        _council_cache.get("session_id")==session_id
+        and time.time()-float(_council_cache.get("created_at") or 0.0) < COUNCIL_REFRESH_SECONDS
+    ) else None
+    if council:
+        print(
+            f"AI_STRATEGY_COUNCIL_REUSE session={session_id} "
+            f"age={time.time()-float(_council_cache.get('created_at') or 0.0):.1f}s "
+            f"refresh={COUNCIL_REFRESH_SECONDS}s"
+        )
+    else:
+        try:
+            council=await strategy_council_with_fallback(council_payload)
+        except Exception as e:
+            council={}
+            print(f"AI_STRATEGY_COUNCIL_FAILED type={type(e).__name__} message={str(e)[:140]} fallback=local_brain")
+        _council_cache={"session_id":session_id,"created_at":time.time(),"data":dict(council or {})}
+        if council.get("proposals"):
+            saved=await record_strategy_council(session_id,council)
+            if not saved:
+                print(f"AI_STRATEGY_COUNCIL_SAVE_FAILED session={session_id}")
     votes=dict(council.get("votes") or {})
     council_order=[str(x.get("strategy") or "").upper() for x in council.get("proposals") or [] if x.get("strategy")]
     preferred=list(dict.fromkeys(council_order+base_preferred))
@@ -670,7 +687,14 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
     _daily["day"] = str(_now_uae().date())
     db_ok=await record_practice_result(rec.get("strategy","UNKNOWN"),result,
                                  pair=rec.get("pair",""),confidence=rec.get("confidence",0),
-                                 context=ctx,error_code=error_code)
+                                 context=ctx,error_code=error_code,
+                                 council_context={
+                                     "session_id":rec.get("council_session_id"),
+                                     "consensus":rec.get("council_consensus"),
+                                     "agreement":rec.get("council_agreement"),
+                                     "members":rec.get("council_members"),
+                                     "votes":rec.get("council_votes"),
+                                 })
     validation=await _strategy_validation_snapshot(rec.get("strategy","UNKNOWN"))
     if tid:
         await complete_open_trade(tid,result)
