@@ -14,6 +14,7 @@ from ai_engine import snapshot_from_asset
 from ai_router import analyze_with_fallback,review_result_with_fallback
 from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot_async, world_learning_loop
 from strategy_knowledge import ensure_tables as ensure_strategy_knowledge_tables, refresh as refresh_strategy_knowledge, refresh_loop as strategy_knowledge_refresh_loop
+from account_asset_catalog import build_account_asset_snapshot
 from learning_lab import (
     configure as configure_learning_lab,
     run_forever as learning_practice_loop,
@@ -1016,156 +1017,42 @@ def _norm_text(v):
     if isinstance(v,(dict,list)): return json.dumps(v,ensure_ascii=False).lower()
     return str(v).strip().lower()
 
-# The following is the exact OPEN asset set from the account screenshots the user
-# supplied. Closed/hidden assets are deliberately not included. The broker feed
-# remains the source for live prices, but it is NOT allowed to widen this universe.
-SCREENSHOT_OPEN_PAIRS={
-    # Exact 53 unique Flex assets visible in the user's supplied screenshots.
-    # Raw IDs below are the authenticated OlympTrade instrument IDs used by
-    # the account-scoped WebSocket event-182 asset feed.
-    "BNBUSD_OTC","PEPEUSD_OTC","SHIBUSD_OTC",
-    "ASIA_X","EUROPE_X","CRYPTO_X","GOAL_X","ETHUSD_OTC","MCI_X",
-    "BTCUSD_OTC","LTCUSD_OTC","EURUSD_OTC","DOGUSD_OTC","XRPUSD_OTC",
-    "HMA_X","NZDUSD_OTC","Bitcoin","AUDUSD_OTC","GBPUSD_OTC","ULTRA_X",
-    "XAUUSD_OTC","USDCHF_OTC","AUDCAD_OTC","USDCAD_OTC","GBPJPY_OTC",
-    "CADJPY_OTC","USDJPY_OTC","STABLE_X","GBPCAD_OTC","EURGBP_OTC",
-    "AUDCHF_OTC","AUDNZD_OTC","AUDJPY_OTC","XAGUSD_OTC","CHFJPY_OTC",
-    "EURAUD_OTC","CADCHF_OTC","EURCAD_OTC","EURJPY_OTC","EURCHF_OTC",
-    "EURNZD_OTC","GBPCHF_OTC","GBPAUD_OTC","NZDCHF_OTC","GBPNZD_OTC",
-    "ETHUSD","NZDJPY_OTC","NZDCAD_OTC","ALTCOIN","QAHWA_X","OASIS_X",
-    "ARAB_X","LTCUSD",
-}
-
-def asset_key(value):
-    text=_norm_text(value)
-    return " ".join(text.replace("/"," ").replace("_"," ").split())
-def screenshot_asset_allowed(x):
-    # Kept for backward compatibility with older callers, but the authenticated
-    # account feed is now the sole authority for the asset universe.
-    return isinstance(x,dict) and bool(pair_name(x))
-
-def is_flex_time_asset(x):
-    if not isinstance(x,dict): return False
-    # Never widen the universe from a public/global asset list. Every candidate
-    # must come from the authenticated account-scoped event-182 response.
-    # Open/locked/disabled state is filtered below in build_assets().
-    return bool(pair_name(x))
-
-def build_assets(client,raw):
-    # The authenticated account-scoped asset response is the sole universe.
-    # Do NOT intersect it with the old 53-item screenshot baseline.
-    prof={}
-    for x in raw or []:
-        if not isinstance(x,dict): continue
-        p=pair_name(x)
-        v=x.get("profitability")
-        if p and isinstance(v,(int,float)): prof[p]=int(v)
-
-    out=[]; seen=set(); rejected=[]
-    raw_pairs={pair_name(x) for x in (raw or []) if isinstance(x,dict) and pair_name(x)}
+# The uploaded user PDF is the authoritative asset universe.
+# It contains exactly 104 unique assets visibly available in the supplied
+# screenshots. Do not call any broker asset-list/profitability endpoint to build
+# or widen this universe. Live candles/ticks may still be read for these pairs.
+def build_assets(client=None,raw=None):
+    # Backward-compatible function name. client/raw are intentionally ignored.
+    assets=build_account_asset_snapshot()
     log.info(
-        "ACCOUNT_AUTHENTICATED_ASSET_UNIVERSE raw=%d unique=%d source=event_182",
-        len(raw or []),len(raw_pairs)
+        "STATIC_ACCOUNT_ASSET_CATALOG source=user_pdf_104_assets "
+        "api_asset_listing=OFF count=%d",
+        len(assets)
     )
-    for x in raw or []:
-        if not isinstance(x,dict) or not is_flex_time_asset(x):
-            p=pair_name(x) if isinstance(x,dict) else ""
-            if p: rejected.append(p)
-            continue
-        p=pair_name(x)
-        if not p or p in seen: continue
-        # API availability flags are metadata only. An instrument already
-        # returned by the authenticated account-scoped Event 182 remains inside
-        # the account scan universe; an API lock/disabled flag cannot delete it
-        # or stop the cycle. Signal eligibility can use the flag separately.
-        api_blocked=bool(
-            x.get("disabled") is True
-            or x.get("locked") is True
-            or x.get("locked_trading") is True
-            or any(
-                x.get(k) is False
-                for k in ("active","available","tradable","is_active","is_available","is_tradable")
-                if k in x
-            )
-            or str(x.get("status") or x.get("state") or "").strip().lower()
-                in {"disabled","locked","inactive","unavailable","closed","off"}
-        )
-        seen.add(p)
-        # Preserve a genuine account-facing name when the authenticated payload
-        # supplies one. If the payload omits the display label, keep the same
-        # authenticated account instrument in the scan using its pair as the
-        # internal/display fallback; never source assets from a public/global
-        # catalogue and never let API metadata remove it from the universe.
-        title=display_name(x) or p
-        v=prof.get(p,x.get("profitability",0))
-        try: profitability=int(v)
-        except Exception: profitability=0
-        quickler=(p.upper()=="ULTRA_X" or "quickler" in " ".join(
-            _norm_text(x.get(k)) for k in
-            ("pair","symbol","name","title","display_name","displayName",
-             "product","category","instrument_type","expiration_type","expiration_mode")
-        ))
-        out.append({
-            "pair":p,"display_name":title,"title":title,
-            "signal_asset_label":title,"profitability":profitability,
-            "locked":bool(x.get("locked") is True),
-            "locked_trading":bool(x.get("locked_trading") is True),
-            "disabled":bool(x.get("disabled") is True),
-            "api_blocked":api_blocked,
-            "mode":"OTC" if "_OTC" in p.upper() else "REAL",
-            "trading_mode":"FLEX_TIME",
-            "signal_eligible":not quickler and not api_blocked
-        })
-    log.info("ACCOUNT_ASSET_FILTER source=authenticated_account raw=%d accepted_open=%d rejected=%d",len(raw or []),len(out),len(rejected))
-    if rejected:
-        log.info("ACCOUNT_ASSET_REJECTED sample=%s",rejected[:25])
-    # Audit the exact account-facing/raw names that Candice accepted.
-    log.info(
-        "ACCOUNT_OPEN_ASSET_NAMES %s",
-        [{"pair":a["pair"],"account_name":a["display_name"]} for a in out]
-    )
-    return out
+    return assets
 
 async def sync_account_assets(client, reason="periodic"):
-    """Refresh the canonical asset universe from the authenticated account session."""
+    """Refresh from the fixed user-supplied 104-asset catalog only."""
     if not client or not client.account_id:
         return False
-    try:
-        # Event 182 is the authenticated/account-scoped source. Do NOT use
-        # get_available_assets(), because that helper applies API-side
-        # availability filtering before Candice gets to see the account universe.
-        # The raw account response is authoritative; API metadata is retained
-        # per asset but cannot remove an account asset from the scan universe.
-        raw=await asyncio.wait_for(
-            client.market.get_profitability(client.account_id),
-            timeout=10.0
+
+    assets=build_account_asset_snapshot()
+    if len(assets)!=104:
+        log.error(
+            "STATIC_ACCOUNT_ASSET_CATALOG_INVALID expected=104 actual=%d",
+            len(assets)
         )
-    except Exception as e:
-        log.warning("ACCOUNT_ASSET_SYNC_FAILED account_id=%s reason=%s type=%s message=%s",
-                    client.account_id,reason,type(e).__name__,str(e)[:160])
-        return False
-
-    if not isinstance(raw,list) or not raw:
-        log.warning("ACCOUNT_ASSET_SYNC_EMPTY account_id=%s reason=%s keep_count=%d",
-                    client.account_id,reason,len(STATE["assets"]))
-        return False
-
-    # The authenticated account response is the only asset universe. Do not
-    # intersect it with the old screenshot list or any public/global API list.
-    assets=build_assets(client,raw)
-    if not assets:
-        log.warning("ACCOUNT_ASSET_SYNC_ZERO account_id=%s reason=%s keep_count=%d",
-                    client.account_id,reason,len(STATE["assets"]))
         return False
 
     old={a["pair"] for a in STATE["assets"]}
     new={a["pair"] for a in assets}
     added=sorted(new-old)
     removed=sorted(old-new)
+
     STATE["assets"]=assets
     STATE["account_id"]=client.account_id
     STATE["account_group"]="demo"
-    STATE["feed_source"]="authenticated_websocket:event_182_account_universe"
+    STATE["feed_source"]="static_user_pdf:104_assets+authenticated_event1"
 
     for pair in removed:
         STATE["prices"].pop(pair,None)
@@ -1178,13 +1065,21 @@ async def sync_account_assets(client, reason="periodic"):
         CANDLE_UNAVAILABLE_UNTIL.pop(pair,None)
         CANDLE_GOOD_ONCE.discard(pair)
 
-    account_blocked=sum(1 for a in assets if a.get("api_blocked"))
     log.info(
-        "ACCOUNT_ASSET_SYNC source=authenticated_account:event_182_raw account_id=%s reason=%s raw_account=%d universe=%d api_blocked_metadata=%d added=%d removed=%d total=%d",
-        client.account_id,reason,len(raw),len(assets),account_blocked,len(added),len(removed),len(assets)
+        "ACCOUNT_ASSET_SYNC source=static_user_pdf_104_assets "
+        "account_id=%s reason=%s catalog=%d added=%d removed=%d total=%d "
+        "api_asset_listing=off",
+        client.account_id,reason,len(assets),len(added),len(removed),len(assets)
     )
-    if added: log.info("ACCOUNT_ASSET_ADDED sample=%s",added[:25])
-    if removed: log.info("ACCOUNT_ASSET_REMOVED sample=%s",removed[:25])
+    log.info(
+        "ACCOUNT_OPEN_ASSET_NAMES source=user_pdf_104_assets count=%d names=%s",
+        len(assets),
+        [{"pair":a["pair"],"account_name":a["display_name"]} for a in assets]
+    )
+    if added:
+        log.info("ACCOUNT_ASSET_ADDED sample=%s",added[:25])
+    if removed:
+        log.info("ACCOUNT_ASSET_REMOVED sample=%s",removed[:25])
     return True
 
 async def on_asset_update(message):
@@ -3588,7 +3483,6 @@ async def market_worker():
         ACCOUNT_TICK_SUBSCRIBED.clear()
         ACCOUNT_TICK_LAST_ATTEMPT.clear()
         client.register_callback(parameters.E_TICK_UPDATE,on_tick)
-        client.register_callback(parameters.E_ASSET_PROFITABILITY_UPDATE,on_asset_update)
         # Demo-learning trade events are isolated from live signal/result state.
         # They exist only for human-approved practice orders.
         client.register_callback(parameters.E_TRADE_ACCEPTED,on_learning_trade_update)
@@ -3705,24 +3599,24 @@ async def market_worker():
             )
 
             if not await sync_account_assets(client,reason="initial"):
-                STATE["status"]="account_asset_api_failed"
+                STATE["status"]="static_asset_catalog_failed"
                 log.error(
-                    "TOKEN_ACCOUNT_ASSET_VALIDATION_FAILED configured_id=%s account_id=%s balance_accounts=%s",
+                    "STATIC_ACCOUNT_ASSET_CATALOG_VALIDATION_FAILED configured_id=%s account_id=%s balance_accounts=%s",
                     expected_account_id,client.account_id,demo_accounts
                 )
                 raise RuntimeError(
-                    f"Authenticated demo account asset scan returned no usable assets for {client.account_id}"
+                    f"Static user asset catalog could not be loaded for {client.account_id}"
                 )
             log.info(
-                "TOKEN_ACCOUNT_ASSET_VALIDATED configured_id=%s account_id=%s source=authenticated_websocket:event_182 asset_count=%d",
+                "STATIC_ACCOUNT_ASSET_CATALOG_READY configured_id=%s account_id=%s source=user_pdf_104_assets asset_count=%d api_asset_listing=off",
                 expected_account_id,client.account_id,len(STATE["assets"])
             )
             STATE["status"]="live_read_only"
             assets=list(STATE["assets"])
             real_n=sum(a["mode"]=="REAL" for a in assets); otc_n=sum(a["mode"]=="OTC" for a in assets)
-            log.info("ACCOUNT_ASSET_SOURCE account_id=%s source_count=%d open_real=%d open_otc=%d open_total=%d",
+            log.info("STATIC_ACCOUNT_ASSET_SOURCE account_id=%s catalog_count=%d static_real=%d static_otc=%d static_total=%d",
                      client.account_id,len(assets),real_n,otc_n,len(assets))
-            log.info("ALL_ACCOUNT_OPEN_ASSETS_READY count=%d",len(assets))
+            log.info("STATIC_ACCOUNT_ASSETS_READY count=%d source=user_pdf_104_assets api_asset_listing=off",len(assets))
             await ensure_account_tick_subscriptions()
             restored=await restore_pending_result_watches()
             if restored:
@@ -3731,7 +3625,7 @@ async def market_worker():
             # read-only worker below. Event-1 ticks are preferred when delivered;
             # the snapshot scanner remains a timestamped fallback for assets
             # that do not emit an event-1 tick.
-            log.info("TICK_SUBSCRIPTION_MODE authenticated_event1 preferred; no live snapshot API fallback")
+            log.info("TICK_SUBSCRIPTION_MODE authenticated_event1 preferred; asset_inventory_source=user_pdf_104_assets; no asset-list API")
             await refresh_candles(force=True)
             last_asset_sync=time.time()
             while True:
