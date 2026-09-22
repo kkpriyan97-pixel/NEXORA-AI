@@ -27,8 +27,12 @@ START_MINUTE = 30
 LOOP_SECONDS = max(30, min(120, int(os.getenv("LEARNING_PRACTICE_INTERVAL_SECONDS","60"))))
 MIN_CONFIDENCE = max(75, min(96, int(os.getenv("LEARNING_PRACTICE_MIN_CONFIDENCE","82"))))
 REQUEST_TTL = 45.0
+RESULT_WATCH_POLL_SECONDS = max(2, min(15, int(os.getenv("LEARNING_RESULT_WATCH_POLL_SECONDS","5"))))
+RESULT_WATCH_EXTRA_SECONDS = max(30, min(600, int(os.getenv("LEARNING_RESULT_WATCH_EXTRA_SECONDS","240"))))
+LEARNING_TRADE_RETENTION_HOURS = 48
 _pending = {}
 _open = {}
+_finalized = set()
 _cfg = {}
 _daily = {"day": None, "placed": 0, "win": 0, "loss": 0, "tie": 0, "blocked": 0, "strategies": set()}
 _last_report_day = None
@@ -71,6 +75,137 @@ def status():
         "pending":len(_pending),
         "open_trades":len(_open),
     }
+
+async def ensure_learning_trade_state_table():
+    if not DB_URL:
+        return False
+    try:
+        import psycopg
+        def init():
+            with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candice_learning_trade_state (
+                            trade_id TEXT PRIMARY KEY,
+                            record JSONB NOT NULL,
+                            status TEXT NOT NULL DEFAULT 'OPEN',
+                            last_error TEXT,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            completed_at TIMESTAMPTZ
+                        )
+                    """)
+                    cur.execute("""
+                        DELETE FROM candice_learning_trade_state
+                        WHERE updated_at < NOW() - INTERVAL '2 days'
+                    """)
+                db.commit()
+        await asyncio.to_thread(init)
+        print("LEARNING_TRADE_STATE_READY")
+        return True
+    except Exception as e:
+        print(f"LEARNING_TRADE_STATE_INIT_FAILED type={type(e).__name__} message={str(e)[:160]}")
+        return False
+
+def _learning_trade_payload(rec):
+    payload={}
+    for k,v in dict(rec or {}).items():
+        if k.startswith("_"):
+            continue
+        if isinstance(v,(str,int,float,bool)) or v is None:
+            payload[k]=v
+        else:
+            try:
+                json.dumps(v)
+                payload[k]=v
+            except Exception:
+                payload[k]=str(v)
+    return payload
+
+async def persist_open_trade(rec):
+    if not DB_URL or not rec.get("trade_id"):
+        return False
+    try:
+        import psycopg
+        trade_id=str(rec["trade_id"])
+        payload=json.dumps(_learning_trade_payload(rec),separators=(",",":"),ensure_ascii=False,default=str)
+        def put():
+            with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO candice_learning_trade_state(trade_id,record,status)
+                        VALUES(%s,%s::jsonb,'OPEN')
+                        ON CONFLICT(trade_id) DO UPDATE SET
+                            record=EXCLUDED.record,status='OPEN',last_error=NULL,
+                            updated_at=NOW(),completed_at=NULL
+                    """,(trade_id,payload))
+                db.commit()
+        await asyncio.to_thread(put)
+        print(f"LEARNING_TRADE_PERSISTED trade_id={trade_id} pair={rec.get('pair')}")
+        return True
+    except Exception as e:
+        print(f"LEARNING_TRADE_PERSIST_FAILED trade_id={rec.get('trade_id')} type={type(e).__name__} message={str(e)[:160]}")
+        return False
+
+async def complete_open_trade(trade_id,result):
+    if not DB_URL or not trade_id:
+        return False
+    try:
+        import psycopg
+        def done():
+            with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        UPDATE candice_learning_trade_state
+                        SET status='COMPLETED',last_error=NULL,updated_at=NOW(),
+                            completed_at=NOW()
+                        WHERE trade_id=%s
+                    """,(str(trade_id),))
+                db.commit()
+        await asyncio.to_thread(done)
+        print(f"LEARNING_TRADE_STATE_COMPLETED trade_id={trade_id} result={result}")
+        return True
+    except Exception as e:
+        print(f"LEARNING_TRADE_COMPLETE_SAVE_FAILED trade_id={trade_id} type={type(e).__name__} message={str(e)[:160]}")
+        return False
+
+async def restore_open_trades():
+    if not DB_URL:
+        return 0
+    try:
+        import psycopg
+        def read():
+            with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        SELECT trade_id,record
+                        FROM candice_learning_trade_state
+                        WHERE status='OPEN'
+                          AND created_at > NOW() - INTERVAL '2 days'
+                        ORDER BY created_at
+                    """)
+                    return cur.fetchall()
+        rows=await asyncio.to_thread(read)
+        restored=0
+        for trade_id,record in rows:
+            tid=str(trade_id)
+            if tid in _open:
+                continue
+            try:
+                rec=dict(record or {})
+                rec["trade_id"]=tid
+                rec["status"]="OPEN"
+                _open[tid]=rec
+                restored+=1
+                print(f"LEARNING_TRADE_RESTORED trade_id={tid} pair={rec.get('pair')} entry={rec.get('entry_price')}")
+            except Exception as e:
+                print(f"LEARNING_TRADE_RESTORE_ITEM_FAILED trade_id={tid} type={type(e).__name__}")
+        if restored:
+            print(f"LEARNING_TRADE_RESTORE_COMPLETE restored={restored}")
+        return restored
+    except Exception as e:
+        print(f"LEARNING_TRADE_RESTORE_FAILED type={type(e).__name__} message={str(e)[:160]}")
+        return 0
 
 def _research_strategy_hint(snapshot):
     """Map recent research terms into an existing executable strategy family."""
@@ -339,6 +474,7 @@ async def _place_demo(rec, actor_id):
         "placed_at":now,"entry_ts":now,"entry_price":entry_price,
     })
     _open[str(trade_id)]=rec
+    await persist_open_trade(rec)
     print(f"LEARNING_ORDER_CONFIRMED pair={pair} trade_id={trade_id} entry={entry_price} account_id={account_id} group=demo")
     return True,"PLACED",rec
 
@@ -376,18 +512,31 @@ async def handle_callback(query):
 async def handle_trade_update(message):
     if not isinstance(message,dict):return
     event=message.get("e")
-    for item in (message.get("d") or []):
+    raw_items=message.get("d") or []
+    items=raw_items if isinstance(raw_items,list) else [raw_items]
+    for item in items:
         if not isinstance(item,dict):continue
-        tid=str(item.get("id") or "")
-        if not tid or tid not in _open:continue
-        if event==26:
-            rec=_open.pop(tid)
+        tid=str(item.get("id") or item.get("trade_id") or "")
+        if not tid or tid not in _open or tid in _finalized:continue
+        if event==26 or str(item.get("status") or "").upper() in {"WIN","WON","PROFIT","LOSS","LOST","CLOSED"}:
+            rec=dict(_open.get(tid) or {})
+            if not rec:continue
             status=str(item.get("status") or "").upper()
             pnl=item.get("balance_change")
-            result="WIN" if status in {"WIN","WON","PROFIT"} or (pnl is not None and float(pnl)>0) else "LOSS" if status in {"LOSS","LOST"} or (pnl is not None and float(pnl)<0) else "TIE"
+            try:
+                pnl_num=float(pnl) if pnl is not None else None
+            except (TypeError,ValueError):
+                pnl_num=None
+            result="WIN" if status in {"WIN","WON","PROFIT"} or (pnl_num is not None and pnl_num>0) else "LOSS" if status in {"LOSS","LOST"} or (pnl_num is not None and pnl_num<0) else "TIE"
             await _record_result(rec,result,"BROKER_EVENT_26",item.get("curs_close"),pnl)
 
 async def _record_result(rec,result,source,exit_price=None,pnl=None):
+    tid=str(rec.get("trade_id") or "")
+    if tid:
+        if tid in _finalized:
+            return
+        _finalized.add(tid)
+        _open.pop(tid,None)
     ctx=dict(rec.get("technique") or {})
     error_code=""
     if result=="LOSS":
@@ -416,7 +565,8 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
                                  pair=rec.get("pair",""),confidence=rec.get("confidence",0),
                                  context=ctx,error_code=error_code)
     validation=await _strategy_validation_snapshot(rec.get("strategy","UNKNOWN"))
-    _open.pop(str(rec.get("trade_id") or ""),None)
+    if tid:
+        await complete_open_trade(tid,result)
     if validation and validation["status"]=="VALIDATED":
         validation_line=(
             f"✅ Own Strategy Brain → VALIDATED "
@@ -443,31 +593,68 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
     )
 
 async def _fallback_watch(rec):
-    await asyncio.sleep(DURATION_SECONDS+2)
     tid=str(rec.get("trade_id") or "")
-    if tid not in _open:return
+    if not tid:return
+    expiry_ts=float(rec.get("entry_ts") or rec.get("placed_at") or time.time()) + DURATION_SECONDS
+    deadline=expiry_ts + RESULT_WATCH_EXTRA_SECONDS
     provider=_cfg.get("snapshot_provider")
-    try:
-        snap=provider()
-        candles=snap.get("candles") or {}
-        pair=rec.get("pair")
-        cs=[]
-        for c in candles.get(pair,[]) or []:
-            try:
-                t=float(c.get("time",c.get("t")))
-                if t>20_000_000_000:t/=1000
-                if t+60<=time.time():cs.append(c)
-            except Exception:continue
-        cs.sort(key=lambda x:float(x.get("time",x.get("t",0))))
-        if not cs:return
-        entry=float(rec.get("entry_price") or rec.get("reference_price") or 0.0)
-        exitp=float(cs[-1].get("close",cs[-1].get("c")))
-        if exitp>entry:result="WIN" if rec["direction"]=="UP" else "LOSS"
-        elif exitp<entry:result="WIN" if rec["direction"]=="DOWN" else "LOSS"
-        else:result="TIE"
-        await _record_result(rec,result,"CLOSED_CANDLE_FALLBACK",exitp,None)
-    except Exception:
-        await save_error(rec.get("strategy","UNKNOWN"),"RESULT_FALLBACK_FAILED",rec.get("technique") or {})
+    attempts=0
+    while tid in _open and tid not in _finalized and time.time() < deadline:
+        attempts+=1
+        try:
+            now=time.time()
+            if now < expiry_ts:
+                await asyncio.sleep(min(RESULT_WATCH_POLL_SECONDS, max(1.0,expiry_ts-now)))
+                continue
+            snap=provider() if provider else {}
+            candles=(snap.get("candles") or {}) if isinstance(snap,dict) else {}
+            pair=str(rec.get("pair") or "")
+            eligible=[]
+            for c in candles.get(pair,[]) or []:
+                if not isinstance(c,dict):continue
+                try:
+                    t=float(c.get("time",c.get("t")))
+                    if t>20_000_000_000:t/=1000
+                    close_ts=t+60.0
+                    if close_ts <= now and close_ts >= expiry_ts-2.0:
+                        exitp=float(c.get("close",c.get("c")))
+                        eligible.append((close_ts,exitp))
+                except Exception:
+                    continue
+            if eligible:
+                eligible.sort(key=lambda x:x[0])
+                close_ts,exitp=eligible[0]
+                entry=float(rec.get("entry_price") or rec.get("reference_price") or 0.0)
+                if exitp>entry:
+                    result="WIN" if str(rec.get("direction")).upper()=="UP" else "LOSS"
+                elif exitp<entry:
+                    result="WIN" if str(rec.get("direction")).upper()=="DOWN" else "LOSS"
+                else:
+                    result="TIE"
+                print(f"LEARNING_RESULT_FALLBACK_CONFIRMED trade_id={tid} pair={pair} attempt={attempts} close_ts={close_ts:.3f} entry={entry} exit={exitp} result={result}")
+                await _record_result(rec,result,"CLOSED_CANDLE_FALLBACK",exitp,None)
+                return
+            print(f"LEARNING_RESULT_WAIT trade_id={tid} pair={pair} attempt={attempts} next_retry={RESULT_WATCH_POLL_SECONDS}s")
+        except Exception as exc:
+            print(f"LEARNING_RESULT_FALLBACK_RETRY trade_id={tid} pair={rec.get('pair')} attempt={attempts} type={type(exc).__name__} message={str(exc)[:120]}")
+        await asyncio.sleep(RESULT_WATCH_POLL_SECONDS)
+
+    if tid in _open and tid not in _finalized:
+        # Never leave the practice gate locked forever. A missing broker close event
+        # or missing candle is a result-availability failure, not a WIN/LOSS.
+        # Release the trade slot so the next DEMO learning candidate can run.
+        _open.pop(tid,None)
+        try:
+            await save_error(rec.get("strategy","UNKNOWN"),"RESULT_UNAVAILABLE_TIMEOUT",rec.get("technique") or {})
+        finally:
+            print(f"LEARNING_RESULT_SLOT_RELEASED trade_id={tid} pair={rec.get('pair')} reason=RESULT_UNAVAILABLE_TIMEOUT")
+            await _cfg["send_message"](
+                "⚠️ DEMO RESULT WATCH TIMEOUT\n\n"
+                f"📊 {rec.get('display_name') or rec.get('pair')}\n"
+                "🔓 Next demo practice slot unlocked\n"
+                "📦 Result was not classified as WIN/LOSS.",
+                chat_id=_cfg.get("admin_id") or None
+            )
 
 
 async def _validated_strategy_ids():
@@ -508,6 +695,8 @@ async def _send_daily_report(day):
 async def run_forever():
     if os.getenv("LEARNING_PRACTICE_ENABLED","true").strip().lower()=="false":
         return
+    await ensure_learning_trade_state_table()
+    await restore_open_trades()
     while True:
         try:
             now=_now_uae()
@@ -535,8 +724,9 @@ async def run_forever():
             # While the 2h window is active, allow another candidate only after the
             # previous order has completed. This prevents overlapping demo orders.
             for tid,rec in list(_open.items()):
-                asyncio.create_task(_fallback_watch(rec)) if not rec.get("_watch_started") else None
-                rec["_watch_started"]=True
+                if not rec.get("_watch_started"):
+                    rec["_watch_started"]=True
+                    asyncio.create_task(_fallback_watch(rec))
             # Expire stale execution requests.
             for token,rec in list(_pending.items()):
                 if time.time()>float(rec.get("expires_at",0)):
