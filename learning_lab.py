@@ -1,7 +1,7 @@
 """Independent daily demo practice laboratory.
 
 It reads the authenticated market snapshot and places DEMO-only practice orders
-automatically during the fixed 20:30–22:30 UAE learning window. It never accepts
+automatically during the fixed 20:30–23:00 UAE learning window. It never accepts
 a live/real account for learning execution.
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ DB_URL = os.getenv("DATABASE_URL","").strip()
 UAE = ZoneInfo("Asia/Dubai")
 DURATION_SECONDS = max(60, min(300, int(os.getenv("LEARNING_PRACTICE_DURATION_SECONDS","60"))))
 AMOUNT = max(0.01, float(os.getenv("LEARNING_DEMO_AMOUNT","1")))
-WINDOW_MINUTES = 120
+WINDOW_MINUTES = 150
 START_HOUR = 20
 START_MINUTE = 30
 LOOP_SECONDS = max(30, min(120, int(os.getenv("LEARNING_PRACTICE_INTERVAL_SECONDS","60"))))
@@ -76,7 +76,7 @@ def status():
         "approval_required":False,
         "demo_only":True,
         "schedule":"DAILY",
-        "learning_window":"20:30–22:30 UAE",
+        "learning_window":"20:30–23:00 UAE",
         "pending":len(_pending),
         "open_trades":len(_open),
     }
@@ -789,7 +789,7 @@ async def _send_daily_report(day):
     validated = await _validated_strategy_ids()
     await _cfg["send_message"](
         "🧠 CANDICE • LEARNING REPORT\n\n"
-        "🕣 Practice → 20:30–22:30 UAE\n"
+        "🕣 Practice → 20:30–23:00 UAE\n"
         f"📅 Day → {day}\n"
         f"🤖 DEMO AUTO-TRADE → {_daily['placed']} trades\n"
         f"🟢 WIN → {_daily['win']}\n"
@@ -809,7 +809,7 @@ async def run_forever():
         return
     await ensure_learning_trade_state_table()
     await restore_open_trades()
-    print("LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=20:30-22:30 timezone=Asia/Dubai demo_only=True")
+    print("LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=20:30-23:00 timezone=Asia/Dubai demo_only=True")
     last_heartbeat=0.0
     last_scan=0.0
     while True:
@@ -850,7 +850,7 @@ async def run_forever():
                 if candidate:
                     sent = await _send_request(candidate)
                     if sent:
-                        log_msg=(f"PRACTICE_WINDOW_ACTIVE day={day} start={START_HOUR:02d}:{START_MINUTE:02d} duration=2h "
+                        log_msg=(f"PRACTICE_WINDOW_ACTIVE day={day} start={START_HOUR:02d}:{START_MINUTE:02d} duration=2.5h "
                                  f"strategy={candidate['strategy']} pair={candidate['pair']} source={candidate['source']}")
                         print(log_msg)
                         print(f"LEARNING_PRACTICE_ROTATION cursor={_practice_cursor}")
