@@ -3773,8 +3773,18 @@ async def health(reader,writer):
             log.info("PING_REQUEST status=200")
             return
         if path.startswith("/health"):
-            body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"account_id":STATE.get("account_id"),"account_group":STATE.get("account_group"),"feed_source":STATE.get("feed_source"),"network":STATE.get("network",{}),"m1_world_learning":m1_learning_status(),"learning_practice":learning_practice_status(),
-"live_external_ai":False}).encode()
+            body_out=json.dumps({
+                "service":"CANDICE-AI","status":STATE["status"],
+                "signal_read_only":True,
+                "learning_demo_execution":bool(learning_practice_status().get("enabled")),
+                "asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),
+                "cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),
+                "account_id":STATE.get("account_id"),"account_group":STATE.get("account_group"),
+                "feed_source":STATE.get("feed_source"),"network":STATE.get("network",{}),
+                "m1_world_learning":m1_learning_status(),
+                "learning_practice":learning_practice_status(),
+                "live_external_ai":False
+            }).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "+str(len(body_out)).encode()+b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
             await writer.drain()
             log.info("HEALTH_REQUEST status=200 path=%s",path)
