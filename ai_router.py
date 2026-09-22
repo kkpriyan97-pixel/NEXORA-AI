@@ -15,11 +15,10 @@ REVIEW_SEMAPHORE=asyncio.Semaphore(1)
 REVIEW_PROVIDER_COOLDOWN={}
 REVIEW_TRANSIENT_COOLDOWN_SECONDS=15.0
 REVIEW_429_COOLDOWN_SECONDS=900.0
-# Hard safety boundary: external LLM calls are never permitted in the live signal path.
-# This cannot be enabled by a runtime environment variable, so provider 429/timeout
-# responses cannot consume signal-cycle time.
-LIVE_EXTERNAL_AI_ENABLED=False
-BACKGROUND_EXTERNAL_ENABLED=os.getenv("AI_EXTERNAL_BACKGROUND_ENABLED","false").strip().lower()=="true"
+# External AI verification is enabled by default, but remains bounded and fail-open.
+# The local Candice Brain remains authoritative; timeouts/429s cannot hard-stop delivery.
+LIVE_EXTERNAL_AI_ENABLED=os.getenv("AI_EXTERNAL_LIVE_ENABLED","true").strip().lower()!="false"
+BACKGROUND_EXTERNAL_ENABLED=os.getenv("AI_EXTERNAL_BACKGROUND_ENABLED","true").strip().lower()!="false"
 _logged_ready=set()
 
 def _providers():
@@ -83,9 +82,8 @@ def _content_json(content:Any)->dict[str,Any]:
         raise
 
 async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
-    # External LLMs are NEVER part of the live signal critical path by default.
-    # A provider-side 429/timeout must not consume the final signal window.
-    # Candice local Brain remains authoritative; this function is opt-in only.
+    # External LLM verification runs here when enabled, but is never authoritative.
+    # Tight timeouts, cooldowns and fail-open fallback preserve deterministic delivery.
     if not LIVE_EXTERNAL_AI_ENABLED:
         log.info("AI_LIVE_EXTERNAL_DISABLED reason=signal_cycle_isolation")
         return None
@@ -206,9 +204,8 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
 async def review_result_with_fallback(rec:dict[str,Any])->dict[str,Any]:
     """Background post-result audit.
 
-    External LLM review is disabled by default. A local audit keeps the durable
-    learning queue useful without allowing provider quotas/rate limits to touch
-    live execution or result processing.
+    External LLM review runs in the background by default. The durable queue isolates
+    provider quotas/rate limits from live execution and result processing.
     """
     if not BACKGROUND_EXTERNAL_ENABLED:
         result=str(rec.get("result") or "").upper()
