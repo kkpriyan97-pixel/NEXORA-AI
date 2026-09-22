@@ -1113,12 +1113,13 @@ async def sync_account_assets(client, reason="periodic"):
     if not client or not client.account_id:
         return False
     try:
-        response=await asyncio.wait_for(
-            client.send_request(parameters.E_ASSET_PROFITABILITY,[{"account_id":client.account_id}],
-                                requires_response=True,timeout=8.0),
-            timeout=9.0
+        # Use the library's authenticated account-scoped availability filter.
+        # It removes assets explicitly marked unavailable/locked/inactive/closed
+        # while preserving every currently available asset from this account.
+        raw=await asyncio.wait_for(
+            client.market.get_available_assets(client.account_id),
+            timeout=10.0
         )
-        raw=response.get("d") if isinstance(response,dict) else None
     except Exception as e:
         log.warning("ACCOUNT_ASSET_SYNC_FAILED account_id=%s reason=%s type=%s message=%s",
                     client.account_id,reason,type(e).__name__,str(e)[:160])
@@ -1155,7 +1156,7 @@ async def sync_account_assets(client, reason="periodic"):
         CANDLE_UNAVAILABLE_UNTIL.pop(pair,None)
         CANDLE_GOOD_ONCE.discard(pair)
 
-    log.info("ACCOUNT_ASSET_SYNC source=authenticated_websocket:event_182 account_id=%s reason=%s raw=%d accepted=%d added=%d removed=%d total=%d",
+    log.info("ACCOUNT_ASSET_SYNC source=authenticated_account:event_182_filtered account_id=%s reason=%s raw_open=%d accepted=%d added=%d removed=%d total=%d",
              client.account_id,reason,len(raw),len(assets),len(added),len(removed),len(assets))
     if added: log.info("ACCOUNT_ASSET_ADDED sample=%s",added[:25])
     if removed: log.info("ACCOUNT_ASSET_REMOVED sample=%s",removed[:25])
