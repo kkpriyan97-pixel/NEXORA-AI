@@ -715,7 +715,7 @@ async def _build_candidate(forced_strategy=None,return_all=False):
         print(f"LEARNING_CANDIDATE_NONE batch={batch} cursor={offset} reason=no_qualified_candidate")
     return candidate
 
-async def _send_request(candidate):
+async def _send_request(candidate, notify=True):
     token=os.urandom(12).hex()
     expires=time.time()+REQUEST_TTL
     rec=dict(candidate)
@@ -744,18 +744,19 @@ async def _send_request(candidate):
             f"strategy={placed['strategy']} trade_id={placed['trade_id']} "
             f"entry={placed.get('entry_price')} at={placed.get('placed_at')}"
         )
-        await _cfg["send_message"](
-            "🤖 DEMO AUTO-TRADE STARTED\n\n"
-            f"📊 {placed['display_name']}\n"
-            f"{'⬆️ UP' if placed['direction']=='UP' else '⬇️ DOWN'}\n"
-            f"💰 Amount → {AMOUNT}\n"
-            f"💵 Entry → {placed.get('entry_price')}\n"
-            f"⏱️ Duration → {DURATION_SECONDS//60} MIN\n"
-            f"🧩 Strategy → {placed['strategy']}\n"
-            f"🆔 Demo Trade → {placed['trade_id']}\n"
-            "🔐 DEMO ACCOUNT ONLY",
-            chat_id=_cfg.get("admin_id") or None
-        )
+        if notify:
+            await _cfg["send_message"](
+                "🤖 DEMO AUTO-TRADE STARTED\n\n"
+                f"📊 {placed['display_name']}\n"
+                f"{'⬆️ UP' if placed['direction']=='UP' else '⬇️ DOWN'}\n"
+                f"💰 Amount → {AMOUNT}\n"
+                f"💵 Entry → {placed.get('entry_price')}\n"
+                f"⏱️ Duration → {DURATION_SECONDS//60} MIN\n"
+                f"🧩 Strategy → {placed['strategy']}\n"
+                f"🆔 Demo Trade → {placed['trade_id']}\n"
+                "🔐 DEMO ACCOUNT ONLY",
+                chat_id=_cfg.get("admin_id") or None
+            )
         return True
     except Exception as exc:
         _pending.pop(token,None)
