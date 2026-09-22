@@ -815,7 +815,7 @@ def uae_time(ts):
     return datetime.fromtimestamp(float(ts),tz=UAE_TZ).strftime("%H:%M:%S")
 
 STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"network":{},"read_only":True,"cycle":0,"last_cycle":None,"account_id":None,"account_group":"demo","feed_source":"authenticated_websocket"}
-CANDLE_FETCH_SEM=asyncio.Semaphore(16)
+CANDLE_FETCH_SEM=asyncio.Semaphore(24)
 CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
 CANDLE_FETCH_RETRIES=3
@@ -834,16 +834,16 @@ MULTI_TF_FRAMES=tuple(range(1,16))
 MULTI_TF_MIN_COMPLETE_BARS=3
 MULTI_TF_5S_SECONDS=5
 MULTI_TF_5S_MIN_COMPLETE_BARS=4
-TICK_RESUB_SEM=asyncio.Semaphore(3)
-TICK_RESUB_TIMEOUT=1.5
+TICK_RESUB_SEM=asyncio.Semaphore(6)
+TICK_RESUB_TIMEOUT=1.0
 LIVE_TICK_MAX_AGE=5.0
 # Rolling coverage window for the account-wide rotating live feed. The broker
 # only exposes a small number of simultaneous tick subscriptions, so an asset
 # can be live-covered without having a fresh tick at every one-second audit.
 LIVE_TICK_COVERAGE_MAX_AGE=60.0
 QUOTE_SNAPSHOT_MAX_AGE=6.0
-QUOTE_SNAPSHOT_REFRESH=3.5
-QUOTE_SNAPSHOT_SEM=asyncio.Semaphore(32)
+QUOTE_SNAPSHOT_REFRESH=2.0
+QUOTE_SNAPSHOT_SEM=asyncio.Semaphore(48)
 QUOTE_SNAPSHOT_LAST={}
 AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=90.0
@@ -859,11 +859,11 @@ CANDIDATE_CACHE_TTL=75.0
 # when a new closed candle forms.
 CANDIDATE_CACHE_HARD_REJECTED={}
 AI_PROVIDER_COOLDOWN={}
-AI_REVIEW_TIMEOUT=2.4
+AI_REVIEW_TIMEOUT=1.8
 # Rotating account-wide live quote scan. It does not touch Brain timing; it only
 # keeps current account prices warm for analysis/candidate selection.
-ACCOUNT_LIVE_SCAN_BATCH=16
-ACCOUNT_LIVE_SCAN_INTERVAL=0.25
+ACCOUNT_LIVE_SCAN_BATCH=32
+ACCOUNT_LIVE_SCAN_INTERVAL=0.10
 ACCOUNT_LIVE_SCAN_CURSOR=0
 # Account-wide event-1 tick subscription manager. Subscriptions are read-only;
 # the worker only requests market quotes and never places/modifies trades.
