@@ -1845,6 +1845,49 @@ def _latest_closed_30s_candle(pair,reference_ts=None):
             })
     return _latest_closed_candle_direction(candles)
 
+def _final_delivery_precheck(candidate, reference_ts=None):
+    """Rank already-qualified candidates by the same local evidence used at delivery.
+
+    This is a zero-network scheduling aid only. It never changes Brain direction and
+    never bypasses the hard final gate; it simply makes the two broker tick slots more
+    likely to be occupied by candidates that can actually survive delivery checks.
+    """
+    try:
+        pair=str((candidate or {}).get("pair") or "")
+        expected=str((candidate or {}).get("direction") or "").upper()
+        if not pair or expected not in {"UP","DOWN"}:
+            return -1000.0
+        reference=time.time() if reference_ts is None else float(reference_ts)
+        closed=_closed_candles(STATE["candles"].get(pair,[]),reference)
+        if len(closed)<45:
+            return -500.0
+        bars2=_aggregate_closed_minutes(closed,2,reference)
+        two=_candle_confirmation_2m(bars2,expected)
+        one=_latest_closed_candle_direction(closed)
+        final_mtf=build_multi_timeframe_context(pair,closed,reference,expected)
+        frames=final_mtf.get("frames") or {}
+        higher=[frames.get(f"{m}m",{}) for m in range(5,16)]
+        higher=[x for x in higher if x.get("status")=="READY" and x.get("direction") in {"UP","DOWN"}]
+        align=sum(1 for x in higher if x.get("direction")==expected)
+        opp=sum(1 for x in higher if x.get("direction")!=expected)
+        agreement=align/max(1,len(higher))
+        score=0.0
+        score += 100.0 if two.get("candle_direction")==expected else -160.0
+        score += 90.0 if one.get("direction")==expected else -140.0
+        if two.get("candle_ok"):
+            score += 30.0
+        else:
+            score -= 45.0
+        if two.get("volume_available"):
+            score += 20.0 if two.get("volume_ok") else -25.0
+        score += agreement*60.0
+        score -= opp*8.0
+        score += min(20.0,float(two.get("body_ratio") or 0.0)*25.0)
+        return round(score,3)
+    except Exception:
+        return -900.0
+
+
 def _candle_confirmation_2m(bars,expected):
     """Candle-first 2m confirmation; indicators are intentionally not used."""
     expected=str(expected or "").upper()
@@ -2662,28 +2705,9 @@ async def cycle_loop():
 
         confidence=int(candidate.get("confidence") or 0)
 
-        # The technical Brain is already the primary qualification layer. Some
-        # OTC feeds do not expose reliable 2m volume/body statistics, so a
-        # borderline body-strength failure must not create a permanent
-        # "no-signal" deadlock when the Brain is very strong and the closed 1m/2m
-        # directions plus higher-timeframe context still agree.
-        if (
-            confirm_reason=="2m_body_strength_failed"
-            and not two.get("volume_available")
-            and two.get("candle_direction")==expected
-            and one.get("direction")==expected
-            and higher_agreement>=0.60
-            and higher_opp<=2
-            and confidence>=95
-        ):
-            log.info(
-                "FINAL_STRICT_GATE_RELAXED cycle=%s pair=%s direction=%s reason=%s "
-                "brain_confidence=%s higher_agreement=%.3f body_ratio=%.3f volume_available=%s",
-                cycle_id,p,expected,confirm_reason,confidence,higher_agreement,
-                float(two.get("body_ratio") or 0),bool(two.get("volume_available"))
-            )
-            confirm_reason=None
-
+        # Do not relax the closed-candle body-strength gate. A high Brain score
+        # cannot override weak last-closed 2m price action at the exact entry boundary.
+        # This keeps delivery aligned with the same hard evidence used by the final gate.
         if confirm_reason:
             log.info(
                 "FINAL_2M_VOLUME_BODY_1M_HIGHER_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
@@ -3044,9 +3068,13 @@ async def cycle_loop():
                             # exact 30-second signal boundary. Any broker
                             # subscribe/unsubscribe latency is absorbed here,
                             # never at signal send time.
+                            prep_reference=time.time()
+                            for _item in prepared_selected:
+                                _item["final_delivery_precheck"]=_final_delivery_precheck(_item,prep_reference)
                             prep_items=sorted(
                                 prepared_selected,
                                 key=lambda x:(
+                                    float(x.get("final_delivery_precheck") or -900.0),
                                     int(x.get("confidence") or 0),
                                     float(x.get("strategy_margin") or 0),
                                     float(x.get("direction_agreement") or 0),
@@ -3077,9 +3105,13 @@ async def cycle_loop():
                                     )
                         if pass_no==5:
                             remaining_to_signal=max(0.0,signal_at-time.time())
+                            final_reference=time.time()
+                            for _item in prepared_selected:
+                                _item["final_delivery_precheck"]=_final_delivery_precheck(_item,final_reference)
                             final_items=sorted(
                                 prepared_selected,
                                 key=lambda x:(
+                                    float(x.get("final_delivery_precheck") or -900.0),
                                     int(x.get("confidence") or 0),
                                     float(x.get("strategy_margin") or 0),
                                     float(x.get("direction_agreement") or 0),
