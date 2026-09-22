@@ -22,13 +22,13 @@ UAE = ZoneInfo("Asia/Dubai")
 DURATION_SECONDS = max(60, min(300, int(os.getenv("LEARNING_PRACTICE_DURATION_SECONDS","60"))))
 AMOUNT = max(0.01, float(os.getenv("LEARNING_DEMO_AMOUNT","1")))
 WINDOW_MINUTES = 120
-START_HOUR = max(0, min(23, int(os.getenv("LEARNING_PRACTICE_START_HOUR_UAE","9"))))
+START_HOUR = 19
 LOOP_SECONDS = max(30, min(120, int(os.getenv("LEARNING_PRACTICE_INTERVAL_SECONDS","60"))))
 MIN_CONFIDENCE = max(75, min(96, int(os.getenv("LEARNING_PRACTICE_MIN_CONFIDENCE","82"))))
 APPROVAL_TTL = 45.0
 _pending = {}
 _open = {}
-_cfg = {}
+_cfg = {}\n_daily = {"day": None, "placed": 0, "win": 0, "loss": 0, "tie": 0, "blocked": 0, "strategies": set()}\n_last_report_day = None
 
 def configure(*, snapshot_provider, client_provider, send_message, answer_callback, admin_id):
     _cfg.update(
@@ -62,7 +62,7 @@ def status():
         "start_uae":start.isoformat(),
         "end_uae":end.isoformat(),
         "duration_seconds":DURATION_SECONDS,
-        "approval_required":True,
+        "approval_required":False,
         "demo_only":True,
         "pending":len(_pending),
         "open_trades":len(_open),
@@ -219,10 +219,6 @@ async def _send_request(candidate):
     rec=dict(candidate)
     rec.update(token=token,expires_at=expires,created_at=time.time(),status="PENDING")
     _pending[token]=rec
-    markup={"inline_keyboard":[
-        [{"text":"✅ ACCEPT DEMO","callback_data":f"learn:accept:{token}"},
-         {"text":"❌ REJECT","callback_data":f"learn:reject:{token}"}]
-    ]}
     text_msg=(
         "🧠 CANDICE • 2H LEARNING PRACTICE\n\n"
         f"📊 {rec['display_name']}\n"
@@ -236,8 +232,27 @@ async def _send_request(candidate):
         "Human ACCEPT is required before any demo order."
     )
     try:
-        await _cfg["send_message"](text_msg, reply_markup=markup,
-                                   chat_id=_cfg.get("admin_id") or None)
+        await _cfg["send_message"](text_msg, chat_id=_cfg.get("admin_id") or None)
+        _daily["strategies"].add(str(rec.get("strategy") or "UNKNOWN"))
+        ok, reason, placed = await _place_demo(rec, _cfg.get("admin_id",""))
+        _pending.pop(token, None)
+        if not ok:
+            _daily["blocked"] += 1
+            await _cfg["send_message"](
+                f"❌ DEMO AUTO-TRADE BLOCKED\\n\\nReason → {reason}",
+                chat_id=_cfg.get("admin_id") or None
+            )
+            await save_error(rec.get("strategy","UNKNOWN"), reason, rec.get("technique") or {})
+            return False
+        _daily["placed"] += 1
+        await _cfg["send_message"](
+            f"🤖 DEMO AUTO-TRADE STARTED\\n\\n📊 {placed['display_name']}\\n"
+            f"{'⬆️ UP' if placed['direction']=='UP' else '⬇️ DOWN'}\\n"
+            f"💰 Amount → {AMOUNT}\\n💵 Entry → {placed.get('entry_price')}\\n"
+            f"⏱️ Duration → {DURATION_SECONDS//60} MIN\\n"
+            f"🧩 Strategy → {placed['strategy']}\\n🆔 Demo Trade → {placed['trade_id']}",
+            chat_id=_cfg.get("admin_id") or None
+        )
         return True
     except Exception:
         _pending.pop(token,None)
@@ -338,23 +353,8 @@ async def handle_callback(query):
                                     chat_id=_cfg.get("admin_id") or None)
         return True
     if action!="accept":
-        await _cfg["answer_callback"](qid,"Invalid action")
+        await _cfg["answer_callback"](qid,"Auto demo mode is active; manual acceptance is not required.")
         return True
-    await _cfg["answer_callback"](qid,"Accepted — placing demo trade")
-    ok,reason,placed=await _place_demo(rec,uid)
-    if not ok:
-        await _cfg["send_message"](f"❌ DEMO LEARNING ORDER BLOCKED\n\nReason → {reason}",
-                                    chat_id=_cfg.get("admin_id") or None)
-        await save_error(rec.get("strategy","UNKNOWN"),reason,rec.get("technique") or {})
-        return True
-    await _cfg["send_message"](
-        f"✅ DEMO LEARNING ORDER ACCEPTED\n\n📊 {placed['display_name']}\n"
-        f"{'⬆️ UP' if placed['direction']=='UP' else '⬇️ DOWN'}\n"
-        f"💰 Amount → {AMOUNT}\n💵 Entry → {placed.get('entry_price')}\n⏱️ Duration → {DURATION_SECONDS//60} MIN\n"
-        f"🧩 Strategy → {placed['strategy']}\n🆔 Demo Trade → {placed['trade_id']}",
-        chat_id=_cfg.get("admin_id") or None
-    )
-    return True
 
 async def handle_trade_update(message):
     if not isinstance(message,dict):return
@@ -388,7 +388,7 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
             error_code="LOW_PRICE_EFFICIENCY"
         else:
             error_code="LOSS_CONTEXT"
-    await record_practice_result(rec.get("strategy","UNKNOWN"),result,
+    if result=="WIN": _daily["win"] += 1\n    elif result=="LOSS": _daily["loss"] += 1\n    else: _daily["tie"] += 1\n    _daily["day"] = str(_now_uae().date())\n    await record_practice_result(rec.get("strategy","UNKNOWN"),result,
                                  pair=rec.get("pair",""),confidence=rec.get("confidence",0),
                                  context=ctx,error_code=error_code)
     _open.pop(str(rec.get("trade_id") or ""),None)
@@ -430,6 +430,42 @@ async def _fallback_watch(rec):
     except Exception:
         await save_error(rec.get("strategy","UNKNOWN"),"RESULT_FALLBACK_FAILED",rec.get("technique") or {})
 
+
+async def _validated_strategy_ids():
+    if not DB_URL:
+        return []
+    try:
+        import psycopg
+        def read():
+            with psycopg.connect(DB_URL,connect_timeout=5) as db:
+                with db.cursor() as cur:
+                    cur.execute("SELECT strategy_id FROM nexora_strategy_knowledge WHERE status='VALIDATED' ORDER BY updated_at DESC")
+                    return [str(r[0]) for r in cur.fetchall()]
+        return await asyncio.to_thread(read)
+    except Exception:
+        return []
+
+async def _send_daily_report(day):
+    decided = _daily["win"] + _daily["loss"]
+    accuracy = (100.0 * _daily["win"] / decided) if decided else 0.0
+    validated = await _validated_strategy_ids()
+    await _cfg["send_message"](
+        "🧠 CANDICE • LEARNING REPORT\\n\\n"
+        "🕖 Practice → 19:00–21:00 UAE\\n"
+        f"📅 Day → {day}\\n"
+        f"🤖 DEMO AUTO-TRADE → {_daily['placed']} trades\\n"
+        f"🟢 WIN → {_daily['win']}\\n"
+        f"🔴 LOSS → {_daily['loss']}\\n"
+        f"🟡 TIE → {_daily['tie']}\\n"
+        f"🎯 Accuracy → {accuracy:.1f}%\\n"
+        f"⛔ Blocked → {_daily['blocked']}\\n\\n"
+        f"✅ VALIDATED / OWN STRATEGY READY → {len(validated)}\\n"
+        f"🧩 Strategies → {', '.join(validated[:20]) if validated else 'None'}\\n\\n"
+        "🔴 21:00 → Learning Auto-Trade OFF\\n"
+        "🔐 ADMIN ONLY",
+        chat_id=_cfg.get("admin_id") or None
+    )
+
 async def run_forever():
     if os.getenv("LEARNING_PRACTICE_ENABLED","true").strip().lower()=="false":
         return
@@ -452,12 +488,7 @@ async def run_forever():
                     pass
             # While the 2h window is active, allow another candidate only after the
             # previous request/order has completed. This prevents Telegram spam and
-            # excessive demo orders.
-            if practice_active(now) and not _pending and not _open:
-                candidate=await _build_candidate()
-                if candidate:
-                    await _send_request(candidate)
-            for tid,rec in list(_open.items()):
+            # excessive demo orders.            for tid,rec in list(_open.items()):
                 asyncio.create_task(_fallback_watch(rec)) if not rec.get("_watch_started") else None
                 rec["_watch_started"]=True
             # Expire stale approvals.
