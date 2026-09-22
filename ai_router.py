@@ -217,9 +217,9 @@ async def strategy_council_with_fallback(payload:dict[str,Any])->dict[str,Any]:
         log.info("AI_STRATEGY_COUNCIL_DISABLED reason=learning_council_off")
         return {"members":[],"member_count":0,"proposals":[],"votes":{},"consensus_strategy":"","agreement":0.0}
     if not BACKGROUND_EXTERNAL_ENABLED:
+        # Learning council is an explicitly separate research lane. A disabled
+        # live/background-review switch must not disable this DEMO-only council.
         log.info("AI_STRATEGY_COUNCIL_BACKGROUND_OVERRIDE enabled=True reason=learning_only_council")
-
-        return {"members":[],"member_count":0,"proposals":[],"votes":{},"consensus_strategy":"","agreement":0.0}
 
     timeout_value=float(os.getenv("AI_COUNCIL_HTTP_TIMEOUT","10.0"))
     http_timeout=max(4.0,min(20.0,timeout_value))
