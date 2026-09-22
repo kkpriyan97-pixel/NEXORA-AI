@@ -412,20 +412,70 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
     else:
         _daily["tie"] += 1
     _daily["day"] = str(_now_uae().date())
-    await record_practice_result(rec.get("strategy","UNKNOWN"),result,
+    db_ok=await record_practice_result(rec.get("strategy","UNKNOWN"),result,
                                  pair=rec.get("pair",""),confidence=rec.get("confidence",0),
                                  context=ctx,error_code=error_code)
+    validation=await _strategy_validation_snapshot(rec.get("strategy","UNKNOWN"))
     _open.pop(str(rec.get("trade_id") or ""),None)
+    if validation and validation["status"]=="VALIDATED":
+        validation_line=(
+            f"✅ Own Strategy Brain → VALIDATED "
+            f"(samples={validation['samples']}, accuracy="
+            f"{(100.0*validation['wins']/max(1,validation['wins']+validation['losses'])):.1f}%)"
+        )
+    elif validation:
+        validation_line=(
+            f"⏳ Own Strategy Brain → {validation['status']} "
+            f"(samples={validation['samples']}/20)"
+        )
+    else:
+        validation_line="⏳ Own Strategy Brain → validation pending"
     await _cfg["send_message"](
-        "🧠 DEMO LEARNING RESULT\n\n"
-        f"📊 {rec.get('display_name')}\n"
-        f"{'🟢 WIN' if result=='WIN' else '🔴 LOSS' if result=='LOSS' else '🟡 TIE'}\n"
-        f"🧩 Strategy → {rec.get('strategy')}\n"
-        f"🔎 Result source → {source}\n"
-        f"📦 Learning DB → UPDATED\n"
+        "🧠 DEMO LEARNING RESULT
+
+"
+        f"📊 {rec.get('display_name')}
+"
+        f"{'🟢 WIN' if result=='WIN' else '🔴 LOSS' if result=='LOSS' else '🟡 TIE'}
+"
+        f"🧩 Strategy → {rec.get('strategy')}
+"
+        f"🔎 Result source → {source}
+"
+        f"📦 Learning DB → {'UPDATED' if db_ok else 'UPDATE FAILED'}
+"
+        f"{validation_line}
+"
         f"💾 Raw practice log → bounded to 500 records",
         chat_id=_cfg.get("admin_id") or None
     )
+
+async def _strategy_validation_snapshot(strategy_id):
+    if not DB_URL or not strategy_id:
+        return None
+    try:
+        import psycopg
+        def read():
+            with psycopg.connect(DB_URL,connect_timeout=5) as db:
+                with db.cursor() as cur:
+                    cur.execute(
+                        "SELECT samples,wins,losses,ties,status FROM nexora_strategy_knowledge WHERE strategy_id=%s",
+                        (str(strategy_id),)
+                    )
+                    row=cur.fetchone()
+                    if not row:
+                        return None
+                    return {
+                        "samples": int(row[0] or 0),
+                        "wins": int(row[1] or 0),
+                        "losses": int(row[2] or 0),
+                        "ties": int(row[3] or 0),
+                        "status": str(row[4] or "CANDIDATE"),
+                    }
+        return await asyncio.to_thread(read)
+    except Exception:
+        return None
+
 
 async def _fallback_watch(rec):
     await asyncio.sleep(DURATION_SECONDS+2)
