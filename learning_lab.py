@@ -198,7 +198,12 @@ async def _load_campaign(session_id):
         rows=await asyncio.to_thread(read)
         if not rows:
             return None
-        for row in rows:
+        ordered_rows=sorted(
+            rows,
+            key=lambda row:(int(row[1] or 0), str(row[0] or ""))
+        )
+        strategy_queue=[str(row[0]).upper() for row in ordered_rows if row[0]]
+        for row in ordered_rows:
             strategy,idx,samples,wins,losses,ties,status,started=row
             if str(status)=="ACTIVE":
                 CAMPAIGN_STATE.update({
@@ -206,6 +211,7 @@ async def _load_campaign(session_id):
                     "strategy_index":int(idx),"sampled":int(samples or 0),
                     "wins":int(wins or 0),"losses":int(losses or 0),
                     "ties":int(ties or 0),"status":"ACTIVE",
+                    "strategies":strategy_queue,
                     "started_at":float(started or time.time()),
                 })
                 return CAMPAIGN_STATE
@@ -240,8 +246,20 @@ async def _initialize_campaign(session_id):
     for s,_ in sorted(votes.items(),key=lambda kv:(-int(kv[1] or 0),kv[0])):
         s=str(s).upper()
         if s in core and s not in ordered: ordered.append(s)
+    validated=set()
+    try:
+        validated={str(x).upper() for x in await _validated_strategy_ids()}
+    except Exception:
+        validated=set()
     for s in core:
-        if s not in ordered: ordered.append(s)
+        if s not in ordered and s not in validated:
+            ordered.append(s)
+    ordered=[s for s in ordered if s not in validated]
+    if not ordered:
+        # No validated-free core family is left. Keep the first core family as a
+        # research fallback; it remains DEMO-only and will not be promoted again
+        # unless a new 100-trade campaign independently passes the gate.
+        ordered=[str(strategy or core[0]).upper()]
 
     CAMPAIGN_STATE.update({
         "session_id":str(session_id),"strategy":ordered[0],
@@ -638,11 +656,40 @@ async def _build_candidate(forced_strategy=None,return_all=False):
     if forced_strategy:
         forced_strategy=str(forced_strategy).upper().strip()
         base_preferred=[forced_strategy]
+    recent_evidence=[]
+    try:
+        if DB_URL:
+            import psycopg
+            def read_evidence():
+                with psycopg.connect(DB_URL,connect_timeout=5) as db:
+                    with db.cursor() as cur:
+                        cur.execute("""
+                            SELECT method_id,url,domain,language,evidence_score,evidence_json
+                            FROM nexora_m1_evidence
+                            ORDER BY created_at DESC LIMIT 12
+                        """)
+                        return cur.fetchall()
+            rows=await asyncio.to_thread(read_evidence)
+            for mid,url,dom,lang,score,payload in rows:
+                if isinstance(payload,str):
+                    try: payload=json.loads(payload)
+                    except Exception: payload={"raw":payload[:800]}
+                recent_evidence.append({
+                    "method_id":str(mid or ""),
+                    "url":str(url or "")[:300],
+                    "domain":str(dom or ""),
+                    "language":str(lang or ""),
+                    "evidence_score":float(score or 0),
+                    "evidence":payload,
+                })
+    except Exception:
+        recent_evidence=[]
     council_payload={
         "session_day":str(session_day),
         "mode":"DEMO_ONLY",
         "market_universe":{"assets":len(assets),"candle_series":len(candles),"price_series":len(prices)},
         "research_hints":[{"strategy":st,"source":sid} for st,sid in hints[:16]],
+        "recent_research_evidence":recent_evidence,
         "allowed_strategies":base_preferred,
     }
     global _council_cache
@@ -678,7 +725,8 @@ async def _build_candidate(forced_strategy=None,return_all=False):
     preferred=list(dict.fromkeys(council_order+base_preferred))
     print(
         f"LEARNING_CANDIDATE_SCAN assets={len(assets)} candles={len(candles)} "
-        f"prices={len(prices)} preferred={','.join(preferred[:12])} "
+        f"prices={len(prices)} research_evidence={len(recent_evidence)} "
+        f"preferred={','.join(preferred[:12])} "
         f"council_members={int(council.get('member_count') or 0)} "
         f"consensus={council.get('consensus_strategy') or 'NONE'} "
         f"agreement={float(council.get('agreement') or 0.0):.3f}"
