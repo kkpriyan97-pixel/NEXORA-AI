@@ -486,6 +486,8 @@ class M1WorldLab:
             except Exception:self.started_at=time.time()
             self.db.set_meta("started_at",self.started_at)
         self.db.seed_research_seeds()
+        for seed in RESEARCH_SEEDS:
+            self.enqueue(seed["url"],seed["lang"],"seed")
         self.metrics={"runs":0,"searches":0,"discovered":0,"fetched":0,"evidence":0,"errors":0,"deduped":0,"kimi_calls":0,"kimi_success":0,"kimi_items":0,"kimi_errors":0,"languages_queried":defaultdict(int)}
         self.languages_seen=defaultdict(int)
     def day(self):
@@ -657,6 +659,7 @@ class M1WorldLab:
         return saved
     async def run_once(self):
         self.metrics["runs"]+=1;start=time.time()
+        log.info("KIMI_RESEARCH_STATUS enabled=%s configured=%s model=%s interval_runs=%s",KIMI_RESEARCH_ENABLED,kimi_configured(),os.getenv("KIMI_RESEARCH_MODEL","kimi-k2.6"),KIMI_RESEARCH_INTERVAL_RUNS)
         await self.discover()
         workers=[]
         while not self.queue.empty() and len(workers)<min(MAX_CONCURRENCY*3,FETCHES_PER_RUN):
