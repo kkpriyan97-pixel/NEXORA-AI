@@ -13,6 +13,14 @@ from candice_brain import analyze_asset
 from ai_engine import snapshot_from_asset
 from ai_router import analyze_with_fallback,review_result_with_fallback
 from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot_async, world_learning_loop
+from strategy_knowledge import ensure_tables as ensure_strategy_knowledge_tables, refresh as refresh_strategy_knowledge, refresh_loop as strategy_knowledge_refresh_loop
+from learning_lab import (
+    configure as configure_learning_lab,
+    run_forever as learning_practice_loop,
+    status as learning_practice_status,
+    handle_callback as handle_learning_callback,
+    handle_trade_update as handle_learning_trade_update,
+)
 
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -1395,15 +1403,18 @@ async def account_tick_subscription_worker():
                         type(e).__name__,str(e)[:160])
         await asyncio.sleep(1.0)
 
-async def telegram(text, chat_id=None):
+async def telegram(text, chat_id=None, reply_markup=None):
     token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
     chat=str(chat_id or STATE.get("telegram_chat_id") or os.getenv("TELEGRAM_CHAT_ID","")).strip()
     if not token or not chat:
         log.warning("TELEGRAM_NOT_CONFIGURED")
         return False
     try:
+        payload={"chat_id":chat,"text":text,"parse_mode":"HTML"}
+        if reply_markup is not None:
+            payload["reply_markup"]=reply_markup
         async with httpx.AsyncClient(timeout=8) as h:
-            r=await h.post(f"https://api.telegram.org/bot{token}/sendMessage",json={"chat_id":chat,"text":text,"parse_mode":"HTML"})
+            r=await h.post(f"https://api.telegram.org/bot{token}/sendMessage",json=payload)
             if r.status_code >= 400:
                 try: detail=r.json()
                 except Exception: detail={"description":r.text[:200]}
@@ -1412,6 +1423,21 @@ async def telegram(text, chat_id=None):
             return True
     except Exception as e:
         log.warning("TELEGRAM_SEND_FAILED type=%s message=%s",type(e).__name__,str(e)[:200]);return False
+
+async def telegram_answer_callback(query_id, text_msg=""):
+    token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
+    if not token or not query_id:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=5) as h:
+            r=await h.post(
+                f"https://api.telegram.org/bot{token}/answerCallbackQuery",
+                json={"callback_query_id":str(query_id),"text":str(text_msg)[:180]},
+            )
+            return r.status_code < 400
+    except Exception as e:
+        log.warning("TELEGRAM_CALLBACK_ACK_FAILED type=%s message=%s",type(e).__name__,str(e)[:140])
+        return False
 
 async def send_learning_summary(summary):
     if not summary:
@@ -3502,6 +3528,10 @@ async def market_worker():
         ACCOUNT_TICK_LAST_ATTEMPT.clear()
         client.register_callback(parameters.E_TICK_UPDATE,on_tick)
         client.register_callback(parameters.E_ASSET_PROFITABILITY_UPDATE,on_asset_update)
+        # Demo-learning trade events are isolated from live signal/result state.
+        # They exist only for human-approved practice orders.
+        client.register_callback(parameters.E_TRADE_ACCEPTED,on_learning_trade_update)
+        client.register_callback(parameters.E_TRADE_CLOSED,on_learning_trade_update)
         try:
             STATE["status"]="connecting"
             # Let the websocket/auth handshake settle before the first
@@ -3663,6 +3693,22 @@ async def market_worker():
             except Exception:pass
             CLIENT=None
 
+def learning_market_snapshot():
+    # Read-only snapshot for the isolated 2-hour learning lab. It never exposes
+    # mutable live signal structures and never performs broker I/O.
+    return {
+        "assets":[dict(a) for a in STATE.get("assets") or []],
+        "candles":{str(p):list(v)[-120:] for p,v in (STATE.get("candles") or {}).items()},
+        "prices":{str(p):tuple(v) for p,v in (STATE.get("prices") or {}).items()},
+    }
+
+async def on_learning_trade_update(message):
+    try:
+        asyncio.create_task(handle_learning_trade_update(message))
+    except Exception as e:
+        log.warning("LEARNING_TRADE_EVENT_DISPATCH_FAILED type=%s message=%s",
+                    type(e).__name__,str(e)[:120])
+
 async def telegram_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg=update.message
     if not msg: return
@@ -3727,7 +3773,8 @@ async def health(reader,writer):
             log.info("PING_REQUEST status=200")
             return
         if path.startswith("/health"):
-            body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"account_id":STATE.get("account_id"),"account_group":STATE.get("account_group"),"feed_source":STATE.get("feed_source"),"network":STATE.get("network",{}),"m1_world_learning":m1_learning_status()}).encode()
+            body_out=json.dumps({"service":"CANDICE-AI","status":STATE["status"],"read_only":True,"asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),"cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),"account_id":STATE.get("account_id"),"account_group":STATE.get("account_group"),"feed_source":STATE.get("feed_source"),"network":STATE.get("network",{}),"m1_world_learning":m1_learning_status(),"learning_practice":learning_practice_status(),
+"live_external_ai":False}).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "+str(len(body_out)).encode()+b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
             await writer.drain()
             log.info("HEALTH_REQUEST status=200 path=%s",path)
@@ -3744,12 +3791,25 @@ async def health(reader,writer):
         if path.startswith("/telegram/webhook") and body:
             try:
                 upd=json.loads(body.decode("utf-8"))
-                msg=upd.get("message") or upd.get("edited_message") or {}
-                chat_id=(msg.get("chat") or {}).get("id")
-                if chat_id is not None:
-                    STATE["telegram_chat_id"]=chat_id
-                    log.info("TELEGRAM_CHAT_ID_CAPTURED chat_id=%s",chat_id)
-                await handle_telegram_command(msg)
+                callback=upd.get("callback_query")
+                if callback:
+                    msg=(callback.get("message") or {})
+                    chat_id=(msg.get("chat") or {}).get("id")
+                    if chat_id is not None:
+                        STATE["telegram_chat_id"]=chat_id
+                        log.info("TELEGRAM_CHAT_ID_CAPTURED chat_id=%s source=callback",chat_id)
+                    # Acknowledge the webhook immediately; the demo order is
+                    # executed asynchronously only after the human ACCEPT gate.
+                    asyncio.create_task(
+                        handle_learning_callback(callback)
+                    )
+                else:
+                    msg=upd.get("message") or upd.get("edited_message") or {}
+                    chat_id=(msg.get("chat") or {}).get("id")
+                    if chat_id is not None:
+                        STATE["telegram_chat_id"]=chat_id
+                        log.info("TELEGRAM_CHAT_ID_CAPTURED chat_id=%s",chat_id)
+                    await handle_telegram_command(msg)
             except Exception as e:
                 log.warning("TELEGRAM_WEBHOOK_PARSE_FAILED %s",e)
         body_out=json.dumps({"service":"CANDICE-AI","status":"ok","read_only":True}).encode()
@@ -3794,7 +3854,28 @@ async def main():
     await ensure_result_watch_queue_table()
     await ensure_cycle_state_table()
     await ensure_access_table()
+    # The knowledge DB is an isolated bridge: learning writes compact validated
+    # strategy/technique knowledge; the Signal Brain reads an in-memory snapshot.
+    await ensure_strategy_knowledge_tables()
+    await refresh_strategy_knowledge(force=True)
+    configure_learning_lab(
+        snapshot_provider=learning_market_snapshot,
+        client_provider=lambda: CLIENT,
+        send_message=telegram,
+        answer_callback=telegram_answer_callback,
+        admin_id=ADMIN_TELEGRAM_ID,
+    )
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
-    await asyncio.gather(market_worker(),account_tick_subscription_worker(),account_live_feed_worker(),cycle_loop_supervisor(),ai_review_worker(),world_learning_loop(),server.serve_forever())
+    await asyncio.gather(
+        market_worker(),
+        account_tick_subscription_worker(),
+        account_live_feed_worker(),
+        cycle_loop_supervisor(),
+        ai_review_worker(),
+        world_learning_loop(),
+        strategy_knowledge_refresh_loop(),
+        learning_practice_loop(),
+        server.serve_forever(),
+    )
 if __name__=="__main__":asyncio.run(main())
