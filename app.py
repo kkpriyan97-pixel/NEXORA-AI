@@ -2704,6 +2704,14 @@ async def cycle_loop():
             confirm_reason="higher_timeframe_conflict"
 
         confidence=int(candidate.get("confidence") or 0)
+        strategy_name=str(candidate.get("strategy") or "").upper()
+        trend_name=str(candidate.get("trend_15m") or "").upper()
+
+        # Keep continuation strategies out of a sideways 15m regime at delivery as
+        # a second hard safety layer. This mirrors the Brain rule and prevents a
+        # stale/recovered candidate from bypassing the regime requirement.
+        if strategy_name in {"MOMENTUM","BREAKOUT"} and trend_name=="SIDEWAYS":
+            confirm_reason="sideways_regime_for_continuation_strategy"
 
         # Do not relax the closed-candle body-strength gate. A high Brain score
         # cannot override weak last-closed 2m price action at the exact entry boundary.
