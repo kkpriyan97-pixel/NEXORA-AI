@@ -929,6 +929,7 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
                                      "members":rec.get("council_members"),
                                      "votes":rec.get("council_votes"),
                                  })
+    await _campaign_result(result,rec.get("strategy","UNKNOWN"))
     validation=await _strategy_validation_snapshot(rec.get("strategy","UNKNOWN"))
     if tid:
         await complete_open_trade(tid,result)
