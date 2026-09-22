@@ -1393,7 +1393,7 @@ async def account_tick_subscription_worker():
         except Exception as e:
             log.warning("ACCOUNT_TICK_SUBSCRIPTION_WORKER_ERROR type=%s message=%s",
                         type(e).__name__,str(e)[:160])
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.0)
 
 async def telegram(text, chat_id=None):
     token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
