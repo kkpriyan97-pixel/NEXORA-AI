@@ -568,12 +568,17 @@ def analyze_asset(asset, candles, price=None):
         return None
 
     ranked = sorted(valid, key=lambda x: x["score"], reverse=True)
-    best = ranked[0]
-    second_score = ranked[1]["score"] if len(ranked) > 1 else 0.0
-    strategy_margin = max(0.0, best["score"] - second_score)
-    if best["score"] < 82 or strategy_margin < 6:
+    # Do not collapse a market setup to one technique too early. Keep every
+    # independently qualified strategy/direction variant (score >= 82) so the
+    # final delivery layer can fall through to the next technique when the
+    # first technique fails a late 2m/1m/live-price gate.
+    qualified_variants = [x for x in ranked if x["score"] >= 82]
+    if not qualified_variants:
         return None
 
+    best = qualified_variants[0]
+    second_score = ranked[1]["score"] if len(ranked) > 1 else 0.0
+    strategy_margin = max(0.0, best["score"] - second_score)
     expected = best["direction"]
 
     # 5m is never a normal/default expiry. This flag only says that the market
@@ -627,6 +632,16 @@ def analyze_asset(asset, candles, price=None):
         "confidence": confidence,
         "strategy": best["strategy"],
         "expiry_minutes": best["expiry_minutes"],
+        "strategy_candidates": [
+            {
+                "strategy": str(v.get("strategy") or ""),
+                "direction": str(v.get("direction") or "").upper(),
+                "score": int(round(v.get("score") or 0)),
+                "expiry_minutes": int(v.get("expiry_minutes") or 3),
+                "self_strategy_version": str(v.get("self_strategy_version") or ""),
+            }
+            for v in qualified_variants
+        ],
         "five_minute_eligible": five_minute_eligible,
         "self_strategy": self_profile["strategy"],
         "self_strategy_strength": self_profile["strength"],
