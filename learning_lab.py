@@ -43,6 +43,22 @@ _cfg = {}
 _daily = {"day": None, "placed": 0, "win": 0, "loss": 0, "tie": 0, "blocked": 0, "strategies": set()}
 _last_report_day = None
 _practice_cursor = 0
+CAMPAIGN_MIN_TRADES = 100
+CAMPAIGN_MIN_WIN_RATE = 0.85
+CAMPAIGN_TARGET_WIN_RATE = 0.90
+CAMPAIGN_STATE = {
+    "session_id":"",
+    "strategy":"",
+    "strategy_index":0,
+    "sampled":0,
+    "wins":0,
+    "losses":0,
+    "ties":0,
+    "status":"WAITING",
+    "strategies":[],
+    "started_at":0.0,
+}
+CAMPAIGN_ASSET_SEM = asyncio.Semaphore(12)
 
 def configure(*, snapshot_provider, client_provider, send_message, answer_callback, admin_id):
     _cfg.update(
@@ -287,7 +303,7 @@ async def _load_research_hints():
                 hints.append((strategy,str(mid)));seen.add(strategy)
     return hints
 
-def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,council_votes=None):
+def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,council_votes=None,forced_strategy=None):
     candidates=[]
     council_votes=dict(council_votes or {})
     now=time.time()
@@ -313,7 +329,7 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,
         if len(cs)<45:continue
         try:
             price=(prices.get(pair) or [None,None])[0]
-            brain=analyze_asset(asset,cs,price)
+            brain=analyze_asset(asset,cs,price,forced_strategy=forced_strategy)
         except Exception:
             continue
         if not brain:continue
@@ -356,7 +372,7 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,
         "council_boost":council_boost,
     }
 
-async def _build_candidate():
+async def _build_candidate(forced_strategy=None):
     provider=_cfg.get("snapshot_provider")
     if not provider:
         return None
@@ -391,6 +407,9 @@ async def _build_candidate():
         "TREND_FOLLOWING","MOMENTUM","BREAKOUT","PULLBACK",
         "REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY"
     ]
+    if forced_strategy:
+        forced_strategy=str(forced_strategy).upper().strip()
+        base_preferred=[forced_strategy]
     council_payload={
         "session_day":str(session_day),
         "mode":"DEMO_ONLY",
@@ -436,12 +455,12 @@ async def _build_candidate():
         f"consensus={council.get('consensus_strategy') or 'NONE'} "
         f"agreement={float(council.get('agreement') or 0.0):.3f}"
     )
-    batch=max(1,int(os.getenv("LEARNING_ASSET_BATCH","8")))
+    batch=len(assets) if forced_strategy else max(1,int(os.getenv("LEARNING_ASSET_BATCH","8")))
     global _practice_cursor
     offset=_practice_cursor
     _practice_cursor=(offset+batch)%max(1,len(assets)) if assets else 0
     candidate=await asyncio.to_thread(
-        _analyze_snapshot_sync,assets,candles,prices,preferred,hints,batch,offset,votes
+        _analyze_snapshot_sync,assets,candles,prices,preferred,hints,batch,offset,votes,forced_strategy
     )
     if candidate:
         consensus=str(council.get("consensus_strategy") or "").upper()
