@@ -365,6 +365,46 @@ async def record_strategy_council(session_id: str, council: dict | None = None):
         return True
     except Exception:
         return False
+async def promote_campaign_strategy(strategy_id: str, samples: int, wins: int, losses: int):
+    """Promote only a completed DEMO campaign that passes the explicit 100/85 gate."""
+    if not DB_URL or not strategy_id:
+        return False
+    samples=int(samples or 0); wins=int(wins or 0); losses=int(losses or 0)
+    if samples < 100 or wins / max(1,wins+losses) < 0.85:
+        return False
+    import psycopg
+    try:
+        def write():
+            with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        UPDATE nexora_strategy_knowledge
+                        SET status='VALIDATED',
+                            payload=jsonb_set(
+                                COALESCE(payload,'{}'::jsonb),
+                                '{campaign_validation}',
+                                %s::jsonb,
+                                true
+                            ),
+                            updated_at=NOW()
+                        WHERE strategy_id=%s
+                    """,(
+                        json.dumps({
+                            "samples":samples,
+                            "wins":wins,
+                            "losses":losses,
+                            "win_rate":round(100*wins/max(1,wins+losses),2),
+                            "gate":"100_DEMO_TRADES_AND_85_PERCENT_MIN",
+                        },separators=(",",":")),
+                        str(strategy_id).upper()
+                    ))
+                db.commit()
+        await asyncio.to_thread(write)
+        await refresh()
+        return True
+    except Exception:
+        return False
+
 async def save_error(strategy_id: str, error_code: str, context: dict | None = None):
     if not DB_URL or not strategy_id or not error_code:
         return False
