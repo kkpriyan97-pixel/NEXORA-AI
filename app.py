@@ -854,8 +854,10 @@ ACCOUNT_TICK_SUB_SEM=asyncio.Semaphore(1)
 ACCOUNT_TICK_SUB_BATCH=4
 ACCOUNT_TICK_SUB_RETRY=2.0
 ACCOUNT_TICK_SUB_DELAY=0.35
-ACCOUNT_TICK_MAX_SLOTS=2
-ACCOUNT_TICK_ROTATE_INTERVAL=6.0
+# Keep three normal coverage slots and reserve two for final candidates.
+ACCOUNT_TICK_MAX_SLOTS=3
+ACCOUNT_TICK_PIN_SLOTS=2
+ACCOUNT_TICK_ROTATE_INTERVAL=15.0
 ACCOUNT_TICK_SUBSCRIBED=set()
 ACCOUNT_TICK_LAST_ATTEMPT={}
 ACCOUNT_TICK_PINNED={}
@@ -1151,28 +1153,41 @@ async def sync_account_assets(client, reason="periodic"):
     return True
 
 async def on_asset_update(message):
-    """Apply event-183 updates only to assets already admitted by the account-scoped scan."""
+    """Apply partial event-183 updates without treating them as a full asset scan."""
     raw=message.get("d") if isinstance(message,dict) else None
     if not isinstance(raw,list) or not raw:
-        return
-    incoming=build_assets(CLIENT,raw)
-    if not incoming:
         return
     current={a["pair"]:a for a in STATE["assets"]}
     updated=0
     ignored=0
-    for a in incoming:
-        p=a["pair"]
-        if p in current:
-            current[p]=a
-            updated+=1
-        else:
-            # event 183 is an update stream, not an authority to widen the account universe.
+    for x in raw:
+        if not isinstance(x,dict):
+            continue
+        p=pair_name(x)
+        if not p:
+            continue
+        if p not in current:
+            # event 183 is an update stream, not authority to widen the account universe.
             ignored+=1
-    STATE["assets"]=list(current.values())
-    STATE["feed_source"]="authenticated_websocket:event_183"
-    log.info("ACCOUNT_ASSET_FEED_UPDATE source=authenticated_websocket:event_183 updated=%d ignored_unknown=%d visible=%d",
-             updated,ignored,len(STATE["assets"]))
+            continue
+        merged=current[p].copy()
+        title=display_name(x) or merged.get("display_name") or ACCOUNT_ASSET_DISPLAY_MAP.get(p)
+        if title:
+            merged["display_name"]=title
+            merged["title"]=title
+            merged["signal_asset_label"]=title
+        for key in ("profitability","locked","locked_trading","disabled"):
+            if key in x:
+                merged[key]=x.get(key)
+        current[p]=merged
+        updated+=1
+    if updated:
+        STATE["assets"]=list(current.values())
+        STATE["feed_source"]="authenticated_websocket:event_183"
+    log.info(
+        "ACCOUNT_ASSET_FEED_UPDATE source=authenticated_websocket:event_183 updated=%d ignored_unknown=%d visible=%d",
+        updated,ignored,len(STATE["assets"])
+    )
 
 
 async def scan_account_live_feed():
@@ -1261,7 +1276,7 @@ async def pin_account_tick_pairs(pairs,ttl=12.0):
             p=str(p or "")
             if p and p not in seen:
                 seen.add(p);unique.append(p)
-        targets=unique[:ACCOUNT_TICK_MAX_SLOTS]
+        targets=unique[:ACCOUNT_TICK_PIN_SLOTS]
         until=time.time()+float(ttl)
         for p in targets:
             ACCOUNT_TICK_PINNED[p]=until
@@ -2961,7 +2976,9 @@ async def cycle_loop():
                         require_live_price=False,
                         deep_analysis=(pass_no in (4,5)),
                         use_cached_only=(pass_no==5),
-                        return_ranked=(pass_no==5)
+                        # Rank several candidates in the deep passes. Pass 4 uses
+                        # that ranked set to prepare authenticated tick coverage.
+                        return_ranked=(pass_no in (4,5))
                     ),
                     timeout=max(1.0,remaining-0.50)
                 )
@@ -2986,13 +3003,14 @@ async def cycle_loop():
                             )
                             candidate_pool[key]=item
 
-                        if pass_no==5:
-                            # Pre-pin the strongest two final candidates so a
-                            # final candle rejection can immediately fall through
-                            # to the next asset without waiting for tick rotation.
-                            final_items=sorted(
+                        if pass_no==4:
+                            # Prepare the authenticated tick slots well before the
+                            # exact 30-second signal boundary. Any broker
+                            # subscribe/unsubscribe latency is absorbed here,
+                            # never at signal send time.
+                            prep_items=sorted(
                                 [x for x in candidate_pool.values()
-                                 if int(x.get("qualified_pass") or 0)==5],
+                                 if int(x.get("qualified_pass") or 0)==4],
                                 key=lambda x:(
                                     int(x.get("confidence") or 0),
                                     float(x.get("strategy_margin") or 0),
@@ -3000,26 +3018,26 @@ async def cycle_loop():
                                     float(x.get("market_quality") or 0)
                                 ),
                                 reverse=True
-                            )[:ACCOUNT_TICK_MAX_SLOTS]
-                            if final_items:
-                                pin_ttl=max(15.0,target-time.time()+8.0)
+                            )[:ACCOUNT_TICK_PIN_SLOTS]
+                            if prep_items:
+                                pin_ttl=max(45.0,target-time.time()+20.0)
                                 try:
-                                    await pin_account_tick_pairs(
-                                        [x.get("pair") for x in final_items],
+                                    active_prep=await pin_account_tick_pairs(
+                                        [x.get("pair") for x in prep_items],
                                         ttl=pin_ttl
                                     )
                                     log.info(
-                                        "FINAL_CANDIDATE_TICKS_PINNED cycle=%s pairs=%s pass=%s ttl=%.1f target_utc=%s",
-                                        cycle_id,[x.get("pair") for x in final_items],
-                                        pass_no,pin_ttl,
+                                        "FINAL_CANDIDATE_TICKS_PREPARED cycle=%s pairs=%s pass=%s active=%s ttl=%.1f target_utc=%s",
+                                        cycle_id,[x.get("pair") for x in prep_items],
+                                        pass_no,active_prep,pin_ttl,
                                         datetime.fromtimestamp(
                                             target,tz=timezone.utc
                                         ).strftime("%H:%M:%S")
                                     )
                                 except Exception as e:
                                     log.warning(
-                                        "FINAL_CANDIDATE_TICKS_PIN_FAILED cycle=%s pairs=%s pass=%s type=%s message=%s",
-                                        cycle_id,[x.get("pair") for x in final_items],
+                                        "FINAL_CANDIDATE_TICKS_PREPARE_FAILED cycle=%s pairs=%s pass=%s message=%s",
+                                        cycle_id,[x.get("pair") for x in prep_items],
                                         pass_no,type(e).__name__,str(e)[:120]
                                     )
                         for item in selected:
@@ -3183,7 +3201,8 @@ async def cycle_loop():
         # 30s signal boundary. Pass 5 already pre-pins its strongest candidates
         # before reaching this point; any second pin here can consume the final
         # delivery milliseconds and make a valid cycle miss its own signal slot.
-        if time.time()<=signal_at+0.20:
+        boundary_lag=time.time()-signal_at
+        if boundary_lag<=0.20:
             attempted_final=0
             for candidate in ranked_pool:
                 attempted_final+=1
@@ -3207,6 +3226,11 @@ async def cycle_loop():
                     break
 
         if not sent:
+            if boundary_lag>0.20:
+                log.warning(
+                    "FINAL_BOUNDARY_MISSED cycle=%s lag_seconds=%.3f candidates=%s",
+                    cycle_id,boundary_lag,len(ranked_pool)
+                )
             if ranked_pool:
                 log.info(
                     "FIVE_SCAN_NO_VALID_SIGNAL cycle=%s candidates=%s "
