@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, quote_plus, urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
+from kimi_research import analyze as kimi_analyze, configured as kimi_configured
 
 log = logging.getLogger("candice.m1lab")
 
@@ -48,6 +49,9 @@ HTTP_TIMEOUT = max(3.0, float(os.getenv("M1_RESEARCH_HTTP_TIMEOUT", "6")))
 MAX_PAGE_BYTES = max(200_000, int(os.getenv("M1_RESEARCH_MAX_PAGE_BYTES", "700000")))
 USER_AGENT = os.getenv("M1_RESEARCH_USER_AGENT", "NEXORA-M1-ResearchBot/1.0")
 DB_URL = os.getenv("DATABASE_URL", "").strip()
+KIMI_RESEARCH_ENABLED = os.getenv("KIMI_RESEARCH_ENABLED", "true").strip().lower() != "false"
+KIMI_RESEARCH_INTERVAL_RUNS = max(1, int(os.getenv("KIMI_RESEARCH_INTERVAL_RUNS", "5")))
+KIMI_RESEARCH_MAX_ITEMS = max(2, min(8, int(os.getenv("KIMI_RESEARCH_MAX_ITEMS", "6"))))
 SQLITE_PATH = os.getenv("M1_RESEARCH_SQLITE_PATH", "m1_world_learning.sqlite3")
 DEFAULT_START_UTC = "2026-09-21T20:52:37+00:00"
 
@@ -350,6 +354,49 @@ class DB:
                 q.execute("UPDATE nexora_m1_sources SET pages_scanned=pages_scanned+1,last_seen=NOW() WHERE domain=%s",(domain(u),))
                 for e in evidence:q.execute("INSERT INTO nexora_m1_evidence(method_id,url,domain,language,evidence_score,evidence_json,marketing_claim) VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s) ON CONFLICT(method_id,url) DO NOTHING",(e["method_id"],e["url"],e["domain"],e["language"],e["evidence_score"],json.dumps(e,ensure_ascii=False),bool(e["marketing_claim"])))
             c.commit()
+    def recent_evidence(self,limit=18):
+        limit=max(1,min(40,int(limit)))
+        try:
+            if self.sqlite:
+                rows=self.cx.execute("SELECT method_id,url,domain,language,evidence_score,evidence_json FROM evidence ORDER BY created_at DESC LIMIT ?",(limit,)).fetchall()
+            else:
+                import psycopg
+                with psycopg.connect(DB_URL,connect_timeout=8) as cdb:
+                    with cdb.cursor() as q:
+                        q.execute("SELECT method_id,url,domain,language,evidence_score,evidence_json FROM nexora_m1_evidence ORDER BY created_at DESC LIMIT %s",(limit,))
+                        rows=q.fetchall()
+            out=[]
+            for row in rows:
+                try:
+                    payload=row[5]
+                    if isinstance(payload,str): payload=json.loads(payload)
+                    out.append({"method_id":row[0],"url":row[1],"domain":row[2],"language":row[3],"evidence_score":float(row[4] or 0),"evidence":payload})
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return []
+
+    def save_kimi_note(self,run_no,item_no,note):
+        url="kimi://run/%s/%s/%s" % (int(run_no),int(item_no),int(time.time()*1000))
+        payload=dict(note or {})
+        payload["origin"]="KIMI_RESEARCH"
+        payload["run"]=int(run_no)
+        payload["item"]=int(item_no)
+        payload["model"]=os.getenv("KIMI_RESEARCH_MODEL","kimi-k2.6")
+        lang=str(payload.get("language") or "multi")
+        try: score=max(0.0,min(1.0,float(payload.get("confidence") or 0.0)/100.0))
+        except Exception: score=0.0
+        if self.sqlite:
+            self.cx.execute("INSERT OR IGNORE INTO evidence(method_id,url,domain,language,evidence_score,evidence_json,marketing_claim,created_at) VALUES(?,?,?,?,?,?,?,?)",("kimi_research",url,"kimi-research",lang,score,json.dumps(payload,ensure_ascii=False),0,time.time()))
+            self.cx.commit()
+            return
+        import psycopg
+        with psycopg.connect(DB_URL,connect_timeout=8) as cdb:
+            with cdb.cursor() as q:
+                q.execute("INSERT INTO nexora_m1_evidence(method_id,url,domain,language,evidence_score,evidence_json,marketing_claim) VALUES(%s,%s,%s,%s,%s,%s::jsonb,FALSE) ON CONFLICT(method_id,url) DO NOTHING",("kimi_research",url,"kimi-research",lang,score,json.dumps(payload,ensure_ascii=False)))
+            cdb.commit()
+
     def store_forecast(self,pair,pred_ts,target_ts,direction,p,features):
         data=(pair,pred_ts,target_ts,direction,float(p),json.dumps(features,separators=(",",":")),time.time())
         if self.sqlite:
@@ -439,7 +486,7 @@ class M1WorldLab:
             except Exception:self.started_at=time.time()
             self.db.set_meta("started_at",self.started_at)
         self.db.seed_research_seeds()
-        self.metrics={"runs":0,"searches":0,"discovered":0,"fetched":0,"evidence":0,"errors":0,"deduped":0}
+        self.metrics={"runs":0,"searches":0,"discovered":0,"fetched":0,"evidence":0,"errors":0,"deduped":0,"kimi_calls":0,"kimi_success":0,"kimi_items":0,"kimi_errors":0,"languages_queried":defaultdict(int)}
         self.languages_seen=defaultdict(int)
     def day(self):
         return min(TARGET_DAYS,max(1,int(max(0,time.time()-self.started_at)//86400)+1))
@@ -449,7 +496,9 @@ class M1WorldLab:
                 "day":self.day(),"days":TARGET_DAYS,"stage":self.stage(),"target_domains":TARGET_DOMAINS,
                 "unique_domains":domains,"remaining_domains":remain,"progress_pct":round(domains/TARGET_DOMAINS*100,2),
                 "daily_target":TARGET_DAILY,"model":self.db.forecast_stats(),"metrics":dict(self.metrics),
-                "languages_seen":dict(sorted(self.languages_seen.items(),key=lambda x:-x[1])[:24])}
+                "languages_seen":dict(sorted(self.languages_seen.items(),key=lambda x:-x[1])[:24]),
+                "languages_queried":dict(sorted(self.metrics["languages_queried"].items(),key=lambda x:-x[1])[:24]),
+                "kimi_research":{"enabled":KIMI_RESEARCH_ENABLED,"configured":kimi_configured(),"model":os.getenv("KIMI_RESEARCH_MODEL","kimi-k2.6"),"calls":self.metrics["kimi_calls"],"success":self.metrics["kimi_success"],"items":self.metrics["kimi_items"],"errors":self.metrics["kimi_errors"]}}
     def stage(self):
         stages=["M1 foundations + structure","candle geometry + next-candle behaviour","EMA/RSI/MACD/Stochastic",
                 "VWAP/ATR/volatility","breakout + retest","pullback + continuation","reversal + rejection",
@@ -514,24 +563,23 @@ class M1WorldLab:
         endpoints=("https://html.duckduckgo.com/html/?q="+quote_plus(q),
                    "https://www.google.com/search?q="+quote_plus(q)+"&num=20",
                    "https://www.bing.com/search?q="+quote_plus(q))
-        for ep in endpoints:
+        async def one(ep):
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(8,connect=3),headers={"User-Agent":USER_AGENT},follow_redirects=True) as h:
                     r=await h.get(ep)
-                if r.status_code>=400:continue
-                p=Parser()
-                p.feed(r.text)
-                found=0
+                if r.status_code>=400:return 0
+                p=Parser();p.feed(r.text);found=0
                 for href,label in p.links:
                     v=clean_url(unwrap(href))
                     if not v or domain(v) in SEARCH_HOSTS:continue
-                    self.enqueue(v,lang,"search")
-                    found+=1
-                if found:return found
+                    self.enqueue(v,lang,"search");found+=1
+                return found
             except Exception as exc:
                 self.metrics["errors"]+=1
                 log.debug("M1_SEARCH_ERROR query=%s error=%s",q,exc)
-        return 0
+                return 0
+        results=await asyncio.gather(*(one(ep) for ep in endpoints),return_exceptions=False)
+        return sum(int(x or 0) for x in results)
 
     async def discover(self):
         items=[]
@@ -543,6 +591,7 @@ class M1WorldLab:
             # Add one method/technology term to widen semantic coverage.
             method=list(METHODS)[(self.metrics["runs"]+i)%len(METHODS)]
             items.append((f"{q} {method.replace('_',' ')}",lang))
+            self.metrics["languages_queried"][lang]+=1
         return await asyncio.gather(*(self.search(q,l) for q,l in items),return_exceptions=True)
     def snapshot(self,pair,candles,timestamp=None):
         cs=[]
@@ -580,6 +629,32 @@ class M1WorldLab:
                            "stage":self.stage()},"next_candle_model":{"status":status,**fs},
                 "rules":{"forward_only":True,"no_lookahead":True,"web_claims_not_profitability_proof":True,
                          "live_brain_activation":False},"status":self.status()}
+    async def kimi_research(self,evidence):
+        if not KIMI_RESEARCH_ENABLED or not kimi_configured():
+            return 0
+        if not evidence:
+            return 0
+        if self.metrics["runs"] % KIMI_RESEARCH_INTERVAL_RUNS != 0:
+            return 0
+        self.metrics["kimi_calls"]+=1
+        items=await kimi_analyze(self.stage(),evidence)
+        saved=0
+        for idx,item in enumerate(items[:KIMI_RESEARCH_MAX_ITEMS],1):
+            if not isinstance(item,dict):continue
+            item=dict(item)
+            item["stage"]=self.stage()
+            item["source_evidence_count"]=len(evidence)
+            self.db.save_kimi_note(self.metrics["runs"],idx,item)
+            saved+=1
+        self.metrics["kimi_items"]+=saved
+        if saved:
+            self.metrics["kimi_success"]+=1
+            self.metrics["evidence"]+=saved
+            log.info("KIMI_RESEARCH_RESULT run=%d model=%s items=%d evidence=%d",self.metrics["runs"],os.getenv("KIMI_RESEARCH_MODEL","kimi-k2.6"),saved,len(evidence))
+        else:
+            self.metrics["kimi_errors"]+=1
+            log.warning("KIMI_RESEARCH_EMPTY run=%d",self.metrics["runs"])
+        return saved
     async def run_once(self):
         self.metrics["runs"]+=1;start=time.time()
         await self.discover()
@@ -587,6 +662,7 @@ class M1WorldLab:
         while not self.queue.empty() and len(workers)<min(MAX_CONCURRENCY*3,FETCHES_PER_RUN):
             workers.append(asyncio.create_task(self.crawl(await self.queue.get())))
         if workers:await asyncio.gather(*workers,return_exceptions=True)
+        await self.kimi_research(self.db.recent_evidence(18))
         status=self.synthesize()
         global _STATUS_CACHE
         _STATUS_CACHE=status.get("status") or {}
