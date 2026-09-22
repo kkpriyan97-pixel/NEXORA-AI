@@ -139,7 +139,8 @@ async def ensure_tables():
                         member_count INTEGER NOT NULL DEFAULT 0,
                         status TEXT NOT NULL DEFAULT 'CANDIDATE',
                         proposal JSONB NOT NULL DEFAULT '{}'::jsonb,
-                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        UNIQUE(session_id,strategy_id)
                     )
                 """)
                 cur.execute("""
@@ -350,6 +351,11 @@ async def record_strategy_council(session_id: str, council: dict | None = None):
                             session_id,strategy_id,votes,agreement,member_count,status,proposal
                         )
                         VALUES(%s,%s,%s,%s,%s,'CANDIDATE',%s::jsonb)
+                        ON CONFLICT(session_id,strategy_id) DO UPDATE SET
+                            votes=EXCLUDED.votes,
+                            agreement=EXCLUDED.agreement,
+                            member_count=EXCLUDED.member_count,
+                            proposal=EXCLUDED.proposal
                     """,(
                         str(session_id),strategy,int(proposal.get("votes") or 0),
                         float(proposal.get("agreement") or 0.0),member_count,
