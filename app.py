@@ -12,7 +12,7 @@ from brain_rules import ActiveSignal,BrainState,rank_signal_candidates
 from candice_brain import analyze_asset
 from ai_engine import snapshot_from_asset
 from ai_router import analyze_with_fallback,review_result_with_fallback
-from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot, world_learning_loop
+from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot_async, world_learning_loop
 
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -854,8 +854,9 @@ ACCOUNT_TICK_SUB_SEM=asyncio.Semaphore(1)
 ACCOUNT_TICK_SUB_BATCH=4
 ACCOUNT_TICK_SUB_RETRY=2.0
 ACCOUNT_TICK_SUB_DELAY=0.35
-# Keep three normal coverage slots and reserve two for final candidates.
-ACCOUNT_TICK_MAX_SLOTS=3
+# Keep the broker-proven two normal coverage slots; final candidates use those
+# same slots but are prepared well before the exact signal boundary.
+ACCOUNT_TICK_MAX_SLOTS=2
 ACCOUNT_TICK_PIN_SLOTS=2
 ACCOUNT_TICK_ROTATE_INTERVAL=15.0
 ACCOUNT_TICK_SUBSCRIBED=set()
@@ -1655,7 +1656,12 @@ async def refresh_candles(force=False):
         # The lab predicts candle t+1 using information available at candle t close;
         # it never changes this live technical analysis path.
         try:
-            record_market_snapshot(p,closed,reference)
+            # M1 learning writes are deliberately moved off the trading event
+            # loop. They use a dedicated single-worker executor inside the lab,
+            # so slow database writes cannot delay pass timing or Telegram delivery.
+            asyncio.create_task(
+                record_market_snapshot_async(p,closed,reference)
+            )
         except Exception as e:
             log.debug("M1_WORLD_SNAPSHOT_FAILED pair=%s type=%s message=%s",p,type(e).__name__,str(e)[:120])
         # Count every successfully analyzed account asset, even when its
@@ -3010,7 +3016,7 @@ async def cycle_loop():
                             # never at signal send time.
                             prep_items=sorted(
                                 [x for x in candidate_pool.values()
-                                 if int(x.get("qualified_pass") or 0)==4],
+                                 if int(x.get("qualified_pass") or 0)>=3],
                                 key=lambda x:(
                                     int(x.get("confidence") or 0),
                                     float(x.get("strategy_margin") or 0),
