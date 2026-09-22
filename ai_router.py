@@ -14,7 +14,8 @@ ANALYSIS_SEMAPHORE=asyncio.Semaphore(3)
 REVIEW_SEMAPHORE=asyncio.Semaphore(1)
 REVIEW_PROVIDER_COOLDOWN={}
 REVIEW_TRANSIENT_COOLDOWN_SECONDS=15.0
-REVIEW_429_COOLDOWN_SECONDS=120.0
+REVIEW_429_COOLDOWN_SECONDS=900.0
+LIVE_EXTERNAL_AI_ENABLED=os.getenv("AI_EXTERNAL_LIVE_ENABLED","false").strip().lower()=="true"
 _logged_ready=set()
 
 def _providers():
@@ -78,6 +79,12 @@ def _content_json(content:Any)->dict[str,Any]:
         raise
 
 async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
+    # External LLMs are NEVER part of the live signal critical path by default.
+    # A provider-side 429/timeout must not consume the final signal window.
+    # Candice local Brain remains authoritative; this function is opt-in only.
+    if not LIVE_EXTERNAL_AI_ENABLED:
+        log.info("AI_LIVE_EXTERNAL_DISABLED reason=signal_cycle_isolation")
+        return None
     request=build_ai_request(snapshot)
     is_verifier=bool(getattr(snapshot,"technical_context",None))
     if is_verifier:
