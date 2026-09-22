@@ -271,11 +271,34 @@ async def _place_demo(rec, actor_id):
     trade_id=result.get("id") or result.get("trade_id")
     if not trade_id:
         return False,"DEMO_ORDER_NO_ID",None
+
+    # Prefer the broker's own accepted-entry fields. If the API omits them,
+    # take a fresh account snapshot immediately after acceptance; never rely
+    # on the older candidate reference for result learning.
+    entry_price=None
+    for k in ("open_price","openPrice","entry_price","entryPrice","price","rate","cur_open"):
+        try:
+            if result.get(k) is not None:
+                entry_price=float(result.get(k))
+                break
+        except (TypeError,ValueError):
+            pass
+    if entry_price is None:
+        try:
+            snap=_cfg.get("snapshot_provider",lambda:{})()
+            live=(snap.get("prices") or {}).get(pair)
+            if live and live[0] is not None:
+                entry_price=float(live[0])
+        except Exception:
+            entry_price=None
+    if entry_price is None:
+        entry_price=float(rec.get("reference_price") or 0.0)
+
     now=time.time()
     rec=dict(rec)
     rec.update({
         "status":"OPEN","trade_id":str(trade_id),"accepted_by":int(actor_id),
-        "placed_at":now,"entry_ts":now,
+        "placed_at":now,"entry_ts":now,"entry_price":entry_price,
     })
     _open[str(trade_id)]=rec
     return True,"PLACED",rec
@@ -320,7 +343,7 @@ async def handle_callback(query):
     await _cfg["send_message"](
         f"✅ DEMO LEARNING ORDER ACCEPTED\n\n📊 {placed['display_name']}\n"
         f"{'⬆️ UP' if placed['direction']=='UP' else '⬇️ DOWN'}\n"
-        f"💰 Amount → {AMOUNT}\n⏱️ Duration → {DURATION_SECONDS//60} MIN\n"
+        f"💰 Amount → {AMOUNT}\n💵 Entry → {placed.get('entry_price')}\n⏱️ Duration → {DURATION_SECONDS//60} MIN\n"
         f"🧩 Strategy → {placed['strategy']}\n🆔 Demo Trade → {placed['trade_id']}",
         chat_id=_cfg.get("admin_id") or None
     )
@@ -376,7 +399,7 @@ async def _fallback_watch(rec):
             except Exception:continue
         cs.sort(key=lambda x:float(x.get("time",x.get("t",0))))
         if not cs:return
-        entry=float(rec.get("reference_price"))
+        entry=float(rec.get("entry_price") or rec.get("reference_price") or 0.0)
         exitp=float(cs[-1].get("close",cs[-1].get("c")))
         if exitp>entry:result="WIN" if rec["direction"]=="UP" else "LOSS"
         elif exitp<entry:result="WIN" if rec["direction"]=="DOWN" else "LOSS"
