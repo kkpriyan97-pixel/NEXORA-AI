@@ -780,6 +780,8 @@ async def _send_campaign_batch(candidates):
             continue
         if str(item.get("strategy") or "").upper()!=strategy:
             continue
+        if not item.get("signal_eligible",True):
+            continue
         pair=str(item.get("pair") or "")
         if not pair or pair in seen:
             continue
