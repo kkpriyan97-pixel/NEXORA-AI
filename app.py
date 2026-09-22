@@ -73,9 +73,10 @@ BRAIN=BrainState()
 UAE_TZ=ZoneInfo("Asia/Dubai")
 # Cycle-state persistence is recovery metadata only. It must never be allowed
 # to block the market/signal scheduler when the database stalls.
-CYCLE_STATE_IO_TIMEOUT=0.75
-CYCLE_STATE_DB_COOLDOWN=30.0
+CYCLE_STATE_IO_TIMEOUT=2.0
+CYCLE_STATE_DB_COOLDOWN=10.0
 CYCLE_STATE_DB_BLOCKED_UNTIL=0.0
+CYCLE_STATE_WRITE_LOCK=asyncio.Lock()
 AI_REVIEW_QUEUE_POLL_SECONDS=0.5
 AI_REVIEW_QUEUE_STALE_SECONDS=600.0
 AI_REVIEW_QUEUE_RETRY_DELAYS=(5,15,30,60,120,300)
@@ -137,62 +138,58 @@ async def save_cycle_state(
     cycle_id,target_epoch,signal_epoch,signal_lead,completed_pass,
     candidate_pool,status="ACTIVE",reason=""
 ):
-    global CYCLE_STATE_DB_BLOCKED_UNTIL
-    if not LEARNING_DB_URL:
-        return False
-    if time.time() < CYCLE_STATE_DB_BLOCKED_UNTIL:
+    if not LEARNING_DB_URL: return False
+    # Recovery metadata is best-effort and already runs in create_task(). Keep
+    # one Postgres write at a time so repeated passes cannot create a connection
+    # storm or leave cancelled database threads behind.
+    if CYCLE_STATE_WRITE_LOCK.locked():
+        log.info("CYCLE_STATE_SAVE_COALESCED cycle=%s pass=%s reason=write_in_progress",
+                 cycle_id,completed_pass)
         return False
     try:
         import psycopg
-        payload=json.dumps(
-            _cycle_state_json(candidate_pool),
-            separators=(",",":"),ensure_ascii=False,default=str
-        )
-        def put():
-            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
-                with db.cursor() as cur:
-                    cur.execute("""
-                        INSERT INTO candice_cycle_state(
-                            cycle_id,target_epoch,signal_epoch,signal_lead,
-                            completed_pass,candidate_pool,status,last_reason,owner
-                        )
-                        VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s)
-                        ON CONFLICT(cycle_id) DO UPDATE SET
-                            target_epoch=EXCLUDED.target_epoch,
-                            signal_epoch=EXCLUDED.signal_epoch,
-                            signal_lead=EXCLUDED.signal_lead,
-                            completed_pass=EXCLUDED.completed_pass,
-                            candidate_pool=EXCLUDED.candidate_pool,
-                            status=EXCLUDED.status,
-                            last_reason=EXCLUDED.last_reason,
-                            owner=EXCLUDED.owner,
-                            updated_at=NOW(),
-                            completed_at=CASE
-                                WHEN EXCLUDED.status IN ('SENT','SKIPPED')
-                                THEN NOW()
-                                ELSE candice_cycle_state.completed_at
-                            END
-                    """,(
-                        int(cycle_id),float(target_epoch),float(signal_epoch),
-                        int(signal_lead),int(completed_pass),payload,status,
-                        str(reason)[:500],SCHEDULER_OWNER
-                    ))
-                db.commit()
-        await asyncio.wait_for(
-            asyncio.to_thread(put),
-            timeout=CYCLE_STATE_IO_TIMEOUT,
-        )
+        payload=json.dumps(_cycle_state_json(candidate_pool),
+                           separators=(",",":"),ensure_ascii=False,default=str)
+        async with CYCLE_STATE_WRITE_LOCK:
+            def put():
+                with psycopg.connect(
+                    LEARNING_DB_URL,
+                    connect_timeout=max(3,int(CYCLE_STATE_IO_TIMEOUT)+1),
+                ) as db:
+                    with db.cursor() as cur:
+                        cur.execute("""
+                            INSERT INTO candice_cycle_state(
+                                cycle_id,target_epoch,signal_epoch,signal_lead,
+                                completed_pass,candidate_pool,status,last_reason,owner
+                            )
+                            VALUES(%s,%s,%s,%s,%s,%s::jsonb,%s,%s,%s)
+                            ON CONFLICT(cycle_id) DO UPDATE SET
+                                target_epoch=EXCLUDED.target_epoch,
+                                signal_epoch=EXCLUDED.signal_epoch,
+                                signal_lead=EXCLUDED.signal_lead,
+                                completed_pass=EXCLUDED.completed_pass,
+                                candidate_pool=EXCLUDED.candidate_pool,
+                                status=EXCLUDED.status,
+                                last_reason=EXCLUDED.last_reason,
+                                owner=EXCLUDED.owner,
+                                updated_at=NOW(),
+                                completed_at=CASE
+                                    WHEN EXCLUDED.status IN ('SENT','SKIPPED') THEN NOW()
+                                    ELSE candice_cycle_state.completed_at
+                                END
+                        """,(
+                            int(cycle_id),float(target_epoch),float(signal_epoch),
+                            int(signal_lead),int(completed_pass),payload,status,
+                            str(reason)[:500],SCHEDULER_OWNER
+                        ))
+                    db.commit()
+            await asyncio.to_thread(put)
+        log.info("CYCLE_STATE_SAVED cycle=%s pass=%s status=%s",
+                 cycle_id,completed_pass,status)
         return True
-    except asyncio.TimeoutError:
-        CYCLE_STATE_DB_BLOCKED_UNTIL=time.time()+CYCLE_STATE_DB_COOLDOWN
-        log.warning(
-            "CYCLE_STATE_SAVE_FAILED cycle=%s type=TimeoutError message=database_write_timeout timeout=%.2fs cooldown=%.0fs",
-            cycle_id,CYCLE_STATE_IO_TIMEOUT,CYCLE_STATE_DB_COOLDOWN
-        )
-        return False
     except Exception as e:
         log.warning("CYCLE_STATE_SAVE_FAILED cycle=%s type=%s message=%s",
-                    cycle_id,type(e).__name__,str(e)[:160])
+                    cycle_id,type(e).__name__,str(e)[:180])
         return False
 
 async def load_recoverable_cycle_state(now=None):
@@ -258,44 +255,30 @@ async def load_recoverable_cycle_state(now=None):
         return None
 
 async def mark_cycle_state(cycle_id,status,reason=""):
-    global CYCLE_STATE_DB_BLOCKED_UNTIL
-    if not LEARNING_DB_URL:
-        return False
-    if time.time() < CYCLE_STATE_DB_BLOCKED_UNTIL:
-        return False
+    if not LEARNING_DB_URL: return False
     try:
         import psycopg
-        def done():
-            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
-                with db.cursor() as cur:
-                    cur.execute("""
-                        UPDATE candice_cycle_state
-                        SET status=%s,last_reason=%s,updated_at=NOW(),
-                            completed_at=NOW(),owner=%s
-                        WHERE cycle_id=%s
-                    """,(status,str(reason)[:500],SCHEDULER_OWNER,int(cycle_id)))
-                db.commit()
-        await asyncio.wait_for(
-            asyncio.to_thread(done),
-            timeout=CYCLE_STATE_IO_TIMEOUT,
-        )
+        async with CYCLE_STATE_WRITE_LOCK:
+            def done():
+                with psycopg.connect(
+                    LEARNING_DB_URL,
+                    connect_timeout=max(3,int(CYCLE_STATE_IO_TIMEOUT)+1),
+                ) as db:
+                    with db.cursor() as cur:
+                        cur.execute("""
+                            UPDATE candice_cycle_state
+                            SET status=%s,last_reason=%s,updated_at=NOW(),
+                                completed_at=NOW(),owner=%s
+                            WHERE cycle_id=%s
+                        """,(status,str(reason)[:500],SCHEDULER_OWNER,int(cycle_id)))
+                    db.commit()
+            await asyncio.to_thread(done)
+        log.info("CYCLE_STATE_MARKED cycle=%s status=%s",cycle_id,status)
         return True
-    except asyncio.TimeoutError:
-        CYCLE_STATE_DB_BLOCKED_UNTIL=time.time()+CYCLE_STATE_DB_COOLDOWN
-        log.warning(
-            "CYCLE_STATE_MARK_FAILED cycle=%s status=%s type=TimeoutError message=database_mark_timeout timeout=%.2fs cooldown=%.0fs",
-            cycle_id,status,CYCLE_STATE_IO_TIMEOUT,CYCLE_STATE_DB_COOLDOWN
-        )
-        return False
     except Exception as e:
-        log.warning(
-            "CYCLE_STATE_MARK_FAILED cycle=%s status=%s type=%s message=%s",
-            cycle_id,status,type(e).__name__,str(e)[:160]
-        )
+        log.warning("CYCLE_STATE_MARK_FAILED cycle=%s status=%s type=%s message=%s",
+                    cycle_id,status,type(e).__name__,str(e)[:160])
         return False
-
-
-
 
 async def ensure_ai_review_queue_table():
     if not LEARNING_DB_URL:
@@ -1020,69 +1003,99 @@ def _norm_text(v):
     if isinstance(v,(dict,list)): return json.dumps(v,ensure_ascii=False).lower()
     return str(v).strip().lower()
 
-# The uploaded user PDF is the authoritative asset universe.
-# It contains exactly 104 unique assets visibly available in the supplied
-# screenshots. Do not call any broker asset-list/profitability endpoint to build
-# or widen this universe. Live candles/ticks may still be read for these pairs.
+# The authenticated account-scoped Event-182 response is the sole account asset universe.
+# Do not intersect it with the old screenshot list or any public/global catalogue.
+# API availability flags remain metadata: an account-returned instrument stays in
+# the scan universe, while api_blocked controls signal eligibility only.
 def build_assets(client=None,raw=None):
-    # Backward-compatible function name. client/raw are intentionally ignored.
-    assets=build_account_asset_snapshot()
-    log.info(
-        "STATIC_ACCOUNT_ASSET_CATALOG source=user_pdf_104_assets "
-        "api_asset_listing=OFF count=%d",
-        len(assets)
-    )
-    return assets
+    prof={}
+    for x in raw or []:
+        if not isinstance(x,dict): continue
+        p=pair_name(x); v=x.get("profitability")
+        if p and isinstance(v,(int,float)): prof[p]=int(v)
+    out=[]; seen=set(); rejected=[]
+    raw_pairs={pair_name(x) for x in (raw or []) if isinstance(x,dict) and pair_name(x)}
+    log.info("ACCOUNT_AUTHENTICATED_ASSET_UNIVERSE raw=%d unique=%d source=event_182",
+             len(raw or []),len(raw_pairs))
+    for x in raw or []:
+        if not isinstance(x,dict): continue
+        p=pair_name(x)
+        if not p or p in seen: continue
+        seen.add(p)
+        api_blocked=bool(
+            x.get("disabled") is True
+            or x.get("locked") is True
+            or x.get("locked_trading") is True
+            or any(
+                x.get(k) is False for k in
+                ("active","available","tradable","is_active","is_available","is_tradable")
+                if k in x
+            )
+            or str(x.get("status") or x.get("state") or "").strip().lower()
+                in {"disabled","locked","inactive","unavailable","closed","off"}
+        )
+        title=display_name(x) or p
+        try: profitability=int(prof.get(p,x.get("profitability",0)))
+        except Exception: profitability=0
+        quickler=(p.upper()=="ULTRA_X" or "quickler" in " ".join(
+            _norm_text(x.get(k)) for k in
+            ("pair","symbol","name","title","display_name","displayName",
+             "product","category","instrument_type","expiration_type","expiration_mode")
+        ))
+        out.append({
+            "pair":p,"display_name":title,"title":title,
+            "signal_asset_label":title,"profitability":profitability,
+            "locked":bool(x.get("locked") is True),
+            "locked_trading":bool(x.get("locked_trading") is True),
+            "disabled":bool(x.get("disabled") is True),
+            "api_blocked":api_blocked,
+            "mode":"OTC" if "_OTC" in p.upper() else "REAL",
+            "trading_mode":"FLEX_TIME",
+            "signal_eligible":not quickler and not api_blocked
+        })
+    log.info("ACCOUNT_ASSET_FILTER source=authenticated_account raw=%d accepted_open=%d rejected=%d",
+             len(raw or []),len(out),len(rejected))
+    if rejected: log.info("ACCOUNT_ASSET_REJECTED sample=%s",rejected[:25])
+    log.info("ACCOUNT_OPEN_ASSET_NAMES source=authenticated_account:event_182_raw count=%d names=%s",
+             len(out),[{"pair":a["pair"],"account_name":a["display_name"]} for a in out])
+    return out
 
 async def sync_account_assets(client, reason="periodic"):
-    """Refresh from the fixed user-supplied 104-asset catalog only."""
-    if not client or not client.account_id:
-        return False
-
-    assets=build_account_asset_snapshot()
-    if len(assets)!=104:
-        log.error(
-            "STATIC_ACCOUNT_ASSET_CATALOG_INVALID expected=104 actual=%d",
-            len(assets)
-        )
-        return False
-
-    old={a["pair"] for a in STATE["assets"]}
-    new={a["pair"] for a in assets}
-    added=sorted(new-old)
-    removed=sorted(old-new)
-
+    if not client or not client.account_id: return False
+    try:
+        raw=await asyncio.wait_for(client.market.get_profitability(client.account_id),timeout=10.0)
+    except Exception as e:
+        log.warning("ACCOUNT_ASSET_SYNC_FAILED account_id=%s reason=%s type=%s message=%s",
+                    client.account_id,reason,type(e).__name__,str(e)[:160]); return False
+    if not isinstance(raw,list) or not raw:
+        log.warning("ACCOUNT_ASSET_SYNC_EMPTY account_id=%s reason=%s keep_count=%d",
+                    client.account_id,reason,len(STATE["assets"])); return False
+    assets=build_assets(client,raw)
+    if not assets:
+        log.warning("ACCOUNT_ASSET_SYNC_ZERO account_id=%s reason=%s keep_count=%d",
+                    client.account_id,reason,len(STATE["assets"])); return False
+    old={a["pair"] for a in STATE["assets"]}; new={a["pair"] for a in assets}
+    added=sorted(new-old); removed=sorted(old-new)
     STATE["assets"]=assets
     STATE["account_id"]=client.account_id
     STATE["account_group"]="demo"
-    STATE["feed_source"]="static_user_pdf:104_assets+authenticated_event1"
-
+    STATE["feed_source"]="authenticated_websocket:event_182_account_universe"
     for pair in removed:
-        STATE["prices"].pop(pair,None)
-        STATE["price_source"].pop(pair,None)
-        STATE["candles"].pop(pair,None)
-        STATE["analyses"].pop(pair,None)
-        QUOTE_SNAPSHOT_LAST.pop(pair,None)
-        TICK_HISTORY.pop(pair,None)
-        CANDLE_FETCH_LAST.pop(pair,None)
-        CANDLE_UNAVAILABLE_UNTIL.pop(pair,None)
+        STATE["prices"].pop(pair,None); STATE["price_source"].pop(pair,None)
+        STATE["candles"].pop(pair,None); STATE["analyses"].pop(pair,None)
+        QUOTE_SNAPSHOT_LAST.pop(pair,None); TICK_HISTORY.pop(pair,None)
+        CANDLE_FETCH_LAST.pop(pair,None); CANDLE_UNAVAILABLE_UNTIL.pop(pair,None)
         CANDLE_GOOD_ONCE.discard(pair)
-
+    account_blocked=sum(1 for a in assets if a.get("api_blocked"))
     log.info(
-        "ACCOUNT_ASSET_SYNC source=static_user_pdf_104_assets "
-        "account_id=%s reason=%s catalog=%d added=%d removed=%d total=%d "
-        "api_asset_listing=off",
-        client.account_id,reason,len(assets),len(added),len(removed),len(assets)
+        "ACCOUNT_ASSET_SYNC source=authenticated_account:event_182_raw account_id=%s reason=%s "
+        "raw_account=%d universe=%d api_blocked_metadata=%d added=%d removed=%d total=%d",
+        client.account_id,reason,len(raw),len(assets),account_blocked,len(added),len(removed),len(assets)
     )
-    log.info(
-        "ACCOUNT_OPEN_ASSET_NAMES source=user_pdf_104_assets count=%d names=%s",
-        len(assets),
-        [{"pair":a["pair"],"account_name":a["display_name"]} for a in assets]
-    )
-    if added:
-        log.info("ACCOUNT_ASSET_ADDED sample=%s",added[:25])
-    if removed:
-        log.info("ACCOUNT_ASSET_REMOVED sample=%s",removed[:25])
+    log.info("ACCOUNT_OPEN_ASSET_NAMES source=authenticated_account:event_182_raw count=%d names=%s",
+             len(assets),[{"pair":a["pair"],"account_name":a["display_name"]} for a in assets])
+    if added: log.info("ACCOUNT_ASSET_ADDED sample=%s",added[:25])
+    if removed: log.info("ACCOUNT_ASSET_REMOVED sample=%s",removed[:25])
     return True
 
 async def on_asset_update(message):
@@ -1116,10 +1129,10 @@ async def on_asset_update(message):
         updated+=1
     if updated:
         # Asset event updates are intentionally ignored as a universe change.
-        # The fixed 104-asset catalog remains authoritative.
+        # Event 183 may update metadata only; Event 182 remains the account universe.
         log.info(
             "ACCOUNT_ASSET_FEED_UPDATE_IGNORED source=authenticated_event_183 "
-            "reason=static_user_pdf_104_assets visible=%d",
+            "reason=authenticated_event_183_metadata_only visible=%d",
             len(STATE["assets"])
         )
     log.info(
@@ -1319,40 +1332,79 @@ async def account_tick_subscription_worker():
                         type(e).__name__,str(e)[:160])
         await asyncio.sleep(1.0)
 
-async def telegram(text, chat_id=None, reply_markup=None):
+TELEGRAM_HTTP_CLIENT=None
+TELEGRAM_HTTP_CLIENT_LOCK=asyncio.Lock()
+TELEGRAM_SIGNAL_TIMEOUT=2.0
+TELEGRAM_DEFAULT_TIMEOUT=3.5
+
+async def _get_telegram_http_client():
+    global TELEGRAM_HTTP_CLIENT
+    if TELEGRAM_HTTP_CLIENT is not None and not TELEGRAM_HTTP_CLIENT.is_closed:
+        return TELEGRAM_HTTP_CLIENT
+    async with TELEGRAM_HTTP_CLIENT_LOCK:
+        if TELEGRAM_HTTP_CLIENT is None or TELEGRAM_HTTP_CLIENT.is_closed:
+            TELEGRAM_HTTP_CLIENT=httpx.AsyncClient(
+                limits=httpx.Limits(max_connections=20,max_keepalive_connections=10,keepalive_expiry=60.0),
+                timeout=httpx.Timeout(connect=1.5,read=3.0,write=2.0,pool=0.5),
+                headers={"Connection":"keep-alive"},
+            )
+    return TELEGRAM_HTTP_CLIENT
+
+async def telegram(text, chat_id=None, reply_markup=None, timeout_seconds=TELEGRAM_DEFAULT_TIMEOUT):
     token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
     chat=str(chat_id or STATE.get("telegram_chat_id") or os.getenv("TELEGRAM_CHAT_ID","")).strip()
     if not token or not chat:
         log.warning("TELEGRAM_NOT_CONFIGURED")
         return False
+    started=time.perf_counter()
     try:
+        client=await _get_telegram_http_client()
+        timeout=max(0.75,min(8.0,float(timeout_seconds)))
         payload={"chat_id":chat,"text":text,"parse_mode":"HTML"}
-        if reply_markup is not None:
-            payload["reply_markup"]=reply_markup
-        async with httpx.AsyncClient(timeout=8) as h:
-            r=await h.post(f"https://api.telegram.org/bot{token}/sendMessage",json=payload)
-            if r.status_code >= 400:
-                try: detail=r.json()
-                except Exception: detail={"description":r.text[:200]}
-                log.warning("TELEGRAM_SEND_FAILED status=%s description=%s",r.status_code,detail.get("description"))
-                return False
-            return True
+        if reply_markup is not None: payload["reply_markup"]=reply_markup
+        r=await asyncio.wait_for(
+            client.post(f"https://api.telegram.org/bot{token}/sendMessage",json=payload),
+            timeout=timeout
+        )
+        latency_ms=(time.perf_counter()-started)*1000.0
+        if r.status_code>=400:
+            try: detail=r.json()
+            except Exception: detail={"description":r.text[:200]}
+            log.warning("TELEGRAM_SEND_FAILED status=%s description=%s latency_ms=%.1f",
+                        r.status_code,detail.get("description"),latency_ms)
+            return False
+        log.info("TELEGRAM_SEND_OK chat=%s latency_ms=%.1f",chat,latency_ms)
+        return True
+    except asyncio.TimeoutError:
+        latency_ms=(time.perf_counter()-started)*1000.0
+        log.warning("TELEGRAM_SEND_FAILED type=TimeoutError timeout=%.2fs latency_ms=%.1f",
+                    timeout,latency_ms)
+        return False
     except Exception as e:
-        log.warning("TELEGRAM_SEND_FAILED type=%s message=%s",type(e).__name__,str(e)[:200]);return False
+        latency_ms=(time.perf_counter()-started)*1000.0
+        log.warning("TELEGRAM_SEND_FAILED type=%s message=%s latency_ms=%.1f",
+                    type(e).__name__,str(e)[:200],latency_ms)
+        return False
 
 async def telegram_answer_callback(query_id, text_msg=""):
     token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
-    if not token or not query_id:
-        return False
+    if not token or not query_id: return False
+    started=time.perf_counter()
     try:
-        async with httpx.AsyncClient(timeout=5) as h:
-            r=await h.post(
+        client=await _get_telegram_http_client()
+        r=await asyncio.wait_for(
+            client.post(
                 f"https://api.telegram.org/bot{token}/answerCallbackQuery",
                 json={"callback_query_id":str(query_id),"text":str(text_msg)[:180]},
-            )
-            return r.status_code < 400
+            ),
+            timeout=2.0
+        )
+        log.info("TELEGRAM_CALLBACK_ACK sent=%s latency_ms=%.1f",
+                 r.status_code<400,(time.perf_counter()-started)*1000.0)
+        return r.status_code<400
     except Exception as e:
-        log.warning("TELEGRAM_CALLBACK_ACK_FAILED type=%s message=%s",type(e).__name__,str(e)[:140])
+        log.warning("TELEGRAM_CALLBACK_ACK_FAILED type=%s message=%s latency_ms=%.1f",
+                    type(e).__name__,str(e)[:140],(time.perf_counter()-started)*1000.0)
         return False
 
 async def send_learning_summary(summary):
@@ -1398,12 +1450,15 @@ async def send_learning_summary(summary):
 
 async def telegram_background(text_msg,label):
     try:
-        sent=await asyncio.wait_for(telegram(text_msg),timeout=5.0)
-        log.info("TELEGRAM_SIGNAL_DELIVERY label=%s sent=%s",label,sent)
+        started=time.perf_counter()
+        sent=await telegram(text_msg,timeout_seconds=TELEGRAM_DEFAULT_TIMEOUT)
+        log.info("TELEGRAM_DELIVERY_BACKGROUND label=%s sent=%s latency_ms=%.1f",
+                 label,sent,(time.perf_counter()-started)*1000.0)
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        log.warning("TELEGRAM_SIGNAL_DELIVERY_FAILED label=%s type=%s message=%s",label,type(e).__name__,str(e)[:160])
+        log.warning("TELEGRAM_DELIVERY_BACKGROUND_FAILED label=%s type=%s message=%s",
+                    label,type(e).__name__,str(e)[:160])
 
 def _tick_records(value):
     # OlympTrade tick payloads have appeared as either a list of records or a
@@ -2019,7 +2074,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     if not CLIENT or STATE.get("account_group") != "demo" or not STATE.get("account_id"):
         log.info("BRAIN_ACCOUNT_GATE blocked=account_not_ready")
         return None
-    if STATE.get("feed_source") != "static_user_pdf:104_assets+authenticated_event1":
+    if not str(STATE.get("feed_source") or "").startswith("authenticated_websocket:event_182_account_universe"):
         log.info("BRAIN_ACCOUNT_GATE blocked=non_account_feed source=%s",
                  STATE.get("feed_source"))
         return None
@@ -2700,22 +2755,26 @@ async def cycle_loop():
             )
             return False
 
-        s=BRAIN.mark_signal_sent(
-            account_id=STATE.get("account_id"),
-            pair=p,display_name=candidate["display_name"],
-            direction=candidate["direction"],expiry_minutes=1,
-            # This is the pre-entry reference shown in the alert. The actual
-            # entry price is captured at target by result_watch().
-            entry_price=entry,entry_ts=target,
-            entry_candle_ts=candidate["entry_candle_ts"],
-            strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence,
-            pattern=str(candidate.get("pattern") or ""),
-            trend_15m=str(candidate.get("trend_15m") or ""),
-            structure_1m=str(candidate.get("structure_1m") or ""),
-            self_strategy=str(candidate.get("self_strategy") or ""),
-            self_strategy_version=str(candidate.get("self_strategy_version") or ""),
-            indicator_context=dict(candidate.get("indicators") or {})
-        )
+        try:
+            s=BRAIN.mark_signal_sent(
+                account_id=STATE.get("account_id"),
+                pair=p,display_name=candidate["display_name"],
+                direction=candidate["direction"],expiry_minutes=1,
+                entry_price=entry,entry_ts=target,
+                entry_candle_ts=candidate["entry_candle_ts"],
+                strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence,
+                pattern=str(candidate.get("pattern") or ""),
+                trend_15m=str(candidate.get("trend_15m") or ""),
+                structure_1m=str(candidate.get("structure_1m") or ""),
+                self_strategy=str(candidate.get("self_strategy") or ""),
+                self_strategy_version=str(candidate.get("self_strategy_version") or ""),
+                indicator_context=dict(candidate.get("indicators") or {})
+            )
+        except Exception as e:
+            log.warning("SIGNAL_RESERVATION_FAILED cycle=%s pair=%s type=%s message=%s",
+                        cycle_id,p,type(e).__name__,str(e)[:160])
+            return False
+
         key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
         msg=(f"🚨 CANDICE AI SIGNAL\n\n"
              f"👋 Market setup detected!\n\n"
@@ -2731,6 +2790,34 @@ async def cycle_loop():
              f"🧠 Strategy → {s.strategy}\n\n"
              f"🟢 DEMO • READ ONLY\n"
              f"🤖 CANDICE BRAIN")
+
+        delivery_started=time.perf_counter()
+        delivered=await telegram(msg,timeout_seconds=TELEGRAM_SIGNAL_TIMEOUT)
+        delivery_latency_ms=(time.perf_counter()-delivery_started)*1000.0
+
+        if not delivered:
+            try:
+                brain_key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
+                BRAIN.active_signals.pop(brain_key,None)
+                BRAIN.sent_keys.discard(BRAIN.duplicate_key(s.pair,s.entry_candle_ts))
+                BRAIN.cycle_signal_sent=False
+            except Exception as rollback_error:
+                log.error("SIGNAL_ROLLBACK_FAILED cycle=%s pair=%s type=%s message=%s",
+                          cycle_id,p,type(rollback_error).__name__,str(rollback_error)[:160])
+            log.warning(
+                "TELEGRAM_SIGNAL_DELIVERY_FAILED cycle=%s pair=%s latency_ms=%.1f "
+                "reason=delivery_not_confirmed next_asset=TRUE",
+                cycle_id,p,delivery_latency_ms
+            )
+            return False
+
+        signal_lag_seconds=time.time()-ts
+        log.info(
+            "TELEGRAM_SIGNAL_DELIVERY cycle=%s pair=%s sent=True latency_ms=%.1f "
+            "signal_lag_seconds=%.3f entry_in_seconds=%.3f",
+            cycle_id,p,delivery_latency_ms,signal_lag_seconds,
+            max(0.0,target-time.time())
+        )
         log.info(
             "FINAL_SIGNAL cycle=%s pair=%s direction=%s strategy=%s confidence=%s price_source=%s "
             "trend=%s structure=%s pattern=%s self_strategy=%s self_version=%s expiry=%s "
@@ -2744,12 +2831,6 @@ async def cycle_loop():
             datetime.fromtimestamp(target,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
             target-time.time()
         )
-        asyncio.create_task(
-            telegram_background(msg,f"{s.cycle_id}:{s.pair}:{s.entry_ts}")
-        )
-        # Durable result-watch persistence is deliberately asynchronous. A slow
-        # database must never consume the 30-second signal window or delay the
-        # scheduler; result_watch() remains the live source of truth.
         asyncio.create_task(persist_result_watch_background(key,s))
         asyncio.create_task(result_watch(key))
         return True
@@ -2763,7 +2844,7 @@ async def cycle_loop():
             and getattr(CLIENT.connection,"is_connected",False)
             and STATE.get("account_group")=="demo"
             and STATE.get("account_id")
-            and STATE.get("feed_source") == "static_user_pdf:104_assets+authenticated_event1"
+            and str(STATE.get("feed_source") or "").startswith("authenticated_websocket:event_182_account_universe")
             and len(STATE.get("assets") or [])>0
         )
 
@@ -2896,7 +2977,7 @@ async def cycle_loop():
                             and getattr(CLIENT.connection,"is_connected",False)
                             and STATE.get("account_group")=="demo"
                             and STATE.get("account_id")
-                            and STATE.get("feed_source") == "static_user_pdf:104_assets+authenticated_event1"
+                            and str(STATE.get("feed_source") or "").startswith("authenticated_websocket:event_182_account_universe")
                             and len(STATE.get("assets") or [])>0
                         )
                         if account_ready:
@@ -3787,7 +3868,8 @@ async def health(reader,writer):
                     if chat_id is not None:
                         STATE["telegram_chat_id"]=chat_id
                         log.info("TELEGRAM_CHAT_ID_CAPTURED chat_id=%s",chat_id)
-                    await handle_telegram_command(msg)
+                    # Webhook HTTP 200 must be immediate; command logic is background.
+                    asyncio.create_task(handle_telegram_command(msg))
             except Exception as e:
                 log.warning("TELEGRAM_WEBHOOK_PARSE_FAILED %s",e)
         body_out=json.dumps({"service":"CANDICE-AI","status":"ok","read_only":True}).encode()
@@ -3815,11 +3897,13 @@ async def configure_telegram_webhook():
     try:
         payload={"url":url}
         if secret: payload["secret_token"]=secret
-        async with httpx.AsyncClient(timeout=10) as h:
-            await h.post(f"https://api.telegram.org/bot{token}/deleteWebhook",json={"drop_pending_updates":False})
-            r=await h.post(f"https://api.telegram.org/bot{token}/setWebhook",json=payload)
-            r.raise_for_status()
-            info=await h.get(f"https://api.telegram.org/bot{token}/getWebhookInfo")
+        h=await _get_telegram_http_client()
+        await h.post(f"https://api.telegram.org/bot{token}/deleteWebhook",
+                     json={"drop_pending_updates":False},timeout=8.0)
+        r=await h.post(f"https://api.telegram.org/bot{token}/setWebhook",
+                       json=payload,timeout=8.0)
+        r.raise_for_status()
+        info=await h.get(f"https://api.telegram.org/bot{token}/getWebhookInfo",timeout=8.0)
             try: data=info.json().get("result",{})
             except Exception: data={}
             log.info("TELEGRAM_WEBHOOK_READY url=%s pending=%s last_error=%s",data.get("url",""),data.get("pending_update_count",0),str(data.get("last_error_message",""))[:160])
