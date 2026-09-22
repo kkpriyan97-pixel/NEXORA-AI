@@ -71,6 +71,20 @@ async def save_persistent_learning():
         log.warning("LEARNING_STATE_SAVE_FAILED type=%s message=%s",type(e).__name__,str(e)[:180])
 BRAIN=BrainState()
 UAE_TZ=ZoneInfo("Asia/Dubai")
+
+SIGNAL_SESSION_START_HOUR=6
+SIGNAL_SESSION_END_HOUR=18
+
+def signal_session_active(ts=None):
+    now=datetime.fromtimestamp(float(ts if ts is not None else time.time()),tz=UAE_TZ)
+    return SIGNAL_SESSION_START_HOUR <= now.hour < SIGNAL_SESSION_END_HOUR
+
+def next_signal_session_start_epoch(ts=None):
+    now=datetime.fromtimestamp(float(ts if ts is not None else time.time()),tz=UAE_TZ)
+    start=now.replace(hour=SIGNAL_SESSION_START_HOUR,minute=0,second=0,microsecond=0)
+    if now>=start:
+        start=start+timedelta(days=1)
+    return start.timestamp()
 # Cycle-state persistence is recovery metadata only. It must never be allowed
 # to block the market/signal scheduler when the database stalls.
 CYCLE_STATE_IO_TIMEOUT=2.0
@@ -2697,7 +2711,7 @@ async def result_watch(key):
     )
 
 async def cycle_loop():
-    # Fast 3-minute signal scheduler.
+    # Fast 3-minute signal scheduler, active only during the UAE 06:00–18:00 signal session.
     # For each target T:
     #   - target = exact next 3-minute boundary
     #   - Telegram signal = target minus an exact 30s lead
@@ -2713,6 +2727,12 @@ async def cycle_loop():
     SCAN_OFFSETS=(150.0,125.0,100.0,75.0,55.0)
 
     async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
+        if not signal_session_active(target):
+            log.info(
+                "SIGNAL_DELIVERY_BLOCKED_OUTSIDE_06_18 cycle=%s target_utc=%s",
+                cycle_id,time.strftime("%H:%M:%S",time.gmtime(target))
+            )
+            return False
         if not candidate or not BRAIN.can_send_cycle_signal(
             STATE.get("account_id"),candidate.get("pair")
         ):
@@ -2943,6 +2963,24 @@ async def cycle_loop():
 
     while True:
         now=time.time()
+
+        # Normal signal delivery is restricted to the UAE 06:00–18:00 session.
+        # Overnight hours belong exclusively to the DEMO learning/council lane.
+        if not signal_session_active(now):
+            if target is not None:
+                log.info(
+                    "SIGNAL_SESSION_OFF start=06:00 end=18:00 timezone=Asia/Dubai "
+                    "reason=overnight_learning_mode"
+                )
+            target=None
+            next_start=next_signal_session_start_epoch(now)
+            log.info(
+                "SIGNAL_SESSION_WAIT next_start_utc=%s",
+                time.strftime("%H:%M:%S",time.gmtime(next_start))
+            )
+            await asyncio.sleep(min(max(1.0,next_start-time.time()),60.0))
+            continue
+
         recovered=None
         resume_completed_pass=0
 
@@ -2982,6 +3020,14 @@ async def cycle_loop():
 
         signal_lead=SIGNAL_LEADS[0 if cycle_sequence<=10 else 1]
         signal_at=target-signal_lead
+
+        if not signal_session_active(target):
+            log.info(
+                "SIGNAL_CYCLE_BLOCKED_OUTSIDE_06_18 cycle=%s target_utc=%s",
+                cycle_id,time.strftime("%H:%M:%S",time.gmtime(target))
+            )
+            target=None
+            continue
 
         # Root-cause guard: cycle analysis must never start with an empty or
         # unauthenticated account snapshot. A restart immediately before the
