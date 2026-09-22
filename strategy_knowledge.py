@@ -33,18 +33,14 @@ def _signature(context: dict | None) -> str:
     ])
 
 def _status(samples: int, wins: int, losses: int, recent: str) -> str:
-    if samples < 20:
+    # Own Strategy promotion is intentionally strict: a strategy must complete
+    # a full 100-trade DEMO campaign before it can enter the live Brain knowledge.
+    # 85% is the minimum acceptance gate; 90% is the research target, not a guarantee.
+    if samples < 100:
         return "CANDIDATE"
-    acc = wins / max(1, wins + losses)
-    streak = 0
-    for ch in reversed(recent[-30:]):
-        if ch == "L":
-            streak += 1
-        elif ch in "WT":
-            break
-    if acc >= 0.60 and streak < 4:
-        return "VALIDATED"
-    return "RESEARCH_REJECT"
+    decided=max(1,wins+losses)
+    acc=wins/decided
+    return "VALIDATED" if acc >= 0.85 else "RESEARCH_REJECT"
 
 def _rebuild_cache(rows):
     global _CACHE, _CACHE_TS
