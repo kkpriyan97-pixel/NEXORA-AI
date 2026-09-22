@@ -234,7 +234,8 @@ def reload_technique_cache(rows):
         )
 
 async def record_practice_result(strategy_id: str, result: str, *, pair="", confidence=0,
-                                 context: dict | None = None, error_code=""):
+                                 context: dict | None = None, error_code="",
+                                 council_context: dict | None = None):
     if not DB_URL or not strategy_id:
         return False
     result = str(result or "").upper()
@@ -246,6 +247,7 @@ async def record_practice_result(strategy_id: str, result: str, *, pair="", conf
         "last_pair": str(pair or ""),
         "last_confidence": int(confidence or 0),
         "source": "DEMO_AUTO_PRACTICE_18_00_06_00_UAE",
+        "council_context": dict(council_context or {}),
     }
     import psycopg
     def write():
