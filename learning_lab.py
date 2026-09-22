@@ -167,6 +167,13 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit):
             "donchian_state":(brain.get("indicators") or {}).get("donchian_state"),
             "donchian_expansion":(brain.get("indicators") or {}).get("donchian_expansion"),
             "stochastic_cross":(brain.get("indicators") or {}).get("stochastic_cross"),
+            "body_ratio":brain.get("body_ratio"),
+            "efficiency":brain.get("efficiency"),
+            "momentum_norm":brain.get("momentum_norm"),
+            "trend_persistence":brain.get("trend_persistence"),
+            "volatility_ratio":brain.get("volatility_ratio"),
+            "ema_gap_norm":brain.get("ema_gap_norm"),
+            "ema_slope_norm":brain.get("ema_slope_norm"),
         }
         candidates.append((conf,float(brain.get("market_quality") or 0),brain,source,technique))
     if not candidates:return None
@@ -365,7 +372,22 @@ async def handle_trade_update(message):
 
 async def _record_result(rec,result,source,exit_price=None,pnl=None):
     ctx=dict(rec.get("technique") or {})
-    error_code="" if result=="WIN" else "LOSS_CONTEXT"
+    error_code=""
+    if result=="LOSS":
+        strategy=str(rec.get("strategy") or "").upper()
+        trend=str(ctx.get("trend_15m") or "").upper()
+        try: body=float(ctx.get("body_ratio") or 0.0)
+        except (TypeError,ValueError): body=0.0
+        try: eff=float(ctx.get("efficiency") or 0.0)
+        except (TypeError,ValueError): eff=0.0
+        if strategy in {"MOMENTUM","BREAKOUT"} and trend=="SIDEWAYS":
+            error_code="SIDEWAYS_CONTINUATION"
+        elif body < 0.55:
+            error_code="WEAK_CANDLE_BODY"
+        elif eff < 0.35:
+            error_code="LOW_PRICE_EFFICIENCY"
+        else:
+            error_code="LOSS_CONTEXT"
     await record_practice_result(rec.get("strategy","UNKNOWN"),result,
                                  pair=rec.get("pair",""),confidence=rec.get("confidence",0),
                                  context=ctx,error_code=error_code)
