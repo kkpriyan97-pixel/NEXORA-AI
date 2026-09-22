@@ -1075,18 +1075,14 @@ def build_assets(client,raw):
         p=pair_name(x)
         if not p or p in seen: continue
         if x.get("disabled") is True or x.get("locked") is True or x.get("locked_trading") is True:
+            rejected.append(p)
             continue
         seen.add(p)
-        # Preserve the exact name shown by the authenticated account.
-        # Only fall back to the internal pair when the broker provides no
-        # human-readable account-facing name.
-        title=display_name(x)
-        if not title:
-            # Never expose a raw instrument ID in a user-facing message. An
-            # unmapped asset remains in the account scan, but is not allowed to
-            # produce a signal until an account-facing label is available.
-            log.warning("ACCOUNT_ASSET_DISPLAY_NAME_MISSING pair=%s",p)
-            continue
+        # Preserve a genuine account-facing name when the authenticated payload
+        # supplies one. If the payload omits the display label, keep the same
+        # authenticated account instrument in the scan using its pair as the
+        # internal/display fallback; never source assets from a public API universe.
+        title=display_name(x) or p
         v=prof.get(p,x.get("profitability",0))
         try: profitability=int(v)
         except Exception: profitability=0
@@ -2198,7 +2194,12 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     # Preliminary passes only seed the candidate pool. External AI verification
     # is reserved for the final/deep pass so provider rate limits and latency
     # cannot consume the five-pass timing window.
-    # Deep/final passes must not arbitrarily discard qualified account assets.\n    # refresh_candles() already evaluates the full authenticated account asset set;\n    # when deep_analysis is enabled, review every currently Brain-qualified setup\n    # so one failed candidate can fall through to the next valid asset.\n    # Preliminary passes remain intentionally narrow to protect the 3-minute timing window.\n    top=raw if deep_analysis else raw[:5]
+    # Deep/final passes must not arbitrarily discard qualified account assets.
+    # refresh_candles() already evaluates the full authenticated account asset set.
+    # When deep_analysis is enabled, review every currently Brain-qualified setup
+    # so one failed candidate can fall through to the next valid asset.
+    # Preliminary passes remain intentionally narrow to protect the 3-minute timing window.
+    top=raw if deep_analysis else raw[:5]
     if require_live_price:
         log.info(            "LIVE_PRICE_SELECTION_MODE source=authenticated_event1 candidates=%d deep=%s",
             len(top),deep_analysis)
