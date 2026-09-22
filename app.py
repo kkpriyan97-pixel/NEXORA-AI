@@ -3228,10 +3228,19 @@ async def cycle_loop():
                             item["deep_verified"]=pass_no>=4
                             item["final_prepared_pass"]=pass_no if pass_no>=4 else 0
                             prepared_selected.append(item)
+                            # Keep every independently-qualified technique.
+                            # Pair+direction alone is not a unique candidate: BREAKOUT,
+                            # TREND_FOLLOWING, PRICE_ACTION, etc. can legitimately
+                            # produce separate validated setups for the same asset.
+                            # If we key only by pair/direction, the later technique
+                            # overwrites the earlier one and the final boundary can
+                            # stop after effectively testing one technique.
                             key=(
                                 item.get("pair"),
                                 str(item.get("entry_candle_ts")),
-                                str(item.get("direction") or "").upper()
+                                str(item.get("direction") or "").upper(),
+                                str(item.get("strategy") or "").upper(),
+                                str(item.get("self_strategy_version") or "")
                             )
                             candidate_pool[key]=item
 
@@ -3337,10 +3346,15 @@ async def cycle_loop():
                     candidate["qualified_pass"]=pass_no
                     candidate["deep_verified"]=pass_no>=4
                     candidate["final_prepared_pass"]=pass_no if pass_no>=4 else 0
+                    # Preserve the technique identity in the cycle pool.
+                    # A single asset may have multiple independently-qualified
+                    # strategies; none should overwrite another before final gates.
                     key=(
                         candidate.get("pair"),
                         str(candidate.get("entry_candle_ts")),
-                        str(candidate.get("direction") or "").upper()
+                        str(candidate.get("direction") or "").upper(),
+                        str(candidate.get("strategy") or "").upper(),
+                        str(candidate.get("self_strategy_version") or "")
                     )
                     candidate_pool[key]=candidate
                     log.info(
