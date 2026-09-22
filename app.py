@@ -3022,6 +3022,7 @@ async def cycle_loop():
                             cycle_id,pass_no,len(STATE["analyses"])
                         )
                     else:
+                        prepared_selected=[]
                         for raw_candidate in selected:
                             if not isinstance(raw_candidate,dict) or not raw_candidate.get("pair"):
                                 continue
@@ -3030,6 +3031,7 @@ async def cycle_loop():
                             item["qualified_pass"]=pass_no
                             item["deep_verified"]=pass_no>=4
                             item["final_prepared_pass"]=pass_no if pass_no>=4 else 0
+                            prepared_selected.append(item)
                             key=(
                                 item.get("pair"),
                                 str(item.get("entry_candle_ts")),
@@ -3043,10 +3045,7 @@ async def cycle_loop():
                             # subscribe/unsubscribe latency is absorbed here,
                             # never at signal send time.
                             prep_items=sorted(
-                                [x for x in selected
-                                 if isinstance(x,dict) and x.get("pair")
-                                 and int(x.get("qualified_pass") or 0)==4
-                                 and bool(x.get("deep_verified"))],
+                                prepared_selected,
                                 key=lambda x:(
                                     int(x.get("confidence") or 0),
                                     float(x.get("strategy_margin") or 0),
@@ -3076,6 +3075,43 @@ async def cycle_loop():
                                         cycle_id,[x.get("pair") for x in prep_items],
                                         pass_no,type(e).__name__,str(e)[:120]
                                     )
+                        if pass_no==5:
+                            remaining_to_signal=max(0.0,signal_at-time.time())
+                            final_items=sorted(
+                                prepared_selected,
+                                key=lambda x:(
+                                    int(x.get("confidence") or 0),
+                                    float(x.get("strategy_margin") or 0),
+                                    float(x.get("direction_agreement") or 0),
+                                    float(x.get("market_quality") or 0)
+                                ),
+                                reverse=True
+                            )[:ACCOUNT_TICK_PIN_SLOTS]
+                            if final_items and remaining_to_signal>=15.0:
+                                try:
+                                    pin_ttl=max(30.0,target-time.time()+12.0)
+                                    active_prep=await pin_account_tick_pairs(
+                                        [x.get("pair") for x in final_items],
+                                        ttl=pin_ttl
+                                    )
+                                    log.info(
+                                        "FINAL_CANDIDATE_TICKS_FINAL_PREPARED cycle=%s pairs=%s pass=%s active=%s ttl=%.1f seconds_to_signal=%.2f",
+                                        cycle_id,[x.get("pair") for x in final_items],
+                                        pass_no,active_prep,pin_ttl,
+                                        max(0.0,signal_at-time.time())
+                                    )
+                                except Exception as e:
+                                    log.warning(
+                                        "FINAL_CANDIDATE_TICKS_FINAL_PREPARE_FAILED cycle=%s pairs=%s pass=%s type=%s message=%s",
+                                        cycle_id,[x.get("pair") for x in final_items],
+                                        pass_no,type(e).__name__,str(e)[:120]
+                                    )
+                            elif final_items:
+                                log.info(
+                                    "FINAL_CANDIDATE_TICKS_FINAL_REPIN_SKIPPED_LATE cycle=%s seconds_to_signal=%.2f",
+                                    cycle_id,remaining_to_signal
+                                )
+
                         for item in selected:
                             log.info(
                                 "SCAN_CANDIDATE_SELECTED cycle=%s scan=SCAN_%s pass=%s pair=%s "
@@ -3222,9 +3258,11 @@ async def cycle_loop():
             if int(x.get("qualified_pass") or 0)>=4
             and bool(x.get("deep_verified"))
         ]
+        now_boundary=time.time()
         ranked_pool=sorted(
             final_candidates,
             key=lambda x:(
+                1 if has_fresh_live_price(x.get("pair"),now_boundary,LIVE_TICK_MAX_AGE) else 0,
                 int(x.get("confidence") or 0),
                 float(x.get("strategy_margin") or 0),
                 float(x.get("direction_agreement") or 0),
