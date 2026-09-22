@@ -1003,25 +1003,62 @@ def _norm_text(v):
     if isinstance(v,(dict,list)): return json.dumps(v,ensure_ascii=False).lower()
     return str(v).strip().lower()
 
-# The authenticated account-scoped Event-182 response is the sole account asset universe.
-# Do not intersect it with the old screenshot list or any public/global catalogue.
-# API availability flags remain metadata: an account-returned instrument stays in
-# the scan universe, while api_blocked controls signal eligibility only.
+# Event-182 is the broker's discovery feed, but it can expose instruments that are
+# not present in the user's currently verified account-visible asset list. The
+# user's supplied account asset catalog is therefore the safety boundary for
+# signal generation. An Event-182 pair must exist in that verified catalog before
+# it can enter STATE["assets"], Brain analysis, or Telegram signalling.
+#
+# This prevents a broker-feed-only instrument such as DDI_X from generating a
+# signal when the user's account UI does not show that asset.
 def build_assets(client=None,raw=None):
     prof={}
     for x in raw or []:
         if not isinstance(x,dict): continue
         p=pair_name(x); v=x.get("profitability")
-        if p and isinstance(v,(int,float)): prof[p]=int(v)
+        if p and isinstance(v,(int,float)): prof[p.upper()]=int(v)
+
+    catalog=build_account_asset_snapshot()
+    verified_by_pair={
+        str(item.get("pair") or "").upper():item
+        for item in catalog
+        if isinstance(item,dict) and item.get("pair")
+    }
+
     out=[]; seen=set(); rejected=[]
-    raw_pairs={pair_name(x) for x in (raw or []) if isinstance(x,dict) and pair_name(x)}
-    log.info("ACCOUNT_AUTHENTICATED_ASSET_UNIVERSE raw=%d unique=%d source=event_182",
-             len(raw or []),len(raw_pairs))
+    raw_pairs={
+        pair_name(x) for x in (raw or [])
+        if isinstance(x,dict) and pair_name(x)
+    }
+    unverified=sorted(
+        p for p in raw_pairs
+        if p.upper() not in verified_by_pair
+    )
+    log.info(
+        "ACCOUNT_AUTHENTICATED_ASSET_UNIVERSE raw=%d unique=%d source=event_182",
+        len(raw or []),len(raw_pairs)
+    )
+    log.info(
+        "ACCOUNT_VERIFIED_ASSET_FILTER catalog=%d raw=%d matched=%d "
+        "unverified=%d sample=%s source=user_verified_account_catalog",
+        len(verified_by_pair),len(raw_pairs),
+        len(raw_pairs)-len(unverified),len(unverified),unverified[:25]
+    )
+
     for x in raw or []:
         if not isinstance(x,dict): continue
         p=pair_name(x)
-        if not p or p in seen: continue
-        seen.add(p)
+        key=p.upper() if p else ""
+        if not p or key in seen: continue
+        if key not in verified_by_pair:
+            rejected.append({
+                "pair":p,
+                "reason":"not_in_verified_account_catalog"
+            })
+            continue
+
+        seen.add(key)
+        verified=verified_by_pair[key]
         api_blocked=bool(
             x.get("disabled") is True
             or x.get("locked") is True
@@ -1034,30 +1071,55 @@ def build_assets(client=None,raw=None):
             or str(x.get("status") or x.get("state") or "").strip().lower()
                 in {"disabled","locked","inactive","unavailable","closed","off"}
         )
-        title=display_name(x) or p
-        try: profitability=int(prof.get(p,x.get("profitability",0)))
-        except Exception: profitability=0
-        quickler=(p.upper()=="ULTRA_X" or "quickler" in " ".join(
-            _norm_text(x.get(k)) for k in
-            ("pair","symbol","name","title","display_name","displayName",
-             "product","category","instrument_type","expiration_type","expiration_mode")
-        ))
+
+        # The verified account catalog controls the user-facing asset identity;
+        # Event-182 supplies the current broker-side profitability/availability
+        # metadata for the same exact pair.
+        title=str(verified.get("display_name") or display_name(x) or p)
+        try:
+            profitability=int(prof.get(key,x.get("profitability",0)))
+        except Exception:
+            profitability=0
+
+        quickler=(
+            key=="ULTRA_X"
+            or "quickler" in " ".join(
+                _norm_text(x.get(k)) for k in
+                ("pair","symbol","name","title","display_name","displayName",
+                 "product","category","instrument_type",
+                 "expiration_type","expiration_mode")
+            )
+        )
+
         out.append({
-            "pair":p,"display_name":title,"title":title,
-            "signal_asset_label":title,"profitability":profitability,
+            "pair":p,
+            "display_name":title,
+            "title":title,
+            "signal_asset_label":title,
+            "profitability":profitability,
             "locked":bool(x.get("locked") is True),
             "locked_trading":bool(x.get("locked_trading") is True),
             "disabled":bool(x.get("disabled") is True),
             "api_blocked":api_blocked,
             "mode":"OTC" if "_OTC" in p.upper() else "REAL",
             "trading_mode":"FLEX_TIME",
+            "market_group":verified.get("market_group"),
             "signal_eligible":not quickler and not api_blocked
         })
-    log.info("ACCOUNT_ASSET_FILTER source=authenticated_account raw=%d accepted_open=%d rejected=%d",
-             len(raw or []),len(out),len(rejected))
-    if rejected: log.info("ACCOUNT_ASSET_REJECTED sample=%s",rejected[:25])
-    log.info("ACCOUNT_OPEN_ASSET_NAMES source=authenticated_account:event_182_raw count=%d names=%s",
-             len(out),[{"pair":a["pair"],"account_name":a["display_name"]} for a in out])
+
+    log.info(
+        "ACCOUNT_ASSET_FILTER source=event_182_intersection_verified_catalog "
+        "raw=%d accepted_verified=%d rejected=%d",
+        len(raw or []),len(out),len(rejected)
+    )
+    if rejected:
+        log.info("ACCOUNT_ASSET_REJECTED sample=%s",rejected[:25])
+    log.info(
+        "ACCOUNT_OPEN_ASSET_NAMES source=verified_account_catalog∩event_182 "
+        "count=%d names=%s",
+        len(out),
+        [{"pair":a["pair"],"account_name":a["display_name"]} for a in out]
+    )
     return out
 
 async def sync_account_assets(client, reason="periodic"):
