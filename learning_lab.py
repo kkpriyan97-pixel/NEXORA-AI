@@ -230,8 +230,8 @@ async def _send_request(candidate):
         f"🔬 Research → {rec['source']}\n"
         f"🎯 Confidence → {rec['confidence']}%\n"
         f"💰 Reference → {rec.get('reference_price')}\n\n"
-        "⚠️ DEMO LEARNING ONLY\n"
-        "Human ACCEPT is required before any demo order."
+        "🤖 DEMO AUTO-TRADE WINDOW\n"
+        "Automatic DEMO practice only during 19:00–21:00 UAE."
     )
     try:
         await _cfg["send_message"](text_msg, chat_id=_cfg.get("admin_id") or None)
@@ -241,18 +241,18 @@ async def _send_request(candidate):
         if not ok:
             _daily["blocked"] += 1
             await _cfg["send_message"](
-                f"❌ DEMO AUTO-TRADE BLOCKED\\n\\nReason → {reason}",
+                f"❌ DEMO AUTO-TRADE BLOCKED\n\nReason → {reason}",
                 chat_id=_cfg.get("admin_id") or None
             )
             await save_error(rec.get("strategy","UNKNOWN"), reason, rec.get("technique") or {})
             return False
         _daily["placed"] += 1
         await _cfg["send_message"](
-            f"🤖 DEMO AUTO-TRADE STARTED\\n\\n📊 {placed['display_name']}\\n"
-            f"{'⬆️ UP' if placed['direction']=='UP' else '⬇️ DOWN'}\\n"
-            f"💰 Amount → {AMOUNT}\\n💵 Entry → {placed.get('entry_price')}\\n"
-            f"⏱️ Duration → {DURATION_SECONDS//60} MIN\\n"
-            f"🧩 Strategy → {placed['strategy']}\\n🆔 Demo Trade → {placed['trade_id']}",
+            f"🤖 DEMO AUTO-TRADE STARTED\n\n📊 {placed['display_name']}\n"
+            f"{'⬆️ UP' if placed['direction']=='UP' else '⬇️ DOWN'}\n"
+            f"💰 Amount → {AMOUNT}\n💵 Entry → {placed.get('entry_price')}\n"
+            f"⏱️ Duration → {DURATION_SECONDS//60} MIN\n"
+            f"🧩 Strategy → {placed['strategy']}\n🆔 Demo Trade → {placed['trade_id']}",
             chat_id=_cfg.get("admin_id") or None
         )
         return True
@@ -261,6 +261,8 @@ async def _send_request(candidate):
         return False
 
 async def _place_demo(rec, actor_id):
+    if not practice_active():
+        return False,"LEARNING_WINDOW_CLOSED",None
     if str(actor_id) != str(_cfg.get("admin_id","")):
         return False,"ADMIN_ONLY",None
     if time.time()>float(rec.get("expires_at",0)):
@@ -458,18 +460,18 @@ async def _send_daily_report(day):
     accuracy = (100.0 * _daily["win"] / decided) if decided else 0.0
     validated = await _validated_strategy_ids()
     await _cfg["send_message"](
-        "🧠 CANDICE • LEARNING REPORT\\n\\n"
-        "🕖 Practice → 19:00–21:00 UAE\\n"
-        f"📅 Day → {day}\\n"
-        f"🤖 DEMO AUTO-TRADE → {_daily['placed']} trades\\n"
-        f"🟢 WIN → {_daily['win']}\\n"
-        f"🔴 LOSS → {_daily['loss']}\\n"
-        f"🟡 TIE → {_daily['tie']}\\n"
-        f"🎯 Accuracy → {accuracy:.1f}%\\n"
-        f"⛔ Blocked → {_daily['blocked']}\\n\\n"
-        f"✅ VALIDATED / OWN STRATEGY READY → {len(validated)}\\n"
-        f"🧩 Strategies → {', '.join(validated[:20]) if validated else 'None'}\\n\\n"
-        "🔴 21:00 → Learning Auto-Trade OFF\\n"
+        "🧠 CANDICE • LEARNING REPORT\n\n"
+        "🕖 Practice → 19:00–21:00 UAE\n"
+        f"📅 Day → {day}\n"
+        f"🤖 DEMO AUTO-TRADE → {_daily['placed']} trades\n"
+        f"🟢 WIN → {_daily['win']}\n"
+        f"🔴 LOSS → {_daily['loss']}\n"
+        f"🟡 TIE → {_daily['tie']}\n"
+        f"🎯 Accuracy → {accuracy:.1f}%\n"
+        f"⛔ Blocked → {_daily['blocked']}\n\n"
+        f"✅ VALIDATED / OWN STRATEGY READY → {len(validated)}\n"
+        f"🧩 Strategies → {', '.join(validated[:20]) if validated else 'None'}\n\n"
+        "🔴 21:00 → Learning Auto-Trade OFF\n"
         "🔐 ADMIN ONLY",
         chat_id=_cfg.get("admin_id") or None
     )
@@ -481,6 +483,12 @@ async def run_forever():
         try:
             now=_now_uae()
             day=now.date()
+            if _daily["day"] != str(day):
+                _daily.update({"day":str(day),"placed":0,"win":0,"loss":0,"tie":0,"blocked":0,"strategies":set()})
+            global _last_report_day
+            if now.hour >= 21 and _last_report_day != day:
+                await _send_daily_report(day)
+                _last_report_day = day
             if practice_active(now) and not _pending and not _open:
                 candidate=await _build_candidate()
                 if candidate:
