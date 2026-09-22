@@ -1130,7 +1130,63 @@ async def sync_account_assets(client, reason="periodic"):
                     client.account_id,reason,len(STATE["assets"]))
         return False
 
-    assets=build_assets(client,raw)
+    # Event 182 is authenticated/account-scoped, but the broker can still include
+    # instruments whose market session is currently closed.  Respect the broker's
+    # own trading schedule fields when they are present; never invent an allowlist
+    # or use a public/global asset catalogue. OTC instruments remain eligible unless
+    # the account feed explicitly marks them unavailable/locked.
+    def _asset_is_currently_open(item, now_ts):
+        pair=str(item.get("pair") or item.get("p") or item.get("symbol") or item.get("instrument") or item.get("id") or "")
+        if "_OTC" in pair.upper():
+            return True
+        for key in ("disabled","locked","locked_trading"):
+            if item.get(key) is True:
+                return False
+        status=str(item.get("status") or item.get("state") or "").strip().lower()
+        if status in {"disabled","locked","inactive","unavailable","closed","off"}:
+            return False
+
+        def _ts(*keys):
+            for key in keys:
+                value=item.get(key)
+                try:
+                    if value is not None:
+                        return float(value)
+                except (TypeError,ValueError):
+                    pass
+            return None
+
+        open_ts=_ts("time_open_trading","time_open")
+        close_ts=_ts("time_close_trading","time_close")
+        if open_ts is None and close_ts is None:
+            # No broker schedule evidence: keep the authenticated account asset.
+            return True
+        if open_ts is not None and now_ts < open_ts:
+            return False
+        if close_ts is not None and now_ts > close_ts:
+            return False
+        return True
+
+    now_ts=time.time()
+    scheduled_open=[]
+    schedule_rejected=[]
+    for item in raw:
+        if not isinstance(item,dict):
+            continue
+        if _asset_is_currently_open(item,now_ts):
+            scheduled_open.append(item)
+        else:
+            p=pair_name(item)
+            if p:
+                schedule_rejected.append(p)
+    log.info(
+        "ACCOUNT_OPEN_SCHEDULE_FILTER account_id=%s raw_authenticated=%d open_now=%d rejected_closed=%d",
+        client.account_id,len(raw),len(scheduled_open),len(schedule_rejected)
+    )
+    if schedule_rejected:
+        log.info("ACCOUNT_ASSET_CLOSED_BY_BROKER_SCHEDULE sample=%s",schedule_rejected[:25])
+
+    assets=build_assets(client,scheduled_open)
     if not assets:
         log.warning("ACCOUNT_ASSET_SYNC_ZERO account_id=%s reason=%s keep_count=%d",
                     client.account_id,reason,len(STATE["assets"]))
