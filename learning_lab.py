@@ -1,8 +1,8 @@
 """Independent daily demo practice laboratory.
 
-It reads the authenticated market snapshot but never writes to the live Signal
-Brain, signal cycle state, or live result state. A demo order can be placed only
-after an admin presses ACCEPT in Telegram.
+It reads the authenticated market snapshot and places DEMO-only practice orders
+automatically during the fixed 19:00–21:00 UAE learning window. It never accepts
+a live/real account for learning execution.
 """
 from __future__ import annotations
 
@@ -28,7 +28,9 @@ MIN_CONFIDENCE = max(75, min(96, int(os.getenv("LEARNING_PRACTICE_MIN_CONFIDENCE
 APPROVAL_TTL = 45.0
 _pending = {}
 _open = {}
-_cfg = {}\n_daily = {"day": None, "placed": 0, "win": 0, "loss": 0, "tie": 0, "blocked": 0, "strategies": set()}\n_last_report_day = None
+_cfg = {}
+_daily = {"day": None, "placed": 0, "win": 0, "loss": 0, "tie": 0, "blocked": 0, "strategies": set()}
+_last_report_day = None
 
 def configure(*, snapshot_provider, client_provider, send_message, answer_callback, admin_id):
     _cfg.update(
@@ -388,7 +390,13 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
             error_code="LOW_PRICE_EFFICIENCY"
         else:
             error_code="LOSS_CONTEXT"
-    if result=="WIN": _daily["win"] += 1\n    elif result=="LOSS": _daily["loss"] += 1\n    else: _daily["tie"] += 1\n    _daily["day"] = str(_now_uae().date())\n    await record_practice_result(rec.get("strategy","UNKNOWN"),result,
+    if result=="WIN":
+        _daily["win"] += 1
+    elif result=="LOSS":
+        _daily["loss"] += 1
+    else:
+        _daily["tie"] += 1
+    _daily["day"] = str(_now_uae().date())\n    await record_practice_result(rec.get("strategy","UNKNOWN"),result,
                                  pair=rec.get("pair",""),confidence=rec.get("confidence",0),
                                  context=ctx,error_code=error_code)
     _open.pop(str(rec.get("trade_id") or ""),None)
@@ -469,26 +477,25 @@ async def _send_daily_report(day):
 async def run_forever():
     if os.getenv("LEARNING_PRACTICE_ENABLED","true").strip().lower()=="false":
         return
-    last_day=None
     while True:
         try:
             now=_now_uae()
             day=now.date()
-            if practice_active(now) and last_day!=day and not _pending and not _open:
+            if practice_active(now) and not _pending and not _open:
                 candidate=await _build_candidate()
                 if candidate:
-                    if await _send_request(candidate):
-                        last_day=day
-                        log_msg=(f"PRACTICE_WINDOW_STARTED day={day} start={START_HOUR:02d}:00 duration=2h "
+                    sent = await _send_request(candidate)
+                    if sent:
+                        log_msg=(f"PRACTICE_WINDOW_ACTIVE day={day} start={START_HOUR:02d}:00 duration=2h "
                                  f"strategy={candidate['strategy']} pair={candidate['pair']} source={candidate['source']}")
                         print(log_msg)
                 else:
-                    # Keep checking within the 2h window; a valid research strategy
-                    # can appear later as candles change.
+                    # Keep checking within the 2h window; a valid setup can appear
+                    # later as candles change.
                     pass
             # While the 2h window is active, allow another candidate only after the
-            # previous request/order has completed. This prevents Telegram spam and
-            # excessive demo orders.            for tid,rec in list(_open.items()):
+            # previous order has completed. This prevents overlapping demo orders.
+            for tid,rec in list(_open.items()):
                 asyncio.create_task(_fallback_watch(rec)) if not rec.get("_watch_started") else None
                 rec["_watch_started"]=True
             # Expire stale approvals.
