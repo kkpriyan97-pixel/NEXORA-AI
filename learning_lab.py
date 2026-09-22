@@ -72,6 +72,8 @@ def status():
         "duration_seconds":DURATION_SECONDS,
         "approval_required":False,
         "demo_only":True,
+        "schedule":"DAILY",
+        "learning_window":"20:30–22:30 UAE",
         "pending":len(_pending),
         "open_trades":len(_open),
     }
@@ -426,22 +428,44 @@ async def _place_demo(rec, actor_id):
     if direction not in {"up","down"} or not pair:
         return False,"INVALID_DIRECTION_OR_PAIR",None
     try:
-        print(f"LEARNING_ORDER_ATTEMPT pair={pair} direction={direction.upper()} account_id={account_id} group=demo amount={AMOUNT} duration={DURATION_SECONDS}")
-        # The group is hard-coded to demo and verified again immediately before
-        # the broker request. No real/live group is accepted by this layer.
+        print(f"LEARNING_ORDER_ATTEMPT pair={pair} direction={direction.upper()} group=demo amount={AMOUNT} duration={DURATION_SECONDS}")
+        # Use the canonical DEMO order signature supported by the OlympTrade
+        # client: pair, amount, direction, duration, account_id, group.
+        # Avoid optional payload flags that can cause a server-side Invalid request.
         result=await asyncio.wait_for(
             client.trade.place_order(
                 pair=pair,amount=AMOUNT,direction=direction,
                 duration=DURATION_SECONDS,account_id=int(account_id),
-                group="demo",category="digital",is_flex=True
+                group="demo"
             ),
             timeout=5.0
         )
     except Exception as e:
-        return False,"DEMO_ORDER_EXCEPTION",None
+        msg=str(e).replace("\n"," ")[:220]
+        print(f"LEARNING_ORDER_EXCEPTION pair={pair} type={type(e).__name__} message={msg}")
+        return False,f"DEMO_ORDER_EXCEPTION:{type(e).__name__}",None
+
     if not isinstance(result,dict):
-        return False,"DEMO_ORDER_REJECTED",None
-    trade_id=result.get("id") or result.get("trade_id")
+        print(f"LEARNING_ORDER_RESPONSE_INVALID pair={pair} type={type(result).__name__}")
+        return False,"DEMO_ORDER_REJECTED:INVALID_RESPONSE",None
+
+    status_value=str(result.get("status") or result.get("state") or "").upper()
+    code_value=str(result.get("code") or result.get("error_code") or "").strip()
+    message_value=str(result.get("message") or result.get("error") or result.get("reason") or "").replace("\n"," ")[:180]
+    success_value=result.get("success")
+
+    print(
+        f"LEARNING_ORDER_RESPONSE pair={pair} status={status_value or 'UNKNOWN'} "
+        f"code={code_value or 'NONE'} message={message_value or 'NONE'} "
+        f"keys={sorted(str(k) for k in result.keys())}"
+    )
+
+    rejected_states={"REJECTED","ERROR","FAILED","FAIL","DENIED"}
+    if status_value in rejected_states or success_value is False or result.get("error") not in (None,"",False):
+        detail=code_value or message_value or status_value or "BROKER_REJECTED"
+        return False,f"DEMO_ORDER_REJECTED:{detail}",None
+
+    trade_id=result.get("id") or result.get("trade_id") or result.get("order_id") or result.get("orderId")
     if not trade_id:
         return False,"DEMO_ORDER_NO_ID",None
 
@@ -709,6 +733,7 @@ async def run_forever():
                 await _send_daily_report(day)
                 _last_report_day = day
             if practice_active(now) and not _pending and not _open:
+                print(f"LEARNING_WINDOW_ACTIVE day={day} start=20:30 end=22:30 timezone=Asia/Dubai")
                 candidate=await _build_candidate()
                 if candidate:
                     sent = await _send_request(candidate)
