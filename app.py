@@ -3777,8 +3777,8 @@ async def handle_telegram_command(msg):
         if str(uid)!=ADMIN_TELEGRAM_ID:
             await audit_access("UNAUTHORIZED_MBCODE_ATTEMPT",int(uid)); await telegram("❌ Admin only.",chat_id=chat_id); return
         ok=await generate_member_access_code(uid)
-        await telegram("✅ Code generated and sent to your admin email." if ok else "❌ Code generation failed.",chat_id=chat_id); return
-    if cmd=="/mbaccess":
+        await telegram(("✅ Code generated and sent to your admin email.\n\n📩 Open your admin email and copy the code.\n\n🔐 Then send:\n/mbverify CODE\n\nExample: /mbverify 123456") if ok else "❌ Code generation failed.",chat_id=chat_id); return
+    if cmd in ("/mbaccess","/mbverify"):
         parts=txt.split(maxsplit=1); code=parts[1].strip() if len(parts)==2 else ""
         result=await grant_member_access(uid,code)
         messages={"GRANTED":"✅ ACCESS VERIFICATION SUCCESS\n\nAll configured MB members now have access for 24 hours.","DENIED":"❌ Admin only.","INVALID":"❌ Invalid access code.","EXPIRED":"❌ Code expired or no active code.","NO_MEMBERS":"❌ No MB1/MB2/... member IDs configured.","DB_ERROR":"❌ Access system unavailable."}
