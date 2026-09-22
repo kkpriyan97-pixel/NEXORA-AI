@@ -1,7 +1,7 @@
 """Independent daily demo practice laboratory.
 
 It reads the authenticated market snapshot and places DEMO-only practice orders
-automatically during the fixed 19:30–21:30 UAE learning window. It never accepts
+automatically during the fixed 20:30–22:30 UAE learning window. It never accepts
 a live/real account for learning execution.
 """
 from __future__ import annotations
@@ -22,7 +22,7 @@ UAE = ZoneInfo("Asia/Dubai")
 DURATION_SECONDS = max(60, min(300, int(os.getenv("LEARNING_PRACTICE_DURATION_SECONDS","60"))))
 AMOUNT = max(0.01, float(os.getenv("LEARNING_DEMO_AMOUNT","1")))
 WINDOW_MINUTES = 120
-START_HOUR = 19
+START_HOUR = 20
 START_MINUTE = 30
 LOOP_SECONDS = max(30, min(120, int(os.getenv("LEARNING_PRACTICE_INTERVAL_SECONDS","60"))))
 MIN_CONFIDENCE = max(75, min(96, int(os.getenv("LEARNING_PRACTICE_MIN_CONFIDENCE","82"))))
@@ -32,6 +32,7 @@ _open = {}
 _cfg = {}
 _daily = {"day": None, "placed": 0, "win": 0, "loss": 0, "tie": 0, "blocked": 0, "strategies": set()}
 _last_report_day = None
+_practice_cursor = 0
 
 def configure(*, snapshot_provider, client_provider, send_message, answer_callback, admin_id):
     _cfg.update(
@@ -133,12 +134,16 @@ async def _load_research_hints():
                 hints.append((strategy,str(mid)));seen.add(strategy)
     return hints
 
-def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit):
+def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0):
     candidates=[]
     now=time.time()
     # Practice is deliberately capped and rotated so the learning laboratory
     # cannot monopolize the CPU or starve the live signal scheduler.
-    for asset in list(assets)[:max(1,int(limit or 8))]:
+    pool=list(assets)
+    n=max(1,int(limit or 8))
+    start=int(offset)%len(pool) if pool else 0
+    selected=[pool[(start+i)%len(pool)] for i in range(min(n,len(pool)))] if pool else []
+    for asset in selected:
         pair=str(asset.get("pair") or "")
         if not pair or not asset.get("signal_eligible",True):
             continue
@@ -211,9 +216,12 @@ async def _build_candidate():
         "TREND_FOLLOWING","MOMENTUM","BREAKOUT","PULLBACK",
         "REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY"
     ]
-    batch=int(os.getenv("LEARNING_ASSET_BATCH","8"))
+    batch=max(1,int(os.getenv("LEARNING_ASSET_BATCH","8")))
+    global _practice_cursor
+    offset=_practice_cursor
+    _practice_cursor=(offset+batch)%max(1,len(assets)) if assets else 0
     return await asyncio.to_thread(
-        _analyze_snapshot_sync,assets,candles,prices,preferred,hints,batch
+        _analyze_snapshot_sync,assets,candles,prices,preferred,hints,batch,offset
     )
 
 async def _send_request(candidate):
@@ -222,44 +230,46 @@ async def _send_request(candidate):
     rec=dict(candidate)
     rec.update(token=token,expires_at=expires,created_at=time.time(),status="PENDING")
     _pending[token]=rec
-    text_msg=(
-        "🧠 CANDICE • 2H LEARNING PRACTICE\n\n"
-        f"📊 {rec['display_name']}\n"
-        f"{'⬆️ UP' if rec['direction']=='UP' else '⬇️ DOWN'}\n"
-        f"⏱️ {DURATION_SECONDS//60} MIN\n\n"
-        f"🧩 Strategy → {rec['strategy']}\n"
-        f"🔬 Research → {rec['source']}\n"
-        f"🎯 Confidence → {rec['confidence']}%\n"
-        f"💰 Reference → {rec.get('reference_price')}\n\n"
-        "🤖 DEMO AUTO-TRADE WINDOW\n"
-        "Automatic DEMO practice only during 19:30–21:30 UAE."
-    )
     try:
-        await _cfg["send_message"](text_msg, chat_id=_cfg.get("admin_id") or None)
-        _daily["strategies"].add(str(rec.get("strategy") or "UNKNOWN"))
+        # Execute with the broker first. Telegram reporting is deliberately
+        # outside the critical execution path so notification latency cannot
+        # delay DEMO entry.
         ok, reason, placed = await _place_demo(rec, _cfg.get("admin_id",""))
         _pending.pop(token, None)
         if not ok:
             _daily["blocked"] += 1
+            print(f"LEARNING_ORDER_BLOCKED pair={rec.get('pair')} strategy={rec.get('strategy')} reason={reason}")
             await _cfg["send_message"](
                 f"❌ DEMO AUTO-TRADE BLOCKED\n\nReason → {reason}",
                 chat_id=_cfg.get("admin_id") or None
             )
             await save_error(rec.get("strategy","UNKNOWN"), reason, rec.get("technique") or {})
             return False
+
         _daily["placed"] += 1
+        _daily["strategies"].add(str(rec.get("strategy") or "UNKNOWN"))
+        print(
+            f"LEARNING_ORDER_ACCEPTED pair={placed['pair']} direction={placed['direction']} "
+            f"strategy={placed['strategy']} trade_id={placed['trade_id']} "
+            f"entry={placed.get('entry_price')} at={placed.get('placed_at')}"
+        )
         await _cfg["send_message"](
-            f"🤖 DEMO AUTO-TRADE STARTED\n\n📊 {placed['display_name']}\n"
+            "🤖 DEMO AUTO-TRADE STARTED\n\n"
+            f"📊 {placed['display_name']}\n"
             f"{'⬆️ UP' if placed['direction']=='UP' else '⬇️ DOWN'}\n"
-            f"💰 Amount → {AMOUNT}\n💵 Entry → {placed.get('entry_price')}\n"
+            f"💰 Amount → {AMOUNT}\n"
+            f"💵 Entry → {placed.get('entry_price')}\n"
             f"⏱️ Duration → {DURATION_SECONDS//60} MIN\n"
-            f"🧩 Strategy → {placed['strategy']}\n🆔 Demo Trade → {placed['trade_id']}",
+            f"🧩 Strategy → {placed['strategy']}\n"
+            f"🆔 Demo Trade → {placed['trade_id']}\n"
+            "🔐 DEMO ACCOUNT ONLY",
             chat_id=_cfg.get("admin_id") or None
         )
         return True
-    except Exception:
+    except Exception as exc:
         _pending.pop(token,None)
-        return False
+        print(f"LEARNING_ORDER_REPORT_FAILED type={type(exc).__name__} message={str(exc)[:120]}")
+        return True if rec.get("trade_id") else False
 
 async def _place_demo(rec, actor_id):
     if not practice_active():
@@ -267,7 +277,7 @@ async def _place_demo(rec, actor_id):
     if str(actor_id) != str(_cfg.get("admin_id","")):
         return False,"ADMIN_ONLY",None
     if time.time()>float(rec.get("expires_at",0)):
-        return False,"APPROVAL_EXPIRED",None
+        return False,"PRACTICE_REQUEST_EXPIRED",None
     client=_cfg.get("client_provider",lambda:None)()
     if not client or not getattr(client.connection,"is_connected",False):
         return False,"BROKER_NOT_CONNECTED",None
@@ -463,7 +473,7 @@ async def _send_daily_report(day):
     validated = await _validated_strategy_ids()
     await _cfg["send_message"](
         "🧠 CANDICE • LEARNING REPORT\n\n"
-        "🕖 Practice → 19:30–21:30 UAE\n"
+        "🕣 Practice → 20:30–22:30 UAE\n"
         f"📅 Day → {day}\n"
         f"🤖 DEMO AUTO-TRADE → {_daily['placed']} trades\n"
         f"🟢 WIN → {_daily['win']}\n"
@@ -473,7 +483,7 @@ async def _send_daily_report(day):
         f"⛔ Blocked → {_daily['blocked']}\n\n"
         f"✅ VALIDATED / OWN STRATEGY READY → {len(validated)}\n"
         f"🧩 Strategies → {', '.join(validated[:20]) if validated else 'None'}\n\n"
-        "🔴 21:30 → Learning Auto-Trade OFF\n"
+        "🔴 22:30 → Learning Auto-Trade OFF\n"
         "🔐 ADMIN ONLY",
         chat_id=_cfg.get("admin_id") or None
     )
@@ -500,6 +510,7 @@ async def run_forever():
                         log_msg=(f"PRACTICE_WINDOW_ACTIVE day={day} start={START_HOUR:02d}:{START_MINUTE:02d} duration=2h "
                                  f"strategy={candidate['strategy']} pair={candidate['pair']} source={candidate['source']}")
                         print(log_msg)
+                        print(f"LEARNING_PRACTICE_ROTATION cursor={_practice_cursor} assets={len((await asyncio.to_thread(lambda:list((_cfg.get('snapshot_provider')() or {}).get('assets') or [])))) if _cfg.get('snapshot_provider') else 0}")
                 else:
                     # Keep checking within the 2h window; a valid setup can appear
                     # later as candles change.
