@@ -523,8 +523,11 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,
     selected=[pool[(start+i)%len(pool)] for i in range(min(n,len(pool)))] if pool else []
     for asset in selected:
         pair=str(asset.get("pair") or "")
-        if not pair or not asset.get("signal_eligible",True):
+        if not pair:
             continue
+        # Overnight research evaluates the complete authenticated account universe.
+        # Non-executable/locked assets are still audited but are not forced into
+        # broker orders by the DEMO execution gate.
         cs=[]
         for c in candles.get(pair,[]) or []:
             if not isinstance(c,dict): continue
