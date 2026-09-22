@@ -15,7 +15,11 @@ REVIEW_SEMAPHORE=asyncio.Semaphore(1)
 REVIEW_PROVIDER_COOLDOWN={}
 REVIEW_TRANSIENT_COOLDOWN_SECONDS=15.0
 REVIEW_429_COOLDOWN_SECONDS=900.0
-LIVE_EXTERNAL_AI_ENABLED=os.getenv("AI_EXTERNAL_LIVE_ENABLED","false").strip().lower()=="true"
+# Hard safety boundary: external LLM calls are never permitted in the live signal path.
+# This cannot be enabled by a runtime environment variable, so provider 429/timeout
+# responses cannot consume signal-cycle time.
+LIVE_EXTERNAL_AI_ENABLED=False
+BACKGROUND_EXTERNAL_ENABLED=os.getenv("AI_EXTERNAL_BACKGROUND_ENABLED","false").strip().lower()=="true"
 _logged_ready=set()
 
 def _providers():
@@ -200,7 +204,27 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
 
 
 async def review_result_with_fallback(rec:dict[str,Any])->dict[str,Any]:
-    """One external post-result AI review attempt. Retries are owned by the durable queue."""
+    """Background post-result audit.
+
+    External LLM review is disabled by default. A local audit keeps the durable
+    learning queue useful without allowing provider quotas/rate limits to touch
+    live execution or result processing.
+    """
+    if not BACKGROUND_EXTERNAL_ENABLED:
+        result=str(rec.get("result") or "").upper()
+        strategy=str(rec.get("strategy") or "UNKNOWN")
+        trend=str(rec.get("trend_15m") or "UNKNOWN")
+        direction=str(rec.get("direction") or "UNKNOWN")
+        return {
+            "lesson":(
+                f"{strategy} result={result} in trend={trend}; reuse only the same "
+                f"closed-candle context and keep existing Brain gates unchanged."
+            )[:320],
+            "reuse":"Recheck the same context before reuse; post-result review must not rewrite direction.",
+            "evidence":f"Local outcome evidence: {direction} / {strategy} / {result}.",
+            "confidence":80,
+            "provider":"LOCAL_RESULT_AUDIT",
+        }
     ind=dict(rec.get("indicator_context") or {})
     payload={
         "task":"Post-result audit for Candice Brain. Do not generate a new trade signal. Explain what the completed result teaches and what exact lesson should be reused when the same market context appears again.",
@@ -288,7 +312,13 @@ async def review_result_with_fallback(rec:dict[str,Any])->dict[str,Any]:
                 log.warning("AI_POST_RESULT_REVIEW_FAILED provider=%s status=%s detail=%s",
                             name,status,detail)
                 if status==429:
-                    REVIEW_PROVIDER_COOLDOWN[name]=time.time()+REVIEW_429_COOLDOWN_SECONDS
+                    # Respect provider-side backoff; the durable queue owns retries.
+                    retry_after=0.0
+                    try:
+                        retry_after=float(e.response.headers.get("Retry-After","0") or 0)
+                    except (TypeError,ValueError):
+                        retry_after=0.0
+                    REVIEW_PROVIDER_COOLDOWN[name]=time.time()+max(REVIEW_429_COOLDOWN_SECONDS,retry_after)
                 elif status in (408,425,500,502,503,504,413):
                     REVIEW_PROVIDER_COOLDOWN[name]=time.time()+REVIEW_TRANSIENT_COOLDOWN_SECONDS
             except (httpx.TimeoutException,httpx.NetworkError) as e:

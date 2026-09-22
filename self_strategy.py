@@ -7,6 +7,7 @@ from __future__ import annotations
 VERSION = "SELF-MARKET-V4"
 
 from research_brain import strategy_research_prior
+from strategy_knowledge import knowledge_priors
 
 
 def _f(x, default=0.0):
@@ -51,6 +52,16 @@ def discover(*, trend, structure, rsi_value, momentum, atr_value,
         pattern=pattern,
         volatility_ratio=vr,
     )
+    # Web research is discovery input only. It must be validated in the separate
+    # demo-learning lane before any strategy/technique can affect live Brain ranking.
+    validated_prior = knowledge_priors({
+        "trend_15m": trend,
+        "structure_1m": structure,
+        "pattern": pattern,
+        "donchian_state": donchian_state,
+        "donchian_expansion": dc_exp,
+        "stochastic_cross": stochastic_cross,
+    })
 
     if isinstance(structure_quality, dict):
         sq = {
@@ -171,9 +182,9 @@ def discover(*, trend, structure, rsi_value, momentum, atr_value,
             vv += 4
         weights["VOLATILITY"] = vv
 
-    # Evidence-led web research is only a bounded prior. Local authenticated
-    # outcomes remain the source of truth for live adaptation.
-    for strategy, prior in research_prior.items():
+    # Only validated demo-practice knowledge is allowed to influence live strategy
+    # ranking. Raw web research remains visible as audit metadata but has zero live weight.
+    for strategy, prior in validated_prior.items():
         if strategy in weights:
             weights[strategy] += float(prior)
 
@@ -196,6 +207,8 @@ def discover(*, trend, structure, rsi_value, momentum, atr_value,
         "weights": {k: round(v, 2) for k, v in weights.items()},
         "research_version": "WEB-RESEARCH-V1",
         "research_prior": dict(research_prior),
+        "validated_knowledge_version": "KNOWLEDGE-V1",
+        "validated_knowledge_prior": dict(validated_prior),
         "regime": {
             "trend": trend,
             "structure": structure,
