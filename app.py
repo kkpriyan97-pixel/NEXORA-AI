@@ -2211,7 +2211,38 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                 len(seed_list),len(recovery_adapted)
             )
 
-    candidate_inputs=adapted+recovery_adapted
+    # Expand every independently qualified Brain technique instead of keeping
+    # only the single best technique returned for an asset. A late confirmation
+    # failure on BREAKOUT/TREND_FOLLOWING/etc. must fall through to another
+    # already-qualified technique for the same asset before the cycle is skipped.
+    candidate_inputs=[]
+    variant_count=0
+    for base in adapted+recovery_adapted:
+        variants=base.get("strategy_candidates") or []
+        if not variants:
+            candidate_inputs.append(base)
+            continue
+        for variant in variants:
+            if not isinstance(variant,dict):
+                continue
+            item=base.copy()
+            item["strategy"]=str(variant.get("strategy") or base.get("strategy") or "").upper()
+            item["direction"]=str(variant.get("direction") or base.get("direction") or "").upper()
+            item["confidence"]=int(variant.get("score") or base.get("confidence") or 0)
+            item["market_quality"]=float(variant.get("score") or base.get("market_quality") or 0)
+            item["strategy_variant"]=True
+            item["strategy_variant_count"]=len(variants)
+            item["strategy_variant_score"]=item["confidence"]
+            item["strategy_margin"]=0.0
+            item["self_strategy_version"]=str(
+                variant.get("self_strategy_version") or base.get("self_strategy_version") or ""
+            )
+            candidate_inputs.append(item)
+            variant_count+=1
+    log.info(
+        "BRAIN_TECHNIQUE_EXPANSION base_assets=%d variants=%d candidate_inputs=%d",
+        len(adapted)+len(recovery_adapted),variant_count,len(candidate_inputs)
+    )
     raw=rank_signal_candidates(candidate_inputs)
     if not raw:
         if candidate_inputs:
