@@ -313,10 +313,13 @@ async def strategy_council_with_fallback(payload:dict[str,Any])->dict[str,Any]:
             "rationale":best.get("rationale",""),
             "providers":sorted({str(p.get("provider") or "") for p in bundle}),
         })
-    consensus=proposals[0] if proposals else None
+    consensus=None
+    if proposals and contributing >= 2 and float(proposals[0].get("agreement") or 0.0) >= 0.5:
+        consensus=proposals[0]
     result={
         "members":members,
         "member_count":len(members),
+        "contributing_members":contributing,
         "proposals":proposals,
         "votes":votes,
         "consensus_strategy":str(consensus.get("strategy") if consensus else ""),
