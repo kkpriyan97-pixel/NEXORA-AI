@@ -1,8 +1,7 @@
-"""Independent daily demo practice laboratory.
+"""Independent overnight DEMO learning laboratory.
 
-It reads the authenticated market snapshot and places DEMO-only practice orders
-automatically during the fixed 20:30–23:00 UAE learning window. It never accepts
-a live/real account for learning execution.
+From 18:00–06:00 UAE it combines the authenticated market snapshot, web-research
+knowledge and a multi-AI strategy council. It never accepts a live/real account.
 """
 from __future__ import annotations
 
@@ -15,15 +14,16 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from candice_brain import analyze_asset
-from strategy_knowledge import record_practice_result, save_error
+from ai_router import strategy_council_with_fallback
+from strategy_knowledge import record_practice_result, record_strategy_council, save_error
 
 DB_URL = os.getenv("DATABASE_URL","").strip()
 UAE = ZoneInfo("Asia/Dubai")
 DURATION_SECONDS = max(60, min(300, int(os.getenv("LEARNING_PRACTICE_DURATION_SECONDS","60"))))
 AMOUNT = max(0.01, float(os.getenv("LEARNING_DEMO_AMOUNT","1")))
-WINDOW_MINUTES = 150
-START_HOUR = 20
-START_MINUTE = 30
+WINDOW_MINUTES = 720
+START_HOUR = 18
+START_MINUTE = 0
 LOOP_SECONDS = max(30, min(120, int(os.getenv("LEARNING_PRACTICE_INTERVAL_SECONDS","60"))))
 LEARNING_SCAN_TIMEOUT_SECONDS = max(10, min(45, int(os.getenv("LEARNING_SCAN_TIMEOUT_SECONDS","25"))))
 LEARNING_RESEARCH_HINT_TIMEOUT_SECONDS = max(2, min(10, int(os.getenv("LEARNING_RESEARCH_HINT_TIMEOUT_SECONDS","5"))))
@@ -53,19 +53,29 @@ def configure(*, snapshot_provider, client_provider, send_message, answer_callba
 def _now_uae():
     return datetime.now(timezone.utc).astimezone(UAE)
 
+def _learning_session_day(now=None):
+    now=now or _now_uae()
+    # One learning session spans 18:00 on day D through 06:00 on day D+1.
+    return now.date() if now.hour >= START_HOUR else (now-timedelta(days=1)).date()
+
 def _window_start(day):
     return datetime(day.year,day.month,day.day,START_HOUR,START_MINUTE,0,tzinfo=UAE)
 
+def _window_end(day):
+    return _window_start(day)+timedelta(minutes=WINDOW_MINUTES)
+
 def practice_active(now=None):
     now=now or _now_uae()
-    start=_window_start(now)
-    end=start+timedelta(minutes=WINDOW_MINUTES)
+    session_day=_learning_session_day(now)
+    start=_window_start(session_day)
+    end=_window_end(session_day)
     return start <= now < end
 
 def status():
     n=_now_uae()
-    start=_window_start(n)
-    end=start+timedelta(minutes=WINDOW_MINUTES)
+    session_day=_learning_session_day(n)
+    start=_window_start(session_day)
+    end=_window_end(session_day)
     active=start<=n<end
     return {
         "enabled":os.getenv("LEARNING_PRACTICE_ENABLED","true").strip().lower()!="false",
@@ -76,7 +86,7 @@ def status():
         "approval_required":False,
         "demo_only":True,
         "schedule":"DAILY",
-        "learning_window":"20:30–23:00 UAE",
+        "learning_window":"18:00–06:00 UAE",
         "pending":len(_pending),
         "open_trades":len(_open),
     }
@@ -274,8 +284,9 @@ async def _load_research_hints():
                 hints.append((strategy,str(mid)));seen.add(strategy)
     return hints
 
-def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0):
+def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,council_votes=None):
     candidates=[]
+    council_votes=dict(council_votes or {})
     now=time.time()
     # Practice is deliberately capped and rotated so the learning laboratory
     # cannot monopolize the CPU or starve the live signal scheduler.
@@ -323,10 +334,11 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0)
             "ema_gap_norm":brain.get("ema_gap_norm"),
             "ema_slope_norm":brain.get("ema_slope_norm"),
         }
-        candidates.append((conf,float(brain.get("market_quality") or 0),brain,source,technique))
+        council_boost=3*int(council_votes.get(strategy,0) or 0)
+        candidates.append((conf+council_boost,conf,float(brain.get("market_quality") or 0),brain,source,technique,council_boost))
     if not candidates:return None
-    candidates.sort(key=lambda x:(x[0],x[1]),reverse=True)
-    _,_,brain,source,technique=candidates[0]
+    candidates.sort(key=lambda x:(x[0],x[1],x[2]),reverse=True)
+    _,_,_,brain,source,technique,council_boost=candidates[0]
     return {
         "pair":brain["pair"],
         "display_name":brain.get("display_name") or brain["pair"],
@@ -338,6 +350,7 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0)
         "source":source,
         "technique":technique,
         "reason":str(brain.get("reason") or "")[:600],
+        "council_boost":council_boost,
     }
 
 async def _build_candidate():
@@ -369,21 +382,58 @@ async def _build_candidate():
     except Exception as e:
         hints=[]
         print(f"LEARNING_RESEARCH_HINTS_FAILED type={type(e).__name__} message={str(e)[:120]} fallback=core_strategy_families")
-    preferred=[x[0] for x in hints] or [
+    session_day=_learning_session_day(_now_uae())
+    session_id=f"{session_day}:OVERNIGHT"
+    base_preferred=[x[0] for x in hints] or [
         "TREND_FOLLOWING","MOMENTUM","BREAKOUT","PULLBACK",
         "REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY"
     ]
+    council_payload={
+        "session_day":str(session_day),
+        "mode":"DEMO_ONLY",
+        "market_universe":{"assets":len(assets),"candle_series":len(candles),"price_series":len(prices)},
+        "research_hints":[{"strategy":st,"source":sid} for st,sid in hints[:16]],
+        "allowed_strategies":base_preferred,
+    }
+    try:
+        council=await strategy_council_with_fallback(council_payload)
+    except Exception as e:
+        council={}
+        print(f"AI_STRATEGY_COUNCIL_FAILED type={type(e).__name__} message={str(e)[:140]} fallback=local_brain")
+    if council.get("proposals"):
+        await record_strategy_council(session_id,council)
+    votes=dict(council.get("votes") or {})
+    council_order=[str(x.get("strategy") or "").upper() for x in council.get("proposals") or [] if x.get("strategy")]
+    preferred=list(dict.fromkeys(council_order+base_preferred))
     print(
         f"LEARNING_CANDIDATE_SCAN assets={len(assets)} candles={len(candles)} "
-        f"prices={len(prices)} preferred={','.join(preferred[:12])}"
+        f"prices={len(prices)} preferred={','.join(preferred[:12])} "
+        f"council_members={int(council.get('member_count') or 0)} "
+        f"consensus={council.get('consensus_strategy') or 'NONE'} "
+        f"agreement={float(council.get('agreement') or 0.0):.3f}"
     )
     batch=max(1,int(os.getenv("LEARNING_ASSET_BATCH","8")))
     global _practice_cursor
     offset=_practice_cursor
     _practice_cursor=(offset+batch)%max(1,len(assets)) if assets else 0
     candidate=await asyncio.to_thread(
-        _analyze_snapshot_sync,assets,candles,prices,preferred,hints,batch,offset
+        _analyze_snapshot_sync,assets,candles,prices,preferred,hints,batch,offset,votes
     )
+    if candidate:
+        consensus=str(council.get("consensus_strategy") or "").upper()
+        strategy=str(candidate.get("strategy") or "").upper()
+        candidate["council_session_id"]=session_id
+        candidate["council_consensus"]=consensus
+        candidate["council_agreement"]=float(council.get("agreement") or 0.0)
+        candidate["council_members"]=int(council.get("member_count") or 0)
+        candidate["council_votes"]=votes
+        candidate["source"]="AI_COUNCIL_CONSENSUS" if consensus and strategy==consensus else candidate.get("source","CORE")
+        print(
+            f"LEARNING_CANDIDATE_READY pair={candidate.get('pair')} "
+            f"direction={candidate.get('direction')} confidence={candidate.get('confidence')} "
+            f"strategy={candidate.get('strategy')} source={candidate.get('source')} "
+            f"council_consensus={consensus or 'NONE'}"
+        )
     if candidate:
         print(
             f"LEARNING_CANDIDATE_READY pair={candidate.get('pair')} "
@@ -862,7 +912,7 @@ async def _send_daily_report(day):
     validated = await _validated_strategy_ids()
     await _cfg["send_message"](
         "🧠 CANDICE • LEARNING REPORT\n\n"
-        "🕣 Practice → 20:30–23:00 UAE\n"
+        "🕕 Practice → 18:00–06:00 UAE\n"
         f"📅 Day → {day}\n"
         f"🤖 DEMO AUTO-TRADE → {_daily['placed']} trades\n"
         f"🟢 WIN → {_daily['win']}\n"
@@ -872,7 +922,7 @@ async def _send_daily_report(day):
         f"⛔ Blocked → {_daily['blocked']}\n\n"
         f"✅ VALIDATED / OWN STRATEGY READY → {len(validated)}\n"
         f"🧩 Strategies → {', '.join(validated[:20]) if validated else 'None'}\n\n"
-        "🔴 23:00 → Learning Auto-Trade OFF\n"
+        "🔴 06:00 → Learning Auto-Trade OFF\n"
         "🔐 ADMIN ONLY",
         chat_id=_cfg.get("admin_id") or None
     )
@@ -895,17 +945,18 @@ async def run_forever():
         print("LEARNING_TRADE_RESTORE_TIMEOUT seconds=5 fallback=memory_only")
     except Exception as e:
         print(f"LEARNING_TRADE_RESTORE_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]} fallback=memory_only")
-    print("LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=20:30-23:00 timezone=Asia/Dubai demo_only=True")
+    print("LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=18:00-06:00 timezone=Asia/Dubai demo_only=True ai_council=True")
     last_heartbeat=0.0
     last_scan=0.0
     while True:
         try:
             now=_now_uae()
-            day=now.date()
+            session_day=_learning_session_day(now)
+            day=session_day
             if _daily["day"] != str(day):
                 _daily.update({"day":str(day),"placed":0,"win":0,"loss":0,"tie":0,"blocked":0,"strategies":set()})
             global _last_report_day
-            window_end=_window_start(day)+timedelta(minutes=WINDOW_MINUTES)
+            window_end=_window_end(day)
             if now >= window_end and _last_report_day != day:
                 await _send_daily_report(day)
                 _last_report_day = day
@@ -919,7 +970,7 @@ async def run_forever():
                     )
                 if time.time()-last_scan >= LOOP_SECONDS:
                     last_scan=time.time()
-                    print(f"LEARNING_WINDOW_ACTIVE day={day} start=20:30 end=23:00 timezone=Asia/Dubai")
+                    print(f"LEARNING_WINDOW_ACTIVE day={day} start=18:00 end=06:00 timezone=Asia/Dubai ai_council=True")
                     try:
                         candidate=await asyncio.wait_for(
                             _build_candidate(),
@@ -936,7 +987,7 @@ async def run_forever():
                 if candidate:
                     sent = await _send_request(candidate)
                     if sent:
-                        log_msg=(f"PRACTICE_WINDOW_ACTIVE day={day} start={START_HOUR:02d}:{START_MINUTE:02d} duration=2.5h "
+                        log_msg=(f"PRACTICE_WINDOW_ACTIVE day={day} start={START_HOUR:02d}:{START_MINUTE:02d} duration=12h "
                                  f"strategy={candidate['strategy']} pair={candidate['pair']} source={candidate['source']}")
                         print(log_msg)
                         print(f"LEARNING_PRACTICE_ROTATION cursor={_practice_cursor}")
