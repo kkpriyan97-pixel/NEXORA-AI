@@ -684,7 +684,7 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
         _daily["loss"] += 1
     else:
         _daily["tie"] += 1
-    _daily["day"] = str(_now_uae().date())
+    _daily["day"] = str(_learning_session_day(_now_uae()))
     db_ok=await record_practice_result(rec.get("strategy","UNKNOWN"),result,
                                  pair=rec.get("pair",""),confidence=rec.get("confidence",0),
                                  context=ctx,error_code=error_code,
