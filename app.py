@@ -2544,30 +2544,20 @@ async def cycle_loop():
         expected=str(candidate.get("direction") or "").upper()
         now=time.time()
 
-        # Keep the final quote fresh without turning a transient rotating-tick
-        # miss into a dead cycle. Pass 5 pre-pins the top candidates; this quick
-        # refresh is only a safety net for the exact asset being attempted.
-        if not has_fresh_live_price(p,now,LIVE_TICK_MAX_AGE):
-            try:
-                await pin_account_tick_pairs(
-                    [p],
-                    ttl=max(8.0,target-time.time()+6.0)
-                )
-            except Exception as e:
-                log.warning(
-                    "FINAL_LIVE_QUOTE_PIN_FAILED cycle=%s pair=%s type=%s message=%s",
-                    cycle_id,p,type(e).__name__,str(e)[:120]
-                )
-            refresh_deadline=min(target-0.25,time.time()+1.0)
-            while time.time()<refresh_deadline and not has_fresh_live_price(
-                p,time.time(),LIVE_TICK_MAX_AGE
-            ):
-                await asyncio.sleep(0.05)
-
-        if not has_fresh_live_price(p,time.time(),LIVE_TICK_MAX_AGE):
+        # Delivery boundary must be zero-network and bounded. Pass 5 is
+        # responsible for warming the strongest candidate quote slots before the
+        # boundary. Do NOT subscribe/unsubscribe or wait for broker responses here:
+        # one event-12/13 timeout can consume the entire signal second and suppress
+        # every remaining fallback candidate. A candidate without a genuinely fresh
+        # authenticated event-1 tick is skipped immediately.
+        quote_now=time.time()
+        quote_age=live_price_age(p,quote_now)
+        if not has_fresh_live_price(p,quote_now,LIVE_TICK_MAX_AGE):
             log.info(
-                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=quote_not_fresh next_asset=TRUE",
-                cycle_id,p
+                "FINAL_QUOTE_STALE_SKIP cycle=%s pair=%s quote_age=%s max_age=%.1f next_asset=TRUE",
+                cycle_id,p,
+                ("NONE" if quote_age is None else f"{quote_age:.3f}"),
+                float(LIVE_TICK_MAX_AGE)
             )
             return False
 
@@ -3190,8 +3180,15 @@ async def cycle_loop():
         # before reaching this point; any second pin here can consume the final
         # delivery milliseconds and make a valid cycle miss its own signal slot.
         if time.time()<=signal_at+0.20:
+            attempted_final=0
             for candidate in ranked_pool:
+                attempted_final+=1
                 try:
+                    log.info(
+                        "FINAL_SIGNAL_ATTEMPT cycle=%s rank=%s pair=%s confidence=%s direction=%s",
+                        cycle_id,attempted_final,candidate.get("pair"),
+                        candidate.get("confidence"),candidate.get("direction")
+                    )
                     sent=await send_cycle_signal(
                         candidate,target,signal_lead,cycle_id
                     )
