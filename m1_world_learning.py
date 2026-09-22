@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, quote_plus, urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
-from kimi_research import analyze as kimi_analyze, configured as kimi_configured
+from kimi_research import analyze as kimi_analyze, configured as kimi_configured, provider_configured as kimi_provider_configured, fallback_configured as kimi_fallback_configured
 
 log = logging.getLogger("candice.m1lab")
 
@@ -500,7 +500,7 @@ class M1WorldLab:
                 "daily_target":TARGET_DAILY,"model":self.db.forecast_stats(),"metrics":dict(self.metrics),
                 "languages_seen":dict(sorted(self.languages_seen.items(),key=lambda x:-x[1])[:24]),
                 "languages_queried":dict(sorted(self.metrics["languages_queried"].items(),key=lambda x:-x[1])[:24]),
-                "kimi_research":{"enabled":KIMI_RESEARCH_ENABLED,"configured":kimi_configured(),"model":os.getenv("KIMI_RESEARCH_MODEL","kimi-k2.6"),"calls":self.metrics["kimi_calls"],"success":self.metrics["kimi_success"],"items":self.metrics["kimi_items"],"errors":self.metrics["kimi_errors"]}}
+                "kimi_research":{"enabled":KIMI_RESEARCH_ENABLED,"configured":kimi_configured(),"kimi_provider":kimi_provider_configured(),"fallback_provider":kimi_fallback_configured(),"model":os.getenv("KIMI_RESEARCH_MODEL","kimi-k2.6"),"calls":self.metrics["kimi_calls"],"success":self.metrics["kimi_success"],"items":self.metrics["kimi_items"],"errors":self.metrics["kimi_errors"]}}
     def stage(self):
         stages=["M1 foundations + structure","candle geometry + next-candle behaviour","EMA/RSI/MACD/Stochastic",
                 "VWAP/ATR/volatility","breakout + retest","pullback + continuation","reversal + rejection",
@@ -659,7 +659,7 @@ class M1WorldLab:
         return saved
     async def run_once(self):
         self.metrics["runs"]+=1;start=time.time()
-        log.info("KIMI_RESEARCH_STATUS enabled=%s configured=%s model=%s interval_runs=%s",KIMI_RESEARCH_ENABLED,kimi_configured(),os.getenv("KIMI_RESEARCH_MODEL","kimi-k2.6"),KIMI_RESEARCH_INTERVAL_RUNS)
+        log.info("KIMI_RESEARCH_STATUS enabled=%s configured=%s kimi_provider=%s fallback_provider=%s model=%s interval_runs=%s",KIMI_RESEARCH_ENABLED,kimi_configured(),kimi_provider_configured(),kimi_fallback_configured(),os.getenv("KIMI_RESEARCH_MODEL","kimi-k2.6"),KIMI_RESEARCH_INTERVAL_RUNS)
         await self.discover()
         workers=[]
         while not self.queue.empty() and len(workers)<min(MAX_CONCURRENCY*3,FETCHES_PER_RUN):
