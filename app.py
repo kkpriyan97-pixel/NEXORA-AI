@@ -3904,9 +3904,9 @@ async def configure_telegram_webhook():
                        json=payload,timeout=8.0)
         r.raise_for_status()
         info=await h.get(f"https://api.telegram.org/bot{token}/getWebhookInfo",timeout=8.0)
-            try: data=info.json().get("result",{})
-            except Exception: data={}
-            log.info("TELEGRAM_WEBHOOK_READY url=%s pending=%s last_error=%s",data.get("url",""),data.get("pending_update_count",0),str(data.get("last_error_message",""))[:160])
+        try: data=info.json().get("result",{})
+        except Exception: data={}
+        log.info("TELEGRAM_WEBHOOK_READY url=%s pending=%s last_error=%s",data.get("url",""),data.get("pending_update_count",0),str(data.get("last_error_message",""))[:160])
     except Exception as e:
         log.warning("TELEGRAM_WEBHOOK_SETUP_FAILED %s",e)
 
