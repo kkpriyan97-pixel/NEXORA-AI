@@ -15,7 +15,10 @@ REVIEW_SEMAPHORE=asyncio.Semaphore(1)
 REVIEW_PROVIDER_COOLDOWN={}
 REVIEW_TRANSIENT_COOLDOWN_SECONDS=15.0
 REVIEW_429_COOLDOWN_SECONDS=900.0
-LIVE_EXTERNAL_AI_ENABLED=os.getenv("AI_EXTERNAL_LIVE_ENABLED","false").strip().lower()=="true"
+# Hard safety boundary: external LLM calls are never permitted in the live signal path.
+# This cannot be enabled by a runtime environment variable, so provider 429/timeout
+# responses cannot consume signal-cycle time.
+LIVE_EXTERNAL_AI_ENABLED=False
 BACKGROUND_EXTERNAL_ENABLED=os.getenv("AI_EXTERNAL_BACKGROUND_ENABLED","false").strip().lower()=="true"
 _logged_ready=set()
 
