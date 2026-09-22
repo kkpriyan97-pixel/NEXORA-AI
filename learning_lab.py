@@ -23,9 +23,10 @@ DURATION_SECONDS = max(60, min(300, int(os.getenv("LEARNING_PRACTICE_DURATION_SE
 AMOUNT = max(0.01, float(os.getenv("LEARNING_DEMO_AMOUNT","1")))
 WINDOW_MINUTES = 120
 START_HOUR = 19
+START_MINUTE = 30
 LOOP_SECONDS = max(30, min(120, int(os.getenv("LEARNING_PRACTICE_INTERVAL_SECONDS","60"))))
 MIN_CONFIDENCE = max(75, min(96, int(os.getenv("LEARNING_PRACTICE_MIN_CONFIDENCE","82"))))
-APPROVAL_TTL = 45.0
+REQUEST_TTL = 45.0
 _pending = {}
 _open = {}
 _cfg = {}
@@ -45,7 +46,7 @@ def _now_uae():
     return datetime.now(timezone.utc).astimezone(UAE)
 
 def _window_start(day):
-    return datetime(day.year,day.month,day.day,START_HOUR,0,0,tzinfo=UAE)
+    return datetime(day.year,day.month,day.day,START_HOUR,START_MINUTE,0,tzinfo=UAE)
 
 def practice_active(now=None):
     now=now or _now_uae()
@@ -217,7 +218,7 @@ async def _build_candidate():
 
 async def _send_request(candidate):
     token=os.urandom(12).hex()
-    expires=time.time()+APPROVAL_TTL
+    expires=time.time()+REQUEST_TTL
     rec=dict(candidate)
     rec.update(token=token,expires_at=expires,created_at=time.time(),status="PENDING")
     _pending[token]=rec
@@ -231,7 +232,7 @@ async def _send_request(candidate):
         f"🎯 Confidence → {rec['confidence']}%\n"
         f"💰 Reference → {rec.get('reference_price')}\n\n"
         "🤖 DEMO AUTO-TRADE WINDOW\n"
-        "Automatic DEMO practice only during 19:00–21:00 UAE."
+        "Automatic DEMO practice only during 19:30–21:30 UAE."
     )
     try:
         await _cfg["send_message"](text_msg, chat_id=_cfg.get("admin_id") or None)
@@ -398,7 +399,8 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
         _daily["loss"] += 1
     else:
         _daily["tie"] += 1
-    _daily["day"] = str(_now_uae().date())\n    await record_practice_result(rec.get("strategy","UNKNOWN"),result,
+    _daily["day"] = str(_now_uae().date())
+    await record_practice_result(rec.get("strategy","UNKNOWN"),result,
                                  pair=rec.get("pair",""),confidence=rec.get("confidence",0),
                                  context=ctx,error_code=error_code)
     _open.pop(str(rec.get("trade_id") or ""),None)
@@ -461,7 +463,7 @@ async def _send_daily_report(day):
     validated = await _validated_strategy_ids()
     await _cfg["send_message"](
         "🧠 CANDICE • LEARNING REPORT\n\n"
-        "🕖 Practice → 19:00–21:00 UAE\n"
+        "🕖 Practice → 19:30–21:30 UAE\n"
         f"📅 Day → {day}\n"
         f"🤖 DEMO AUTO-TRADE → {_daily['placed']} trades\n"
         f"🟢 WIN → {_daily['win']}\n"
@@ -471,7 +473,7 @@ async def _send_daily_report(day):
         f"⛔ Blocked → {_daily['blocked']}\n\n"
         f"✅ VALIDATED / OWN STRATEGY READY → {len(validated)}\n"
         f"🧩 Strategies → {', '.join(validated[:20]) if validated else 'None'}\n\n"
-        "🔴 21:00 → Learning Auto-Trade OFF\n"
+        "🔴 21:30 → Learning Auto-Trade OFF\n"
         "🔐 ADMIN ONLY",
         chat_id=_cfg.get("admin_id") or None
     )
@@ -486,7 +488,8 @@ async def run_forever():
             if _daily["day"] != str(day):
                 _daily.update({"day":str(day),"placed":0,"win":0,"loss":0,"tie":0,"blocked":0,"strategies":set()})
             global _last_report_day
-            if now.hour >= 21 and _last_report_day != day:
+            window_end=_window_start(day)+timedelta(minutes=WINDOW_MINUTES)
+            if now >= window_end and _last_report_day != day:
                 await _send_daily_report(day)
                 _last_report_day = day
             if practice_active(now) and not _pending and not _open:
@@ -510,7 +513,7 @@ async def run_forever():
             for token,rec in list(_pending.items()):
                 if time.time()>float(rec.get("expires_at",0)):
                     _pending.pop(token,None)
-                    await save_error(rec.get("strategy","UNKNOWN"),"HUMAN_APPROVAL_TIMEOUT",rec.get("technique") or {})
+                    await save_error(rec.get("strategy","UNKNOWN"),"DEMO_REQUEST_TIMEOUT",rec.get("technique") or {})
             await asyncio.sleep(LOOP_SECONDS)
         except asyncio.CancelledError:
             raise
