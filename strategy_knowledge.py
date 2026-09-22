@@ -231,7 +231,7 @@ async def record_practice_result(strategy_id: str, result: str, *, pair="", conf
         "technique_signature": sig,
         "last_pair": str(pair or ""),
         "last_confidence": int(confidence or 0),
-        "source": "DEMO_AUTO_PRACTICE_19_21_UAE",
+        "source": "DEMO_AUTO_PRACTICE_20_30_22_30_UAE",
     }
     import psycopg
     def write():
