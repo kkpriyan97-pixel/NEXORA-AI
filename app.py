@@ -1864,6 +1864,12 @@ def _final_delivery_precheck(candidate, reference_ts=None):
         bars2=_aggregate_closed_minutes(closed,2,reference)
         two=_candle_confirmation_2m(bars2,expected)
         one=_latest_closed_candle_direction(closed)
+        # Stable 1m/2m candle direction is a deterministic prerequisite for the
+        # exact final send gate; do not spend scarce tick slots on a mismatch.
+        if one.get("direction")!=expected:
+            return -700.0
+        if two.get("candle_direction")!=expected or not two.get("candle_ok"):
+            return -650.0
         final_mtf=build_multi_timeframe_context(pair,closed,reference,expected)
         frames=final_mtf.get("frames") or {}
         higher=[frames.get(f"{m}m",{}) for m in range(5,16)]
@@ -3299,10 +3305,24 @@ async def cycle_loop():
             and bool(x.get("deep_verified"))
         ]
         now_boundary=time.time()
+        boundary_scored=[]
+        for x in final_candidates:
+            y=x.copy()
+            y["final_delivery_precheck"]=_final_delivery_precheck(y,now_boundary)
+            boundary_scored.append(y)
+
+        # Rank only candidates that are currently compatible with the stable
+        # closed-candle portion of the exact send gate. send_cycle_signal() still
+        # remains the authoritative final check, including live tick freshness.
+        boundary_eligible=[
+            x for x in boundary_scored
+            if float(x.get("final_delivery_precheck") or -900.0)>=200.0
+        ]
         ranked_pool=sorted(
-            final_candidates,
+            boundary_eligible,
             key=lambda x:(
                 1 if has_fresh_live_price(x.get("pair"),now_boundary,LIVE_TICK_MAX_AGE) else 0,
+                float(x.get("final_delivery_precheck") or -900.0),
                 int(x.get("confidence") or 0),
                 float(x.get("strategy_margin") or 0),
                 float(x.get("direction_agreement") or 0),
