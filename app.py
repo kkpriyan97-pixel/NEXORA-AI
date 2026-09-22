@@ -3570,7 +3570,7 @@ async def market_worker():
         ACCOUNT_TICK_LAST_ATTEMPT.clear()
         client.register_callback(parameters.E_TICK_UPDATE,on_tick)
         # Demo-learning trade events are isolated from live signal/result state.
-        # They exist only for human-approved practice orders.
+        # They exist only for automatic DEMO learning practice orders.
         client.register_callback(parameters.E_TRADE_ACCEPTED,on_learning_trade_update)
         client.register_callback(parameters.E_TRADE_CLOSED,on_learning_trade_update)
         try:
