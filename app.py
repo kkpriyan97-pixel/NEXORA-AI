@@ -3927,6 +3927,12 @@ async def main():
         answer_callback=telegram_answer_callback,
         admin_id=ADMIN_TELEGRAM_ID,
     )
+    lp=learning_practice_status()
+    log.info(
+        "LEARNING_PRACTICE_CONFIG enabled=%s start=%s end=%s duration=%ss demo_only=%s approval_required=%s",
+        lp.get("enabled"),lp.get("start_uae"),lp.get("end_uae"),
+        lp.get("duration_seconds"),lp.get("demo_only"),lp.get("approval_required")
+    )
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
     await asyncio.gather(
