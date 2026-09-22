@@ -1,0 +1,30 @@
+name: NEXORA Python validation
+
+on:
+  push:
+    branches:
+      - main
+      - upgrade-ai-isolation-learning-v1
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  syntax-and-import:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Compile Python
+        run: python -m compileall -q .
+      - name: Import application
+        env:
+          M1_WORLD_LEARNING_ENABLED: "false"
+          LEARNING_PRACTICE_ENABLED: "false"
+          AI_EXTERNAL_LIVE_ENABLED: "false"
+          AI_EXTERNAL_BACKGROUND_ENABLED: "false"
+        run: python -c "import app; print('NEXORA_IMPORT_OK')"
