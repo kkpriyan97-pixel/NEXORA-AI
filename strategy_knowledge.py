@@ -157,10 +157,17 @@ async def refresh(force: bool = False):
                         SELECT strategy_id,samples,wins,losses,ties,recent,status,version,payload
                         FROM nexora_strategy_knowledge
                     """)
-                    return cur.fetchall()
+                    strategy_rows = cur.fetchall()
+                    cur.execute("""
+                        SELECT strategy_id,signature,samples,wins,losses
+                        FROM nexora_strategy_techniques
+                    """)
+                    technique_rows = cur.fetchall()
+                    return strategy_rows, technique_rows
         try:
-            rows = await asyncio.to_thread(read)
+            rows, technique_rows = await asyncio.to_thread(read)
             _rebuild_cache(rows)
+            reload_technique_cache(technique_rows)
             return True
         except Exception:
             return False
