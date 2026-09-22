@@ -2212,7 +2212,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     # Preliminary passes only seed the candidate pool. External AI verification
     # is reserved for the final/deep pass so provider rate limits and latency
     # cannot consume the five-pass timing window.
-    top=raw[:(8 if deep_analysis else 5)]
+    # Deep/final passes must not arbitrarily discard qualified account assets.\n    # refresh_candles() already evaluates the full authenticated account asset set;\n    # when deep_analysis is enabled, review every currently Brain-qualified setup\n    # so one failed candidate can fall through to the next valid asset.\n    # Preliminary passes remain intentionally narrow to protect the 3-minute timing window.\n    top=raw if deep_analysis else raw[:5]
     if require_live_price:
         log.info(            "LIVE_PRICE_SELECTION_MODE source=authenticated_event1 candidates=%d deep=%s",
             len(top),deep_analysis)
