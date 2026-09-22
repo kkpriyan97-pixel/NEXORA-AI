@@ -711,13 +711,7 @@ async def _build_candidate(forced_strategy=None,return_all=False):
                 f"strategy={candidate.get('strategy')} source={candidate.get('source')} "
                 f"council_consensus={consensus or 'NONE'}"
             )
-    if candidate:
-        print(
-            f"LEARNING_CANDIDATE_READY pair={candidate.get('pair')} "
-            f"direction={candidate.get('direction')} confidence={candidate.get('confidence')} "
-            f"strategy={candidate.get('strategy')} source={candidate.get('source')}"
-        )
-    else:
+    if not candidate:
         print(f"LEARNING_CANDIDATE_NONE batch={batch} cursor={offset} reason=no_qualified_candidate")
     return candidate
 
