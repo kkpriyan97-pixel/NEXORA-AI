@@ -130,25 +130,12 @@ async def _load_research_hints():
                 hints.append((strategy,str(mid)));seen.add(strategy)
     return hints
 
-async def _build_candidate():
-    provider=_cfg.get("snapshot_provider")
-    if not provider:
-        return None
-    try:
-        snap=provider()
-        assets=list(snap.get("assets") or [])
-        candles=copy.deepcopy(snap.get("candles") or {})
-        prices=copy.deepcopy(snap.get("prices") or {})
-    except Exception:
-        return None
-    hints=await _load_research_hints()
-    preferred=[x[0] for x in hints] or [
-        "TREND_FOLLOWING","MOMENTUM","BREAKOUT","PULLBACK",
-        "REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY"
-    ]
+def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit):
     candidates=[]
     now=time.time()
-    for asset in assets:
+    # Practice is deliberately capped and rotated so the learning laboratory
+    # cannot monopolize the CPU or starve the live signal scheduler.
+    for asset in list(assets)[:max(1,int(limit or 8))]:
         pair=str(asset.get("pair") or "")
         if not pair or not asset.get("signal_eligible",True):
             continue
@@ -197,6 +184,27 @@ async def _build_candidate():
         "technique":technique,
         "reason":str(brain.get("reason") or "")[:600],
     }
+
+async def _build_candidate():
+    provider=_cfg.get("snapshot_provider")
+    if not provider:
+        return None
+    try:
+        snap=provider()
+        assets=list(snap.get("assets") or [])
+        candles=copy.deepcopy(snap.get("candles") or {})
+        prices=copy.deepcopy(snap.get("prices") or {})
+    except Exception:
+        return None
+    hints=await _load_research_hints()
+    preferred=[x[0] for x in hints] or [
+        "TREND_FOLLOWING","MOMENTUM","BREAKOUT","PULLBACK",
+        "REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY"
+    ]
+    batch=int(os.getenv("LEARNING_ASSET_BATCH","8"))
+    return await asyncio.to_thread(
+        _analyze_snapshot_sync,assets,candles,prices,preferred,hints,batch
+    )
 
 async def _send_request(candidate):
     token=os.urandom(12).hex()
