@@ -3305,17 +3305,12 @@ async def cycle_loop():
             and bool(x.get("deep_verified"))
         ]
         now_boundary=time.time()
-        boundary_scored=[]
-        for x in final_candidates:
-            y=x.copy()
-            y["final_delivery_precheck"]=_final_delivery_precheck(y,now_boundary)
-            boundary_scored.append(y)
-
-        # Rank only candidates that are currently compatible with the stable
-        # closed-candle portion of the exact send gate. send_cycle_signal() still
-        # remains the authoritative final check, including live tick freshness.
+        # Pass 5 already calculated final_delivery_precheck ahead of this moment.
+        # Never recompute candle/timeframe evidence at the exact boundary: that
+        # work added ~300ms of latency in live verification. The final send routine
+        # remains the authoritative last-second hard gate.
         boundary_eligible=[
-            x for x in boundary_scored
+            x for x in final_candidates
             if float(x.get("final_delivery_precheck") or -900.0)>=200.0
         ]
         ranked_pool=sorted(
@@ -3336,12 +3331,16 @@ async def cycle_loop():
             cycle_id,len(candidate_pool),len(ranked_pool),int(signal_lead)
         )
 
-        # Do not perform awaited broker subscription work at the exact
-        # 30s signal boundary. Pass 5 already pre-pins its strongest candidates
-        # before reaching this point; any second pin here can consume the final
-        # delivery milliseconds and make a valid cycle miss its own signal slot.
+        # Do not perform broker subscription work at the exact boundary.
+        # Wake 80ms early, then yield until signal_at so the final ranking is
+        # already prepared without sacrificing the requested timing.
+        early_wake=max(0.0,signal_at-0.08-time.time())
+        if early_wake>0:
+            await asyncio.sleep(early_wake)
+        while time.time()<signal_at:
+            await asyncio.sleep(0)
         boundary_lag=time.time()-signal_at
-        if boundary_lag<=0.20:
+        if boundary_lag<=0.35:
             attempted_final=0
             for candidate in ranked_pool:
                 attempted_final+=1
@@ -3365,9 +3364,9 @@ async def cycle_loop():
                     break
 
         if not sent:
-            if boundary_lag>0.20:
+            if boundary_lag>0.35:
                 log.warning(
-                    "FINAL_BOUNDARY_MISSED cycle=%s lag_seconds=%.3f candidates=%s",
+                    "FINAL_BOUNDARY_MISSED cycle=%s lag_seconds=%.3f candidates=%s max_lag=0.35",
                     cycle_id,boundary_lag,len(ranked_pool)
                 )
             if ranked_pool:
