@@ -130,6 +130,19 @@ async def ensure_tables():
                     )
                 """)
                 cur.execute("""
+                    CREATE TABLE IF NOT EXISTS nexora_strategy_council (
+                        id BIGSERIAL PRIMARY KEY,
+                        session_id TEXT NOT NULL,
+                        strategy_id TEXT NOT NULL,
+                        votes INTEGER NOT NULL DEFAULT 0,
+                        agreement DOUBLE PRECISION NOT NULL DEFAULT 0,
+                        member_count INTEGER NOT NULL DEFAULT 0,
+                        status TEXT NOT NULL DEFAULT 'CANDIDATE',
+                        proposal JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                """)
+                cur.execute("""
                     DELETE FROM nexora_learning_practice_log
                     WHERE id NOT IN (
                         SELECT id FROM nexora_learning_practice_log
@@ -231,7 +244,7 @@ async def record_practice_result(strategy_id: str, result: str, *, pair="", conf
         "technique_signature": sig,
         "last_pair": str(pair or ""),
         "last_confidence": int(confidence or 0),
-        "source": "DEMO_AUTO_PRACTICE_20_30_22_30_UAE",
+        "source": "DEMO_AUTO_PRACTICE_18_00_06_00_UAE",
     }
     import psycopg
     def write():
@@ -315,6 +328,39 @@ async def record_practice_result(strategy_id: str, result: str, *, pair="", conf
     except Exception:
         return False
 
+async def record_strategy_council(session_id: str, council: dict | None = None):
+    """Persist overnight multi-AI council proposals as unvalidated candidates."""
+    if not DB_URL or not session_id:
+        return False
+    council=dict(council or {})
+    proposals=council.get("proposals") or []
+    member_count=int(council.get("member_count") or 0)
+    import psycopg
+    def write():
+        with psycopg.connect(DB_URL,connect_timeout=8) as db:
+            with db.cursor() as cur:
+                for proposal in proposals[:8]:
+                    if not isinstance(proposal,dict):
+                        continue
+                    strategy=str(proposal.get("strategy") or "").upper().strip()
+                    if not strategy:
+                        continue
+                    cur.execute("""
+                        INSERT INTO nexora_strategy_council(
+                            session_id,strategy_id,votes,agreement,member_count,status,proposal
+                        )
+                        VALUES(%s,%s,%s,%s,%s,'CANDIDATE',%s::jsonb)
+                    """,(
+                        str(session_id),strategy,int(proposal.get("votes") or 0),
+                        float(proposal.get("agreement") or 0.0),member_count,
+                        json.dumps(proposal,ensure_ascii=False,default=str)
+                    ))
+            db.commit()
+    try:
+        await asyncio.to_thread(write)
+        return True
+    except Exception:
+        return False
 async def save_error(strategy_id: str, error_code: str, context: dict | None = None):
     if not DB_URL or not strategy_id or not error_code:
         return False
