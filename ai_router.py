@@ -215,7 +215,8 @@ async def strategy_council_with_fallback(payload:dict[str,Any])->dict[str,Any]:
     providers=_providers()
     if not LEARNING_COUNCIL_ENABLED:
         log.info("AI_STRATEGY_COUNCIL_DISABLED reason=learning_council_off")
-    elif not BACKGROUND_EXTERNAL_ENABLED:
+        return {"members":[],"member_count":0,"proposals":[],"votes":{},"consensus_strategy":"","agreement":0.0}
+    if not BACKGROUND_EXTERNAL_ENABLED:
         log.info("AI_STRATEGY_COUNCIL_BACKGROUND_OVERRIDE enabled=True reason=learning_only_council")
 
         return {"members":[],"member_count":0,"proposals":[],"votes":{},"consensus_strategy":"","agreement":0.0}
