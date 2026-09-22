@@ -485,11 +485,11 @@ class M1WorldLab:
             try:self.started_at=datetime.fromisoformat(raw.replace("Z","+00:00")).astimezone(timezone.utc).timestamp()
             except Exception:self.started_at=time.time()
             self.db.set_meta("started_at",self.started_at)
+        self.metrics={"runs":0,"searches":0,"discovered":0,"fetched":0,"evidence":0,"errors":0,"deduped":0,"kimi_calls":0,"kimi_success":0,"kimi_items":0,"kimi_errors":0,"languages_queried":defaultdict(int)}
+        self.languages_seen=defaultdict(int)
         self.db.seed_research_seeds()
         for seed in RESEARCH_SEEDS:
             self.enqueue(seed["url"],seed["lang"],"seed")
-        self.metrics={"runs":0,"searches":0,"discovered":0,"fetched":0,"evidence":0,"errors":0,"deduped":0,"kimi_calls":0,"kimi_success":0,"kimi_items":0,"kimi_errors":0,"languages_queried":defaultdict(int)}
-        self.languages_seen=defaultdict(int)
     def day(self):
         return min(TARGET_DAYS,max(1,int(max(0,time.time()-self.started_at)//86400)+1))
     def status(self):
