@@ -771,8 +771,21 @@ async def _send_campaign_batch(candidates):
     strategy=str(CAMPAIGN_STATE.get("strategy") or "").upper()
     if not strategy or not isinstance(candidates,list):
         return 0
-    remaining=CAMPAIGN_MIN_TRADES-int(CAMPAIGN_STATE.get("sampled") or 0)
+    completed=int(CAMPAIGN_STATE.get("sampled") or 0)
+    active_reserved=sum(
+        1 for rec in _open.values()
+        if str(rec.get("strategy") or "").upper()==strategy
+    )
+    pending_reserved=sum(
+        1 for rec in _pending.values()
+        if str(rec.get("strategy") or "").upper()==strategy
+    )
+    remaining=CAMPAIGN_MIN_TRADES-completed-active_reserved-pending_reserved
     if remaining<=0:
+        print(
+            f"LEARNING_CAMPAIGN_WAITING_RESULTS strategy={strategy} "
+            f"completed={completed} open={active_reserved} pending={pending_reserved}"
+        )
         return 0
     unique=[]; seen=set()
     for item in candidates:
