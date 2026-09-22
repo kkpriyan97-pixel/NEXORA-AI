@@ -2937,12 +2937,13 @@ async def cycle_loop():
             try:
                 candidate=await asyncio.wait_for(
                     final_candidate(
-                        # Scan passes select from the full authenticated account/candle
-                        # universe. Live quote freshness is a delivery concern; it
-                        # must not collapse pass 5 to a single asset because the
-                        # broker rotates a small number of tick slots.
+                        # Pass 4 has enough time to perform external AI verification
+                        # and warm its cache. Pass 5 is the exact delivery pass, so
+                        # it must be cache-only; no provider timeout may consume the
+                        # final signal window.
                         require_live_price=False,
-                        deep_analysis=(pass_no==5),
+                        deep_analysis=(pass_no in (4,5)),
+                        use_cached_only=(pass_no==5),
                         return_ranked=(pass_no==5)
                     ),
                     timeout=max(1.0,remaining-0.50)
@@ -3160,6 +3161,21 @@ async def cycle_loop():
             "PREFETCH_POOL_READY cycle=%s candidates=%d final_pass_candidates=%d signal_lead=%ss",
             cycle_id,len(candidate_pool),len(ranked_pool),int(signal_lead)
         )
+
+        # Warm several final candidates before the exact boundary. The broker
+        # rotates a small number of live-tick slots, so one stale top quote must
+        # not turn the entire cycle into a no-signal result.
+        if ranked_pool:
+            try:
+                await pin_account_tick_pairs(
+                    [x.get("pair") for x in ranked_pool[:4] if x.get("pair")],
+                    ttl=max(8.0,target-time.time()+6.0)
+                )
+            except Exception as e:
+                log.warning(
+                    "FINAL_POOL_QUOTE_PIN_FAILED cycle=%s type=%s message=%s",
+                    cycle_id,type(e).__name__,str(e)[:120]
+                )
 
         if time.time()<=signal_at+0.20:
             for candidate in ranked_pool:
