@@ -1112,8 +1112,13 @@ async def on_asset_update(message):
         current[p]=merged
         updated+=1
     if updated:
-        STATE["assets"]=list(current.values())
-        STATE["feed_source"]="authenticated_websocket:event_183"
+        # Asset event updates are intentionally ignored as a universe change.
+        # The fixed 104-asset catalog remains authoritative.
+        log.info(
+            "ACCOUNT_ASSET_FEED_UPDATE_IGNORED source=authenticated_event_183 "
+            "reason=static_user_pdf_104_assets visible=%d",
+            len(STATE["assets"])
+        )
     log.info(
         "ACCOUNT_ASSET_FEED_UPDATE source=authenticated_websocket:event_183 updated=%d ignored_unknown=%d visible=%d",
         updated,ignored,len(STATE["assets"])
@@ -2007,10 +2012,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     if not CLIENT or STATE.get("account_group") != "demo" or not STATE.get("account_id"):
         log.info("BRAIN_ACCOUNT_GATE blocked=account_not_ready")
         return None
-    if STATE.get("feed_source") not in {
-        "authenticated_websocket:event_182",
-        "authenticated_websocket:event_183",
-    }:
+    if STATE.get("feed_source") != "static_user_pdf:104_assets+authenticated_event1":
         log.info("BRAIN_ACCOUNT_GATE blocked=non_account_feed source=%s",
                  STATE.get("feed_source"))
         return None
@@ -2754,10 +2756,7 @@ async def cycle_loop():
             and getattr(CLIENT.connection,"is_connected",False)
             and STATE.get("account_group")=="demo"
             and STATE.get("account_id")
-            and STATE.get("feed_source") in {
-                "authenticated_websocket:event_182",
-                "authenticated_websocket:event_183",
-            }
+            and STATE.get("feed_source") == "static_user_pdf:104_assets+authenticated_event1"
             and len(STATE.get("assets") or [])>0
         )
 
@@ -2890,10 +2889,7 @@ async def cycle_loop():
                             and getattr(CLIENT.connection,"is_connected",False)
                             and STATE.get("account_group")=="demo"
                             and STATE.get("account_id")
-                            and STATE.get("feed_source") in {
-                                "authenticated_websocket:event_182",
-                                "authenticated_websocket:event_183",
-                            }
+                            and STATE.get("feed_source") == "static_user_pdf:104_assets+authenticated_event1"
                             and len(STATE.get("assets") or [])>0
                         )
                         if account_ready:
