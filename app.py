@@ -2722,9 +2722,11 @@ async def cycle_loop():
     #     the scheduler, so one completed signal cannot stop the next cycle.
     # The Brain/AI strategy itself is unchanged; only the scheduling cadence
     # and the requested expiry are changed for DEMO analysis.
-    SIGNAL_INTERVAL=180.0
+    # Day signal session: every 2m30s, with the Telegram alert exactly 30s
+    # before the 1-minute DEMO expiry boundary.
+    SIGNAL_INTERVAL=150.0
     SIGNAL_LEADS=(30.0,30.0)
-    SCAN_OFFSETS=(150.0,125.0,100.0,75.0,55.0)
+    SCAN_OFFSETS=(120.0,95.0,70.0,45.0,30.0)
 
     async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
         if not signal_session_active(target):
@@ -3040,7 +3042,7 @@ async def cycle_loop():
         # Root-cause guard: cycle analysis must never start with an empty or
         # unauthenticated account snapshot. A restart immediately before the
         # signal boundary cannot complete five passes safely, so skip that
-        # boundary and preserve the next full 3-minute window.
+        # boundary and preserve the next full 2m30s window.
         signal_in=max(0.0,signal_at-time.time())
         log.info(
             "CYCLE_ACCOUNT_READY_GUARD cycle=%s account_ready=%s assets=%d "
@@ -3661,7 +3663,7 @@ async def cycle_loop():
         )
         await asyncio.sleep(0)
 
-        # Immediately iterate to the next 3-minute target. Because the first
+        # Immediately iterate to the next 2m30s target. Because the first
         # scan of the next target is 2m30s before that target, the next cycle
         # is queued as soon as the current signal boundary is released.
 
