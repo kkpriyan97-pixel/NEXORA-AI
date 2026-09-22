@@ -3309,12 +3309,21 @@ async def cycle_loop():
         # Never recompute candle/timeframe evidence at the exact boundary: that
         # work added ~300ms of latency in live verification. The final send routine
         # remains the authoritative last-second hard gate.
-        boundary_eligible=[
-            x for x in final_candidates
-            if float(x.get("final_delivery_precheck") or -900.0)>=200.0
-        ]
+        # The cached precheck is ranking evidence only, never a hard
+        # eligibility gate. The authoritative send_cycle_signal() gate below
+        # rechecks fresh price, closed 30s/1m/2m candles, higher timeframes,
+        # confidence, deadline, and deep qualification. A cached precheck can
+        # become conservative/stale while the live candidate remains valid;
+        # filtering it here was able to suppress an entire cycle before the
+        # authoritative gate had a chance to try the fallback candidate.
+        boundary_pool=list(final_candidates)
+        log.info(
+            "FINAL_BOUNDARY_POOL cycle=%s candidates=%d precheck_eligible=%d",
+            cycle_id,len(boundary_pool),
+            sum(1 for x in boundary_pool if float(x.get("final_delivery_precheck") or -900.0)>=200.0)
+        )
         ranked_pool=sorted(
-            boundary_eligible,
+            boundary_pool,
             key=lambda x:(
                 1 if has_fresh_live_price(x.get("pair"),now_boundary,LIVE_TICK_MAX_AGE) else 0,
                 float(x.get("final_delivery_precheck") or -900.0),
