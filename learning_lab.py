@@ -31,7 +31,7 @@ LEARNING_SNAPSHOT_TIMEOUT_SECONDS = max(3, min(15, int(os.getenv("LEARNING_SNAPS
 MIN_CONFIDENCE = max(75, min(96, int(os.getenv("LEARNING_PRACTICE_MIN_CONFIDENCE","82"))))
 REQUEST_TTL = 45.0
 RESULT_WATCH_POLL_SECONDS = max(2, min(15, int(os.getenv("LEARNING_RESULT_WATCH_POLL_SECONDS","5"))))
-RESULT_WATCH_EXTRA_SECONDS = max(20, min(180, int(os.getenv("LEARNING_RESULT_WATCH_EXTRA_SECONDS","60"))))
+RESULT_WATCH_EXTRA_SECONDS = max(60, min(300, int(os.getenv("LEARNING_RESULT_WATCH_EXTRA_SECONDS","180"))))
 LEARNING_TRADE_RETENTION_HOURS = 48
 _pending = {}
 _open = {}
@@ -650,64 +650,122 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
     )
 
 async def _fallback_watch(rec):
+    """Resolve DEMO results only from a broker event or a fully closed M1 candle."""
     tid=str(rec.get("trade_id") or "")
-    if not tid:return
+    if not tid:
+        return
     expiry_ts=float(rec.get("entry_ts") or rec.get("placed_at") or time.time()) + DURATION_SECONDS
     deadline=expiry_ts + RESULT_WATCH_EXTRA_SECONDS
     provider=_cfg.get("snapshot_provider")
     attempts=0
-    while tid in _open and tid not in _finalized and time.time() < deadline:
+    pair=str(rec.get("pair") or "")
+
+    def _normalise_candles(raw):
+        out=[]
+        def walk(value):
+            if isinstance(value,dict):
+                if isinstance(value.get("candles"),list):
+                    for item in value["candles"]: walk(item)
+                elif isinstance(value.get("data"),list):
+                    for item in value["data"]: walk(item)
+                elif any(k in value for k in ("open","o","high","h","low","l","close","c")):
+                    out.append(value)
+            elif isinstance(value,list):
+                for item in value: walk(item)
+        walk(raw)
+        return out
+
+    async def _direct_candles(attempt):
+        client_provider=_cfg.get("client_provider")
+        client=client_provider() if client_provider else None
+        if not client:
+            print(f"LEARNING_RESULT_DIRECT_CANDLE_UNAVAILABLE pair={pair} attempt={attempt} reason=no_client")
+            return []
+        connection=getattr(client,"connection",None)
+        connected=bool(connection and getattr(connection,"is_connected",False))
+        if not connected:
+            recovered=False
+            # Recover the existing authenticated client/session only; no new
+            # credentials or login flow is created by the result watcher.
+            for owner,name in (
+                (client,"start"),(client,"reconnect"),
+                (connection,"reconnect"),(connection,"connect")
+            ):
+                fn=getattr(owner,name,None) if owner is not None else None
+                if not callable(fn):
+                    continue
+                try:
+                    value=fn()
+                    if hasattr(value,"__await__"):
+                        await asyncio.wait_for(value,timeout=5.0)
+                    recovered=True
+                    print(f"LEARNING_RESULT_CONNECTION_RECOVERY pair={pair} attempt={attempt} method={name}")
+                    break
+                except Exception as exc:
+                    print(
+                        f"LEARNING_RESULT_CONNECTION_RECOVERY_FAILED pair={pair} "
+                        f"attempt={attempt} method={name} type={type(exc).__name__} "
+                        f"message={str(exc)[:100]}"
+                    )
+            connection=getattr(client,"connection",None)
+            connected=bool(connection and getattr(connection,"is_connected",False))
+            if not connected and not recovered:
+                print(f"LEARNING_RESULT_DIRECT_CANDLE_UNAVAILABLE pair={pair} attempt={attempt} reason=broker_disconnected")
+                return []
+        try:
+            fresh=await asyncio.wait_for(
+                client.market.get_candles(pair,size=60,count=5),timeout=4.0
+            )
+            candles=_normalise_candles(fresh)
+            print(
+                f"LEARNING_RESULT_DIRECT_CANDLE_FETCH pair={pair} count={len(candles)} "
+                f"attempt={attempt} connected={connected}"
+            )
+            return candles
+        except Exception as exc:
+            print(
+                f"LEARNING_RESULT_DIRECT_CANDLE_RETRY pair={pair} attempt={attempt} "
+                f"type={type(exc).__name__} message={str(exc)[:120]}"
+            )
+            return []
+
+    def _eligible(items,current_time):
+        eligible=[]
+        for c in items:
+            try:
+                t=float(c.get("time",c.get("t")))
+                if t>20_000_000_000: t/=1000
+                close_ts=t+60.0
+                # Never classify a forming candle or an old candle. The close
+                # must have completed and correspond to this trade's expiry.
+                if close_ts<=current_time and close_ts>=expiry_ts-2.0:
+                    eligible.append((close_ts,float(c.get("close",c.get("c")))))
+            except Exception:
+                continue
+        return eligible
+
+    while tid in _open and tid not in _finalized and time.time()<deadline:
         attempts+=1
         try:
             now=time.time()
-            if now < expiry_ts:
-                await asyncio.sleep(min(RESULT_WATCH_POLL_SECONDS, max(1.0,expiry_ts-now)))
+            if now<expiry_ts:
+                await asyncio.sleep(min(RESULT_WATCH_POLL_SECONDS,max(1.0,expiry_ts-now)))
                 continue
+
             snap=provider() if provider else {}
             candles=(snap.get("candles") or {}) if isinstance(snap,dict) else {}
-            pair=str(rec.get("pair") or "")
-            pair_candles=list(candles.get(pair,[]) or [])
-            # The learning snapshot is read-only and can briefly lag behind the
-            # broker candle feed. After expiry, fetch a small closed-candle window
-            # directly from the authenticated DEMO market session before giving up.
-            if not pair_candles:
-                client_provider=_cfg.get("client_provider")
-                client=client_provider() if client_provider else None
-                if client and getattr(client,"connection",None) and getattr(client.connection,"is_connected",False):
-                    try:
-                        fresh=await asyncio.wait_for(
-                            client.market.get_candles(pair,size=60,count=5),
-                            timeout=3.0,
-                        )
-                        if isinstance(fresh,list):
-                            pair_candles=[]
-                            for item in fresh:
-                                if isinstance(item,dict) and isinstance(item.get("candles"),list):
-                                    pair_candles.extend(x for x in item["candles"] if isinstance(x,dict))
-                                elif isinstance(item,dict) and any(k in item for k in ("open","o","high","h","low","l","close","c")):
-                                    pair_candles.append(item)
-                            print(
-                                f"LEARNING_RESULT_DIRECT_CANDLE_FETCH pair={pair} "
-                                f"count={len(pair_candles)} attempt={attempts}"
-                            )
-                    except Exception as exc:
-                        print(
-                            f"LEARNING_RESULT_DIRECT_CANDLE_RETRY pair={pair} "
-                            f"attempt={attempts} type={type(exc).__name__} "
-                            f"message={str(exc)[:120]}"
-                        )
-            eligible=[]
-            for c in pair_candles:
-                if not isinstance(c,dict):continue
-                try:
-                    t=float(c.get("time",c.get("t")))
-                    if t>20_000_000_000:t/=1000
-                    close_ts=t+60.0
-                    if close_ts <= now and close_ts >= expiry_ts-2.0:
-                        exitp=float(c.get("close",c.get("c")))
-                        eligible.append((close_ts,exitp))
-                except Exception:
-                    continue
+            pair_candles=_normalise_candles(candles.get(pair,[]) if isinstance(candles,dict) else [])
+            eligible=_eligible(pair_candles,now)
+
+            # Critical fix: direct broker fetch is attempted whenever the local
+            # snapshot has NO ELIGIBLE CLOSED EXPIRY CANDLE, not only when it is
+            # completely empty. A stale non-empty snapshot caused the previous
+            # timeout path to skip the direct fetch.
+            if not eligible:
+                direct=await _direct_candles(attempts)
+                if direct:
+                    eligible=_eligible(direct,now)
+
             if eligible:
                 eligible.sort(key=lambda x:x[0])
                 close_ts,exitp=eligible[0]
@@ -718,30 +776,45 @@ async def _fallback_watch(rec):
                     result="WIN" if str(rec.get("direction")).upper()=="DOWN" else "LOSS"
                 else:
                     result="TIE"
-                print(f"LEARNING_RESULT_FALLBACK_CONFIRMED trade_id={tid} pair={pair} attempt={attempts} close_ts={close_ts:.3f} entry={entry} exit={exitp} result={result}")
+                print(
+                    f"LEARNING_RESULT_FALLBACK_CONFIRMED trade_id={tid} pair={pair} "
+                    f"attempt={attempts} close_ts={close_ts:.3f} entry={entry} "
+                    f"exit={exitp} result={result} verification=closed-candle"
+                )
                 await _record_result(rec,result,"CLOSED_CANDLE_FALLBACK",exitp,None)
                 return
-            print(f"LEARNING_RESULT_WAIT trade_id={tid} pair={pair} attempt={attempts} next_retry={RESULT_WATCH_POLL_SECONDS}s")
+
+            print(
+                f"LEARNING_RESULT_WAIT trade_id={tid} pair={pair} attempt={attempts} "
+                f"reason=no_closed_expiry_candle next_retry={RESULT_WATCH_POLL_SECONDS}s"
+            )
         except Exception as exc:
-            print(f"LEARNING_RESULT_FALLBACK_RETRY trade_id={tid} pair={rec.get('pair')} attempt={attempts} type={type(exc).__name__} message={str(exc)[:120]}")
+            print(
+                f"LEARNING_RESULT_FALLBACK_RETRY trade_id={tid} pair={pair} "
+                f"attempt={attempts} type={type(exc).__name__} message={str(exc)[:120]}"
+            )
         await asyncio.sleep(RESULT_WATCH_POLL_SECONDS)
 
     if tid in _open and tid not in _finalized:
-        # Never leave the practice gate locked forever. A missing broker close event
-        # or missing candle is a result-availability failure, not a WIN/LOSS.
-        # Release the trade slot so the next DEMO learning candidate can run.
+        # A timeout is a data-availability failure, never a guessed WIN/LOSS.
+        # Release the active practice slot so the learning loop continues.
         _open.pop(tid,None)
-        try:
-            await save_error(rec.get("strategy","UNKNOWN"),"RESULT_UNAVAILABLE_TIMEOUT",rec.get("technique") or {})
-        finally:
-            print(f"LEARNING_RESULT_SLOT_RELEASED trade_id={tid} pair={rec.get('pair')} reason=RESULT_UNAVAILABLE_TIMEOUT")
-            await _cfg["send_message"](
-                "⚠️ DEMO RESULT WATCH TIMEOUT\n\n"
-                f"📊 {rec.get('display_name') or rec.get('pair')}\n"
-                "🔓 Next demo practice slot unlocked\n"
-                "📦 Result was not classified as WIN/LOSS.",
-                chat_id=_cfg.get("admin_id") or None
-            )
+        await save_error(
+            rec.get("strategy","UNKNOWN"),
+            "RESULT_UNAVAILABLE_TIMEOUT",
+            rec.get("technique") or {}
+        )
+        print(
+            f"LEARNING_RESULT_SLOT_RELEASED trade_id={tid} pair={pair} "
+            f"reason=RESULT_UNAVAILABLE_TIMEOUT attempts={attempts}"
+        )
+        await _cfg["send_message"](
+            "⚠️ DEMO RESULT WATCH TIMEOUT\\n\\n"
+            f"📊 {rec.get('display_name') or pair}\\n"
+            "🔓 Next demo practice slot unlocked\\n"
+            "📦 Result was not classified as WIN/LOSS.",
+            chat_id=_cfg.get("admin_id") or None
+        )
 
 
 async def _strategy_validation_snapshot(strategy_id):
@@ -799,7 +872,7 @@ async def _send_daily_report(day):
         f"⛔ Blocked → {_daily['blocked']}\n\n"
         f"✅ VALIDATED / OWN STRATEGY READY → {len(validated)}\n"
         f"🧩 Strategies → {', '.join(validated[:20]) if validated else 'None'}\n\n"
-        "🔴 22:30 → Learning Auto-Trade OFF\n"
+        "🔴 23:00 → Learning Auto-Trade OFF\n"
         "🔐 ADMIN ONLY",
         chat_id=_cfg.get("admin_id") or None
     )
@@ -833,7 +906,7 @@ async def run_forever():
                     )
                 if time.time()-last_scan >= LOOP_SECONDS:
                     last_scan=time.time()
-                    print(f"LEARNING_WINDOW_ACTIVE day={day} start=20:30 end=22:30 timezone=Asia/Dubai")
+                    print(f"LEARNING_WINDOW_ACTIVE day={day} start=20:30 end=23:00 timezone=Asia/Dubai")
                     try:
                         candidate=await asyncio.wait_for(
                             _build_candidate(),
