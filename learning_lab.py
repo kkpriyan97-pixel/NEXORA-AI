@@ -15,7 +15,10 @@ from zoneinfo import ZoneInfo
 
 from candice_brain import analyze_asset
 from ai_router import strategy_council_with_fallback
-from strategy_knowledge import record_practice_result, record_strategy_council, save_error
+from strategy_knowledge import (
+    record_practice_result, record_strategy_council, save_error,
+    promote_campaign_strategy,
+)
 
 DB_URL = os.getenv("DATABASE_URL","").strip()
 UAE = ZoneInfo("Asia/Dubai")
@@ -109,6 +112,211 @@ def status():
         "pending":len(_pending),
         "open_trades":len(_open),
     }
+
+async def ensure_campaign_table():
+    if not DB_URL:
+        return False
+    try:
+        import psycopg
+        def init():
+            with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS nexora_strategy_campaign (
+                            session_id TEXT NOT NULL,
+                            strategy_id TEXT NOT NULL,
+                            strategy_index INTEGER NOT NULL DEFAULT 0,
+                            samples INTEGER NOT NULL DEFAULT 0,
+                            wins INTEGER NOT NULL DEFAULT 0,
+                            losses INTEGER NOT NULL DEFAULT 0,
+                            ties INTEGER NOT NULL DEFAULT 0,
+                            status TEXT NOT NULL DEFAULT 'ACTIVE',
+                            started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            completed_at TIMESTAMPTZ,
+                            PRIMARY KEY(session_id,strategy_id)
+                        )
+                    """)
+                db.commit()
+        await asyncio.to_thread(init)
+        return True
+    except Exception as e:
+        print(f"LEARNING_CAMPAIGN_TABLE_FAILED type={type(e).__name__} message={str(e)[:140]}")
+        return False
+
+async def _save_campaign():
+    if not DB_URL or not CAMPAIGN_STATE.get("session_id") or not CAMPAIGN_STATE.get("strategy"):
+        return False
+    try:
+        import psycopg
+        s=CAMPAIGN_STATE
+        def write():
+            with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO nexora_strategy_campaign(
+                            session_id,strategy_id,strategy_index,samples,wins,losses,ties,status,started_at,completed_at
+                        ) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,
+                                 COALESCE(to_timestamp(%s),NOW()),
+                                 CASE WHEN %s IN ('VALIDATED','REJECTED') THEN NOW() ELSE NULL END)
+                        ON CONFLICT(session_id,strategy_id) DO UPDATE SET
+                            strategy_index=EXCLUDED.strategy_index,
+                            samples=EXCLUDED.samples,wins=EXCLUDED.wins,
+                            losses=EXCLUDED.losses,ties=EXCLUDED.ties,
+                            status=EXCLUDED.status,updated_at=NOW(),
+                            completed_at=EXCLUDED.completed_at
+                    """,(
+                        str(s["session_id"]),str(s["strategy"]),int(s.get("strategy_index") or 0),
+                        int(s.get("sampled") or 0),int(s.get("wins") or 0),
+                        int(s.get("losses") or 0),int(s.get("ties") or 0),
+                        str(s.get("status") or "ACTIVE"),float(s.get("started_at") or time.time()),
+                        str(s.get("status") or "ACTIVE")
+                    ))
+                db.commit()
+        await asyncio.to_thread(write)
+        return True
+    except Exception as e:
+        print(f"LEARNING_CAMPAIGN_SAVE_FAILED strategy={CAMPAIGN_STATE.get('strategy')} type={type(e).__name__} message={str(e)[:120]}")
+        return False
+
+async def _load_campaign(session_id):
+    if not DB_URL:
+        return None
+    try:
+        import psycopg
+        def read():
+            with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        SELECT strategy_id,strategy_index,samples,wins,losses,ties,status,
+                               EXTRACT(EPOCH FROM started_at)
+                        FROM nexora_strategy_campaign
+                        WHERE session_id=%s
+                        ORDER BY strategy_index
+                    """,(str(session_id),))
+                    return cur.fetchall()
+        rows=await asyncio.to_thread(read)
+        if not rows:
+            return None
+        for row in rows:
+            strategy,idx,samples,wins,losses,ties,status,started=row
+            if str(status)=="ACTIVE":
+                CAMPAIGN_STATE.update({
+                    "session_id":str(session_id),"strategy":str(strategy),
+                    "strategy_index":int(idx),"sampled":int(samples or 0),
+                    "wins":int(wins or 0),"losses":int(losses or 0),
+                    "ties":int(ties or 0),"status":"ACTIVE",
+                    "started_at":float(started or time.time()),
+                })
+                return CAMPAIGN_STATE
+        return None
+    except Exception:
+        return None
+
+async def _initialize_campaign(session_id):
+    if CAMPAIGN_STATE.get("session_id")==session_id and CAMPAIGN_STATE.get("strategy"):
+        return CAMPAIGN_STATE
+    loaded=await _load_campaign(session_id)
+    if loaded:
+        return loaded
+
+    # Ask the council once at session start. Its result determines the first
+    # fixed strategy, but the actual 100-trade campaign is evaluated independently.
+    strategy=""
+    votes={}
+    try:
+        seed=await asyncio.wait_for(_build_candidate(),timeout=LEARNING_SCAN_TIMEOUT_SECONDS)
+        if seed:
+            strategy=str(seed.get("council_consensus") or seed.get("strategy") or "").upper()
+            votes=dict(seed.get("council_votes") or {})
+    except Exception:
+        pass
+    core=[
+        "TREND_FOLLOWING","MOMENTUM","BREAKOUT","PULLBACK",
+        "REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY"
+    ]
+    ordered=[]
+    if strategy: ordered.append(strategy)
+    for s,_ in sorted(votes.items(),key=lambda kv:(-int(kv[1] or 0),kv[0])):
+        s=str(s).upper()
+        if s in core and s not in ordered: ordered.append(s)
+    for s in core:
+        if s not in ordered: ordered.append(s)
+
+    CAMPAIGN_STATE.update({
+        "session_id":str(session_id),"strategy":ordered[0],
+        "strategy_index":0,"sampled":0,"wins":0,"losses":0,"ties":0,
+        "status":"ACTIVE","strategies":ordered,"started_at":time.time(),
+    })
+    await _save_campaign()
+    print(
+        f"LEARNING_STRATEGY_CAMPAIGN_START session={session_id} "
+        f"strategy={ordered[0]} index=0 target_trades=100 min_win_rate=85% target_win_rate=90%"
+    )
+    return CAMPAIGN_STATE
+
+async def _advance_campaign_if_complete():
+    s=CAMPAIGN_STATE
+    if s.get("status")!="ACTIVE" or int(s.get("sampled") or 0)<CAMPAIGN_MIN_TRADES:
+        return False
+    decided=max(1,int(s.get("wins") or 0)+int(s.get("losses") or 0))
+    rate=float(s.get("wins") or 0)/decided
+    strategy=str(s.get("strategy") or "").upper()
+    if rate>=CAMPAIGN_MIN_WIN_RATE:
+        s["status"]="VALIDATED"
+        promoted=await promote_campaign_strategy(strategy,s["sampled"],s["wins"],s["losses"])
+        print(
+            f"LEARNING_STRATEGY_CAMPAIGN_COMPLETE strategy={strategy} samples={s['sampled']} "
+            f"wins={s['wins']} losses={s['losses']} ties={s['ties']} "
+            f"win_rate={rate*100:.2f}% gate=85% promoted={promoted}"
+        )
+    else:
+        s["status"]="REJECTED"
+        print(
+            f"LEARNING_STRATEGY_CAMPAIGN_REJECTED strategy={strategy} samples={s['sampled']} "
+            f"wins={s['wins']} losses={s['losses']} ties={s['ties']} win_rate={rate*100:.2f}% gate=85%"
+        )
+    await _save_campaign()
+    # The next strategy starts only after the previous 100 completed results.
+    strategies=list(s.get("strategies") or [])
+    next_idx=int(s.get("strategy_index") or 0)+1
+    if next_idx>=len(strategies):
+        # Research council will be refreshed on the next session.
+        print(f"LEARNING_STRATEGY_QUEUE_EXHAUSTED session={s.get('session_id')}")
+        return True
+    next_strategy=str(strategies[next_idx]).upper()
+    s.update({
+        "strategy":next_strategy,"strategy_index":next_idx,
+        "sampled":0,"wins":0,"losses":0,"ties":0,
+        "status":"ACTIVE","started_at":time.time(),
+    })
+    await _save_campaign()
+    print(
+        f"LEARNING_STRATEGY_NEXT strategy={next_strategy} index={next_idx} "
+        f"target_trades=100 min_win_rate=85% target_win_rate=90%"
+    )
+    return True
+
+async def _campaign_result(result, strategy):
+    s=CAMPAIGN_STATE
+    if s.get("status")!="ACTIVE":
+        return
+    if str(strategy or "").upper()!=str(s.get("strategy") or "").upper():
+        return
+    if int(s.get("sampled") or 0)>=CAMPAIGN_MIN_TRADES:
+        return
+    s["sampled"]=int(s.get("sampled") or 0)+1
+    if result=="WIN": s["wins"]=int(s.get("wins") or 0)+1
+    elif result=="LOSS": s["losses"]=int(s.get("losses") or 0)+1
+    else: s["ties"]=int(s.get("ties") or 0)+1
+    print(
+        f"LEARNING_STRATEGY_PROGRESS strategy={s['strategy']} "
+        f"sample={s['sampled']}/100 win={s['wins']} loss={s['losses']} tie={s['ties']} "
+        f"rate={(100*s['wins']/max(1,s['wins']+s['losses'])):.2f}%"
+    )
+    await _save_campaign()
+    if s["sampled"]>=CAMPAIGN_MIN_TRADES:
+        await _advance_campaign_if_complete()
 
 async def ensure_learning_trade_state_table():
     if not DB_URL:
