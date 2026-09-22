@@ -25,6 +25,9 @@ WINDOW_MINUTES = 120
 START_HOUR = 20
 START_MINUTE = 30
 LOOP_SECONDS = max(30, min(120, int(os.getenv("LEARNING_PRACTICE_INTERVAL_SECONDS","60"))))
+LEARNING_SCAN_TIMEOUT_SECONDS = max(10, min(45, int(os.getenv("LEARNING_SCAN_TIMEOUT_SECONDS","25"))))
+LEARNING_RESEARCH_HINT_TIMEOUT_SECONDS = max(2, min(10, int(os.getenv("LEARNING_RESEARCH_HINT_TIMEOUT_SECONDS","5"))))
+LEARNING_SNAPSHOT_TIMEOUT_SECONDS = max(3, min(15, int(os.getenv("LEARNING_SNAPSHOT_TIMEOUT_SECONDS","8"))))
 MIN_CONFIDENCE = max(75, min(96, int(os.getenv("LEARNING_PRACTICE_MIN_CONFIDENCE","82"))))
 REQUEST_TTL = 45.0
 RESULT_WATCH_POLL_SECONDS = max(2, min(15, int(os.getenv("LEARNING_RESULT_WATCH_POLL_SECONDS","5"))))
@@ -342,13 +345,30 @@ async def _build_candidate():
     if not provider:
         return None
     try:
-        snap=provider()
+        snap=await asyncio.wait_for(
+            asyncio.to_thread(provider),
+            timeout=LEARNING_SNAPSHOT_TIMEOUT_SECONDS,
+        )
         assets=list(snap.get("assets") or [])
         candles=copy.deepcopy(snap.get("candles") or {})
         prices=copy.deepcopy(snap.get("prices") or {})
-    except Exception:
+    except asyncio.TimeoutError:
+        print(f"LEARNING_SNAPSHOT_TIMEOUT seconds={LEARNING_SNAPSHOT_TIMEOUT_SECONDS}")
         return None
-    hints=await _load_research_hints()
+    except Exception as e:
+        print(f"LEARNING_SNAPSHOT_FAILED type={type(e).__name__} message={str(e)[:120]}")
+        return None
+    try:
+        hints=await asyncio.wait_for(
+            _load_research_hints(),
+            timeout=LEARNING_RESEARCH_HINT_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        hints=[]
+        print(f"LEARNING_RESEARCH_HINTS_TIMEOUT seconds={LEARNING_RESEARCH_HINT_TIMEOUT_SECONDS} fallback=core_strategy_families")
+    except Exception as e:
+        hints=[]
+        print(f"LEARNING_RESEARCH_HINTS_FAILED type={type(e).__name__} message={str(e)[:120]} fallback=core_strategy_families")
     preferred=[x[0] for x in hints] or [
         "TREND_FOLLOWING","MOMENTUM","BREAKOUT","PULLBACK",
         "REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY"
@@ -759,6 +779,9 @@ async def run_forever():
         return
     await ensure_learning_trade_state_table()
     await restore_open_trades()
+    print("LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=20:30-22:30 timezone=Asia/Dubai demo_only=True")
+    last_heartbeat=0.0
+    last_scan=0.0
     while True:
         try:
             now=_now_uae()
@@ -771,8 +794,29 @@ async def run_forever():
                 await _send_daily_report(day)
                 _last_report_day = day
             if practice_active(now) and not _pending and not _open:
-                print(f"LEARNING_WINDOW_ACTIVE day={day} start=20:30 end=22:30 timezone=Asia/Dubai")
-                candidate=await _build_candidate()
+                if time.time()-last_heartbeat >= 60:
+                    last_heartbeat=time.time()
+                    print(
+                        f"LEARNING_HEARTBEAT day={day} active=True pending={len(_pending)} "
+                        f"open={len(_open)} placed={_daily['placed']} win={_daily['win']} "
+                        f"loss={_daily['loss']} tie={_daily['tie']} blocked={_daily['blocked']}"
+                    )
+                if time.time()-last_scan >= LOOP_SECONDS:
+                    last_scan=time.time()
+                    print(f"LEARNING_WINDOW_ACTIVE day={day} start=20:30 end=22:30 timezone=Asia/Dubai")
+                    try:
+                        candidate=await asyncio.wait_for(
+                            _build_candidate(),
+                            timeout=LEARNING_SCAN_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        candidate=None
+                        print(f"LEARNING_SCAN_TIMEOUT seconds={LEARNING_SCAN_TIMEOUT_SECONDS} fallback=next_scan")
+                    except Exception as e:
+                        candidate=None
+                        print(f"LEARNING_SCAN_FAILED type={type(e).__name__} message={str(e)[:160]} fallback=next_scan")
+                else:
+                    candidate=None
                 if candidate:
                     sent = await _send_request(candidate)
                     if sent:
@@ -795,7 +839,7 @@ async def run_forever():
                 if time.time()>float(rec.get("expires_at",0)):
                     _pending.pop(token,None)
                     await save_error(rec.get("strategy","UNKNOWN"),"DEMO_REQUEST_TIMEOUT",rec.get("technique") or {})
-            await asyncio.sleep(LOOP_SECONDS)
+            await asyncio.sleep(min(LOOP_SECONDS,30))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
