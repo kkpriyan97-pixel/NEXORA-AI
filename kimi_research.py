@@ -2,16 +2,25 @@
 from __future__ import annotations
 import json, os, re, logging
 import httpx
+import time
 
 log=logging.getLogger("candice.m1lab")
+KIMI_MIN_INTERVAL_SECONDS=max(300.0,min(3600.0,float(os.getenv("KIMI_RESEARCH_MIN_INTERVAL_SECONDS","900"))))
+_KIMI_NEXT_ALLOWED=0.0
 
 def configured():
     return os.getenv("KIMI_RESEARCH_ENABLED","true").strip().lower() != "false" and bool(os.getenv("KIMI_RESEARCH_API_KEY","").strip())
 
 async def analyze(stage, evidence):
+    global _KIMI_NEXT_ALLOWED
     key=os.getenv("KIMI_RESEARCH_API_KEY","").strip()
     if not configured() or not evidence:
         return []
+    now=time.time()
+    if now < _KIMI_NEXT_ALLOWED:
+        log.info("KIMI_RESEARCH_COOLDOWN remaining=%.1fs",_KIMI_NEXT_ALLOWED-now)
+        return []
+    _KIMI_NEXT_ALLOWED=now+KIMI_MIN_INTERVAL_SECONDS
     base=os.getenv("KIMI_RESEARCH_API_BASE","https://api.moonshot.ai/v1").strip().rstrip("/")
     model=os.getenv("KIMI_RESEARCH_MODEL","kimi-k2.6").strip()
     timeout=max(5.0,min(20.0,float(os.getenv("KIMI_RESEARCH_TIMEOUT","10"))))
@@ -36,6 +45,21 @@ async def analyze(stage, evidence):
             data=json.loads(s)
             items=data.get("items") if isinstance(data,dict) else None
             return items if isinstance(items,list) else []
+    except httpx.HTTPStatusError as exc:
+        status=exc.response.status_code
+        detail=exc.response.text[:160].replace("\n"," ")
+        if status==429:
+            retry_after=0.0
+            try:
+                retry_after=float(exc.response.headers.get("Retry-After","0") or 0)
+            except (TypeError,ValueError):
+                retry_after=0.0
+            _KIMI_NEXT_ALLOWED=time.time()+max(KIMI_MIN_INTERVAL_SECONDS,retry_after)
+            log.warning("KIMI_RESEARCH_429_BACKOFF retry_after=%s backoff_seconds=%.1f detail=%s",
+                        retry_after,KIMI_MIN_INTERVAL_SECONDS,detail)
+        else:
+            log.warning("KIMI_RESEARCH_ERROR status=%s detail=%s",status,detail)
+        return []
     except Exception as exc:
         log.warning("KIMI_RESEARCH_ERROR type=%s message=%s",type(exc).__name__,str(exc)[:180])
         return []
