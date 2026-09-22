@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import html
 import json
 import logging
@@ -586,11 +587,14 @@ class M1WorldLab:
         while not self.queue.empty() and len(workers)<min(MAX_CONCURRENCY*3,FETCHES_PER_RUN):
             workers.append(asyncio.create_task(self.crawl(await self.queue.get())))
         if workers:await asyncio.gather(*workers,return_exceptions=True)
-        self.db.set_meta("last_status",json.dumps(self.status(),separators=(",",":")))
+        status=self.synthesize()
+        global _STATUS_CACHE
+        _STATUS_CACHE=status.get("status") or {}
+        self.db.set_meta("last_status",json.dumps(_STATUS_CACHE,separators=(",",":")))
         log.info("M1_WORLD_RESEARCH day=%d domains=%d/%d pages=%d evidence=%d model=%s languages=%s",
                  self.day(),self.db.count_domains(),TARGET_DOMAINS,self.db.count_pages(),self.metrics["evidence"],
                  self.db.forecast_stats(),dict(self.languages_seen))
-        return self.synthesize()
+        return status
     async def run_forever(self):
         if os.getenv("M1_WORLD_LEARNING_ENABLED","true").strip().lower()=="false":
             log.info("M1_WORLD_LEARNING_DISABLED");return
@@ -602,6 +606,29 @@ class M1WorldLab:
 
 LAB=M1WorldLab()
 
-def learning_status():return LAB.status()
-def record_market_snapshot(pair,candles,timestamp=None):LAB.snapshot(pair,candles,timestamp)
-async def world_learning_loop():await LAB.run_forever()
+# The research lab performs synchronous database writes and CPU work. Keep both
+# research and live-snapshot learning off the trading event loop so a slow
+# database/search cannot delay the exact signal boundary.
+RESEARCH_EXECUTOR=ThreadPoolExecutor(max_workers=1,thread_name_prefix="m1research")
+SNAPSHOT_EXECUTOR=ThreadPoolExecutor(max_workers=1,thread_name_prefix="m1snapshot")
+_STATUS_CACHE=LAB.status()
+
+def learning_status():
+    return dict(_STATUS_CACHE)
+
+def record_market_snapshot(pair,candles,timestamp=None):
+    LAB.snapshot(pair,candles,timestamp)
+
+async def record_market_snapshot_async(pair,candles,timestamp=None):
+    loop=asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        SNAPSHOT_EXECUTOR,
+        record_market_snapshot,
+        pair,candles,timestamp
+    )
+
+async def world_learning_loop():
+    loop=asyncio.get_running_loop()
+    def runner():
+        asyncio.run(LAB.run_forever())
+    await loop.run_in_executor(RESEARCH_EXECUTOR,runner)
