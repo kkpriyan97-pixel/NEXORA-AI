@@ -67,7 +67,7 @@ UAE_TZ=ZoneInfo("Asia/Dubai")
 CYCLE_STATE_IO_TIMEOUT=0.75
 CYCLE_STATE_DB_COOLDOWN=30.0
 CYCLE_STATE_DB_BLOCKED_UNTIL=0.0
-AI_REVIEW_QUEUE_POLL_SECONDS=2.0
+AI_REVIEW_QUEUE_POLL_SECONDS=0.5
 AI_REVIEW_QUEUE_STALE_SECONDS=600.0
 AI_REVIEW_QUEUE_RETRY_DELAYS=(5,15,30,60,120,300)
 RESULT_WATCH_QUEUE_STALE_SECONDS=600.0
@@ -815,7 +815,7 @@ def uae_time(ts):
     return datetime.fromtimestamp(float(ts),tz=UAE_TZ).strftime("%H:%M:%S")
 
 STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"network":{},"read_only":True,"cycle":0,"last_cycle":None,"account_id":None,"account_group":"demo","feed_source":"authenticated_websocket"}
-CANDLE_FETCH_SEM=asyncio.Semaphore(8)
+CANDLE_FETCH_SEM=asyncio.Semaphore(16)
 CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
 CANDLE_FETCH_RETRIES=3
@@ -863,7 +863,7 @@ AI_REVIEW_TIMEOUT=2.4
 # Rotating account-wide live quote scan. It does not touch Brain timing; it only
 # keeps current account prices warm for analysis/candidate selection.
 ACCOUNT_LIVE_SCAN_BATCH=16
-ACCOUNT_LIVE_SCAN_INTERVAL=1.0
+ACCOUNT_LIVE_SCAN_INTERVAL=0.25
 ACCOUNT_LIVE_SCAN_CURSOR=0
 # Account-wide event-1 tick subscription manager. Subscriptions are read-only;
 # the worker only requests market quotes and never places/modifies trades.
@@ -1237,7 +1237,7 @@ async def account_live_feed_worker():
             raise
         except Exception as e:
             log.warning("ACCOUNT_LIVE_FEED_WORKER_ERROR type=%s message=%s",type(e).__name__,str(e)[:160])
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.25)
 
 
 async def _unsubscribe_account_tick(pair):
@@ -1606,7 +1606,7 @@ async def refresh_candles(force=False):
             last_reason="unknown"
             for attempt in range(1,CANDLE_FETCH_RETRIES+1):
                 try:
-                    await asyncio.sleep(0.15 if attempt==1 else CANDLE_FETCH_RETRY_DELAY)
+                    await asyncio.sleep(0.05 if attempt==1 else CANDLE_FETCH_RETRY_DELAY)
                     cs=await asyncio.wait_for(
                         client.market.get_candles(p,size=60,count=60),
                         timeout=2.0
