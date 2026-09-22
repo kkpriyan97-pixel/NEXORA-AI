@@ -19,6 +19,7 @@ REVIEW_429_COOLDOWN_SECONDS=900.0
 # The local Candice Brain remains authoritative; timeouts/429s cannot hard-stop delivery.
 LIVE_EXTERNAL_AI_ENABLED=os.getenv("AI_EXTERNAL_LIVE_ENABLED","true").strip().lower()!="false"
 BACKGROUND_EXTERNAL_ENABLED=os.getenv("AI_EXTERNAL_BACKGROUND_ENABLED","true").strip().lower()!="false"
+LEARNING_COUNCIL_ENABLED=os.getenv("LEARNING_AI_COUNCIL_ENABLED","true").strip().lower()!="false"
 _logged_ready=set()
 
 def _providers():
@@ -212,8 +213,11 @@ async def strategy_council_with_fallback(payload:dict[str,Any])->dict[str,Any]:
         "REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY",
     }
     providers=_providers()
-    if not BACKGROUND_EXTERNAL_ENABLED:
-        log.info("AI_STRATEGY_COUNCIL_DISABLED reason=background_external_ai_off")
+    if not LEARNING_COUNCIL_ENABLED:
+        log.info("AI_STRATEGY_COUNCIL_DISABLED reason=learning_council_off")
+    elif not BACKGROUND_EXTERNAL_ENABLED:
+        log.info("AI_STRATEGY_COUNCIL_BACKGROUND_OVERRIDE enabled=True reason=learning_only_council")
+
         return {"members":[],"member_count":0,"proposals":[],"votes":{},"consensus_strategy":"","agreement":0.0}
 
     timeout_value=float(os.getenv("AI_COUNCIL_HTTP_TIMEOUT","10.0"))
