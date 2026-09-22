@@ -201,6 +201,126 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
     return None
 
 
+async def strategy_council_with_fallback(payload:dict[str,Any])->dict[str,Any]:
+    """Multi-provider strategy council for the isolated DEMO learning lane.
+    External models can propose and cross-check strategy families, but they never
+    choose a live direction and never execute a trade. The local Candice Brain remains
+    authoritative for live signals; council output is learning metadata until DEMO validation.
+    """
+    allowed={
+        "TREND_FOLLOWING","MOMENTUM","PULLBACK","BREAKOUT",
+        "REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY",
+    }
+    providers=_providers()
+    if not BACKGROUND_EXTERNAL_ENABLED:
+        log.info("AI_STRATEGY_COUNCIL_DISABLED reason=background_external_ai_off")
+        return {"members":[],"member_count":0,"proposals":[],"votes":{},"consensus_strategy":"","agreement":0.0}
+
+    timeout_value=float(os.getenv("AI_COUNCIL_HTTP_TIMEOUT","10.0"))
+    http_timeout=max(4.0,min(20.0,timeout_value))
+    connect_timeout=min(3.0,http_timeout)
+    prompt=(
+        "You are a member of a strategy-research council for an isolated DEMO learning lab. "
+        "Use only the supplied evidence. Propose up to three testable 1-minute strategy families "
+        "from the allowed list. Never trade. Never choose or rewrite the live Candice direction. "
+        "Return JSON only: {strategies:[{strategy,confidence,entry_conditions,confirmation_conditions,"
+        "failure_conditions,rationale}]}. Reject marketing claims and invented data. "
+        f"Allowed={','.join(sorted(allowed))}\n"
+        f"Evidence={json.dumps(payload,ensure_ascii=False,separators=(chr(44),chr(58)))}"
+    )
+
+    async def ask_provider(name):
+        cfg=_cfg(name)
+        if not cfg:
+            return {"provider":name,"strategies":[],"error":"not_configured"}
+        if name not in _logged_ready:
+            log.info("AI_STRATEGY_COUNCIL_PROVIDER_READY provider=%s model=%s",name,cfg[1])
+            _logged_ready.add(name)
+        base,model,key=cfg
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(http_timeout,connect=connect_timeout)) as h:
+                r=await h.post(
+                    base+"/chat/completions",
+                    headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+                    json={"model":model,"temperature":0,"messages":[
+                        {"role":"system","content":"Return one JSON object with a strategies array only."},
+                        {"role":"user","content":prompt},
+                    ]},
+                )
+                r.raise_for_status()
+                data=_content_json(r.json()["choices"][0]["message"]["content"])
+            raw=data.get("strategies") or []
+            if not isinstance(raw,list):
+                raw=[raw]
+            out=[]
+            for item in raw[:3]:
+                if not isinstance(item,dict):
+                    continue
+                strategy=str(item.get("strategy") or "").upper().strip()
+                if strategy not in allowed:
+                    continue
+                try:
+                    confidence=max(0,min(100,int(float(item.get("confidence") or 0))))
+                except (TypeError,ValueError):
+                    confidence=0
+                out.append({
+                    "strategy":strategy,
+                    "confidence":confidence,
+                    "entry_conditions":str(item.get("entry_conditions") or "")[:500],
+                    "confirmation_conditions":str(item.get("confirmation_conditions") or "")[:500],
+                    "failure_conditions":str(item.get("failure_conditions") or "")[:500],
+                    "rationale":str(item.get("rationale") or "")[:500],
+                    "provider":name,
+                })
+            log.info("AI_STRATEGY_COUNCIL_MEMBER provider=%s proposals=%s",name,len(out))
+            return {"provider":name,"strategies":out}
+        except Exception as e:
+            log.warning("AI_STRATEGY_COUNCIL_MEMBER_FAILED provider=%s type=%s message=%s",name,type(e).__name__,str(e)[:140])
+            return {"provider":name,"strategies":[],"error":type(e).__name__}
+
+    async with ANALYSIS_SEMAPHORE:
+        raw_members=await asyncio.gather(*(ask_provider(name) for name in providers),return_exceptions=True)
+    members=[x for x in raw_members if isinstance(x,dict)]
+    votes={}
+    bundles={}
+    for member in members:
+        for proposal in member.get("strategies") or []:
+            strategy=str(proposal.get("strategy") or "").upper()
+            if strategy not in allowed:
+                continue
+            votes[strategy]=votes.get(strategy,0)+1
+            bundles.setdefault(strategy,[]).append(proposal)
+
+    contributing=max(1,len([m for m in members if m.get("strategies")]))
+    ordered=sorted(votes,key=lambda s:(votes.get(s,0),max((int(p.get("confidence") or 0) for p in bundles.get(s,[])),default=0)),reverse=True)
+    proposals=[]
+    for strategy in ordered[:8]:
+        bundle=bundles.get(strategy,[])
+        best=max(bundle,key=lambda p:int(p.get("confidence") or 0))
+        proposals.append({
+            "strategy":strategy,
+            "votes":votes.get(strategy,0),
+            "agreement":round(votes.get(strategy,0)/contributing,3),
+            "confidence":round(sum(int(p.get("confidence") or 0) for p in bundle)/max(1,len(bundle))),
+            "entry_conditions":best.get("entry_conditions",""),
+            "confirmation_conditions":best.get("confirmation_conditions",""),
+            "failure_conditions":best.get("failure_conditions",""),
+            "rationale":best.get("rationale",""),
+            "providers":sorted({str(p.get("provider") or "") for p in bundle}),
+        })
+    consensus=proposals[0] if proposals else None
+    result={
+        "members":members,
+        "member_count":len(members),
+        "proposals":proposals,
+        "votes":votes,
+        "consensus_strategy":str(consensus.get("strategy") if consensus else ""),
+        "agreement":float(consensus.get("agreement") if consensus else 0.0),
+    }
+    log.info("AI_STRATEGY_COUNCIL_COMPLETE members=%s contributors=%s proposals=%s consensus=%s agreement=%.3f",
+             len(members),contributing,len(proposals),result["consensus_strategy"],result["agreement"])
+    return result
+
 async def review_result_with_fallback(rec:dict[str,Any])->dict[str,Any]:
     """Background post-result audit.
 
