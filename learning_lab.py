@@ -856,7 +856,11 @@ async def _send_campaign_batch(candidates):
 
     async def one(item):
         async with CAMPAIGN_ASSET_SEM:
-            return await _send_request(item,notify=False)
+            # Every DEMO campaign order is now reported immediately to the
+            # admin Telegram chat. This keeps the learning lab observable:
+            # accepted trade ID, asset, direction, entry, duration and result
+            # are visible instead of only the aggregate batch count.
+            return await _send_request(item,notify=True)
 
     results=await asyncio.gather(*(one(item) for item in unique),return_exceptions=True)
     accepted=sum(1 for r in results if r is True)
