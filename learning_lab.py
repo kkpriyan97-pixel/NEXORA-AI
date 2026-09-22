@@ -1,7 +1,7 @@
 """Independent daily demo practice laboratory.
 
 It reads the authenticated market snapshot and places DEMO-only practice orders
-automatically during the fixed 19:00–21:00 UAE learning window. It never accepts
+automatically during the fixed 19:30–21:30 UAE learning window. It never accepts
 a live/real account for learning execution.
 """
 from __future__ import annotations
@@ -497,7 +497,7 @@ async def run_forever():
                 if candidate:
                     sent = await _send_request(candidate)
                     if sent:
-                        log_msg=(f"PRACTICE_WINDOW_ACTIVE day={day} start={START_HOUR:02d}:00 duration=2h "
+                        log_msg=(f"PRACTICE_WINDOW_ACTIVE day={day} start={START_HOUR:02d}:{START_MINUTE:02d} duration=2h "
                                  f"strategy={candidate['strategy']} pair={candidate['pair']} source={candidate['source']}")
                         print(log_msg)
                 else:
