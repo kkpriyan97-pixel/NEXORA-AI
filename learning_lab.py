@@ -511,7 +511,7 @@ async def _load_research_hints():
                 hints.append((strategy,str(mid)));seen.add(strategy)
     return hints
 
-def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,council_votes=None,forced_strategy=None):
+def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,council_votes=None,forced_strategy=None,return_all=False):
     candidates=[]
     council_votes=dict(council_votes or {})
     now=time.time()
@@ -565,6 +565,23 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,
         candidates.append((conf+council_boost,conf,float(brain.get("market_quality") or 0),brain,source,technique,council_boost))
     if not candidates:return None
     candidates.sort(key=lambda x:(x[0],x[1],x[2]),reverse=True)
+    if return_all:
+        out=[]
+        for _,_,_,brain,source,technique,council_boost in candidates:
+            out.append({
+                "pair":brain["pair"],
+                "display_name":brain.get("display_name") or brain["pair"],
+                "direction":str(brain.get("direction") or "").upper(),
+                "strategy":str(brain.get("strategy") or "").upper(),
+                "confidence":int(brain.get("confidence") or 0),
+                "reference_price":brain.get("price"),
+                "entry_candle_ts":brain.get("entry_candle_ts"),
+                "source":source,
+                "technique":technique,
+                "reason":str(brain.get("reason") or "")[:600],
+                "council_boost":council_boost,
+            })
+        return out
     _,_,_,brain,source,technique,council_boost=candidates[0]
     return {
         "pair":brain["pair"],
@@ -580,7 +597,7 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,
         "council_boost":council_boost,
     }
 
-async def _build_candidate(forced_strategy=None):
+async def _build_candidate(forced_strategy=None,return_all=False):
     provider=_cfg.get("snapshot_provider")
     if not provider:
         return None
@@ -668,23 +685,32 @@ async def _build_candidate(forced_strategy=None):
     offset=_practice_cursor
     _practice_cursor=(offset+batch)%max(1,len(assets)) if assets else 0
     candidate=await asyncio.to_thread(
-        _analyze_snapshot_sync,assets,candles,prices,preferred,hints,batch,offset,votes,forced_strategy
+        _analyze_snapshot_sync,assets,candles,prices,preferred,hints,batch,offset,votes,forced_strategy,return_all
     )
     if candidate:
         consensus=str(council.get("consensus_strategy") or "").upper()
-        strategy=str(candidate.get("strategy") or "").upper()
-        candidate["council_session_id"]=session_id
-        candidate["council_consensus"]=consensus
-        candidate["council_agreement"]=float(council.get("agreement") or 0.0)
-        candidate["council_members"]=int(council.get("member_count") or 0)
-        candidate["council_votes"]=votes
-        candidate["source"]="AI_COUNCIL_CONSENSUS" if consensus and strategy==consensus else candidate.get("source","CORE")
-        print(
-            f"LEARNING_CANDIDATE_READY pair={candidate.get('pair')} "
-            f"direction={candidate.get('direction')} confidence={candidate.get('confidence')} "
-            f"strategy={candidate.get('strategy')} source={candidate.get('source')} "
-            f"council_consensus={consensus or 'NONE'}"
-        )
+        items=candidate if isinstance(candidate,list) else [candidate]
+        for item in items:
+            strategy=str(item.get("strategy") or "").upper()
+            item["council_session_id"]=session_id
+            item["council_consensus"]=consensus
+            item["council_agreement"]=float(council.get("agreement") or 0.0)
+            item["council_members"]=int(council.get("member_count") or 0)
+            item["council_votes"]=votes
+            if consensus and strategy==consensus:
+                item["source"]="AI_COUNCIL_CONSENSUS"
+        if isinstance(candidate,list):
+            print(
+                f"LEARNING_CANDIDATE_READY count={len(candidate)} "
+                f"strategy={forced_strategy or 'COUNCIL'} consensus={consensus or 'NONE'}"
+            )
+        else:
+            print(
+                f"LEARNING_CANDIDATE_READY pair={candidate.get('pair')} "
+                f"direction={candidate.get('direction')} confidence={candidate.get('confidence')} "
+                f"strategy={candidate.get('strategy')} source={candidate.get('source')} "
+                f"council_consensus={consensus or 'NONE'}"
+            )
     if candidate:
         print(
             f"LEARNING_CANDIDATE_READY pair={candidate.get('pair')} "
