@@ -880,8 +880,21 @@ async def _send_daily_report(day):
 async def run_forever():
     if os.getenv("LEARNING_PRACTICE_ENABLED","true").strip().lower()=="false":
         return
-    await ensure_learning_trade_state_table()
-    await restore_open_trades()
+    # Startup recovery must never block the learning scheduler. The Render/Postgres
+    # connection can temporarily stall during a broker reconnect; DB state is recovery
+    # metadata only, so bound both operations and continue into the live learning loop.
+    try:
+        await asyncio.wait_for(ensure_learning_trade_state_table(), timeout=5.0)
+    except asyncio.TimeoutError:
+        print("LEARNING_TRADE_STATE_INIT_TIMEOUT seconds=5 fallback=memory_only")
+    except Exception as e:
+        print(f"LEARNING_TRADE_STATE_INIT_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]} fallback=memory_only")
+    try:
+        await asyncio.wait_for(restore_open_trades(), timeout=5.0)
+    except asyncio.TimeoutError:
+        print("LEARNING_TRADE_RESTORE_TIMEOUT seconds=5 fallback=memory_only")
+    except Exception as e:
+        print(f"LEARNING_TRADE_RESTORE_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]} fallback=memory_only")
     print("LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=20:30-23:00 timezone=Asia/Dubai demo_only=True")
     last_heartbeat=0.0
     last_scan=0.0
