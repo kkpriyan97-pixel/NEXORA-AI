@@ -5063,7 +5063,7 @@ pre{white-space:pre-wrap;word-break:break-word;font-size:11px;opacity:.85}
 <div id="list"></div>
 </div>
 <script>
-const initial=__INITIAL_PAYLOAD__;
+const initial={service:"CANDICE-AI",assets:[],live_orders:[],live_order_events:[],five_scan_cycle:{},asset_count:0,authenticated_account_feed:false,order_position_monitor:{}};
 function nfmt(x){
  const n=Number(x);
  return Number.isFinite(n)?n.toFixed(5):"—";
@@ -5167,7 +5167,7 @@ function render(d){
    '</div>';
  }).join("");
 }
-render(initial);
+try{render(initial);}catch(e){document.getElementById("status").textContent="Live page starting…";}
 async function tick(){
  try{
    const r=await fetch("/live-analysis?ts="+Date.now(),{cache:"no-store"});
@@ -5176,7 +5176,7 @@ async function tick(){
    document.getElementById("status").textContent="Live refresh waiting…";
  }
 }
-setInterval(tick,2000);
+setTimeout(tick,100); setInterval(tick,2000);
 </script>
 </body>
 </html>"""
