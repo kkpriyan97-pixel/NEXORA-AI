@@ -1284,6 +1284,91 @@ async def scan_account_live_feed():
     # sufficient for the 1-minute account-feed health audit.
 
 
+async def refresh_broker_live_quote(pair):
+    """Read the current quote from the authenticated broker session.
+
+    Event-1 ticks are preferred when available. This fallback reads the current
+    in-progress 1-minute candle from the same authenticated session. The live
+    quote is never fed into indicator candle history; it is only used as the
+    current price at Brain/final-signal boundaries.
+    """
+    client=CLIENT
+    if not client or not pair or not getattr(client.connection,"is_connected",False):
+        return False
+    try:
+        q=await asyncio.wait_for(
+            client.market.get_live_quote(pair),
+            timeout=3.0
+        )
+        if not isinstance(q,dict) or q.get("price") is None:
+            return False
+        now=time.time()
+        price=float(q["price"])
+        broker_candle=q.get("candle") or {}
+        broker_ts=broker_candle.get("time",broker_candle.get("t"))
+        try:
+            broker_ts=float(broker_ts)
+            if broker_ts>10000000000:
+                broker_ts/=1000.0
+        except Exception:
+            broker_ts=now
+        STATE["prices"][pair]=(price,broker_ts,now)
+        STATE["price_source"][pair]="authenticated_broker_live_candle"
+        return True
+    except Exception as e:
+        log.debug(
+            "BROKER_LIVE_QUOTE_REFRESH_FAILED pair=%s type=%s message=%s",
+            pair,type(e).__name__,str(e)[:120]
+        )
+        return False
+
+async def account_live_quote_worker():
+    """Continuously rotate the authenticated account asset universe through the
+    broker current-quote endpoint, so Brain sees the same account market feed even
+    when Event-1 tick subscriptions are unavailable.
+    """
+    cursor=0
+    while True:
+        try:
+            client=CLIENT
+            assets=list(STATE.get("assets") or [])
+            if not client or not assets or not getattr(client.connection,"is_connected",False):
+                await asyncio.sleep(2.0)
+                continue
+            pairs=[str(a.get("pair") or "") for a in assets if a.get("pair")]
+            if not pairs:
+                await asyncio.sleep(2.0)
+                continue
+            batch_size=max(4,min(16,int(ACCOUNT_LIVE_SCAN_BATCH//2)))
+            batch=[]
+            for _ in range(min(batch_size,len(pairs))):
+                p=pairs[cursor % len(pairs)]
+                cursor+=1
+                if p and p not in batch:
+                    batch.append(p)
+            results=await asyncio.gather(
+                *(refresh_broker_live_quote(p) for p in batch),
+                return_exceptions=True
+            )
+            updated=sum(1 for x in results if x is True)
+            fresh=sum(
+                1 for p in pairs
+                if has_fresh_live_price(p,time.time(),max(LIVE_TICK_MAX_AGE,QUOTE_SNAPSHOT_MAX_AGE))
+            )
+            log.info(
+                "ACCOUNT_LIVE_BROKER_FEED batch=%d updated=%d account_assets=%d "
+                "fresh_any_source=%d source=authenticated_session_current_candle",
+                len(batch),updated,len(pairs),fresh
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(
+                "ACCOUNT_LIVE_BROKER_FEED_WORKER_ERROR type=%s message=%s",
+                type(e).__name__,str(e)[:160]
+            )
+        await asyncio.sleep(2.0)
+
 async def account_live_feed_worker():
     # This worker is observability only. Actual event-1 tick reception is
     # continuous in on_tick(); the audit interval must not create avoidable CPU
@@ -1668,13 +1753,13 @@ async def ensure_candidate_ticks(pairs):
     return await pin_account_tick_pairs(unique,ttl=12.0)
 
 async def ensure_candidate_quotes(pairs):
-    """Refresh candidate quotes from the authenticated event-1 stream, never from a snapshot API."""
+    """Refresh candidate quotes from authenticated Event-1 ticks, then broker current-candle quotes."""
     client=CLIENT
     if not client or not pairs:
         return 0
     await ensure_candidate_ticks(pairs)
     unique=list(dict.fromkeys(str(p) for p in pairs if p))
-    deadline=time.time()+2.0
+    deadline=time.time()+1.5
     fresh=0
     while time.time()<deadline:
         now=time.time()
@@ -1682,7 +1767,25 @@ async def ensure_candidate_quotes(pairs):
         if fresh>=min(len(unique),ACCOUNT_TICK_MAX_SLOTS):
             break
         await asyncio.sleep(0.10)
-    log.info("LIVE_PRICE_EVENT1_REFRESH requested=%d fresh=%d",len(unique),fresh)
+    # Event-1 is optional. For any candidate still missing a fresh quote, use the
+    # authenticated broker current-candle endpoint instead of external/synthetic data.
+    missing=[p for p in unique if not has_fresh_live_price(p,time.time(),max(LIVE_TICK_MAX_AGE,QUOTE_SNAPSHOT_MAX_AGE))]
+    if missing:
+        results=await asyncio.gather(
+            *(refresh_broker_live_quote(p) for p in missing[:ACCOUNT_TICK_FINAL_PROBE_LIMIT]),
+            return_exceptions=True
+        )
+        fallback_updated=sum(1 for x in results if x is True)
+        fresh=sum(
+            1 for p in unique
+            if has_fresh_live_price(p,time.time(),max(LIVE_TICK_MAX_AGE,QUOTE_SNAPSHOT_MAX_AGE))
+        )
+        log.info(
+            "LIVE_PRICE_BROKER_FALLBACK requested=%d updated=%d fresh=%d",
+            len(missing[:ACCOUNT_TICK_FINAL_PROBE_LIMIT]),fallback_updated,fresh
+        )
+    else:
+        log.info("LIVE_PRICE_EVENT1_REFRESH requested=%d fresh=%d",len(unique),fresh)
     return fresh
 
 
@@ -4356,8 +4459,9 @@ async def market_worker():
             # read-only worker below. Event-1 ticks are preferred when delivered;
             # the snapshot scanner remains a timestamped fallback for assets
             # that do not emit an event-1 tick.
-            log.info("TICK_SUBSCRIPTION_MODE authenticated_event1 preferred; asset_inventory_source=user_pdf_104_assets; no asset-list API")
+            log.info("TICK_SUBSCRIPTION_MODE authenticated_event1 preferred; broker_current_candle_fallback=enabled; asset_inventory_source=user_pdf_104_assets; no asset-list API")
             await refresh_candles(force=True)
+            live_quote_task=asyncio.create_task(account_live_quote_worker(),name="account_live_quote_worker")
             last_asset_sync=time.time()
             while True:
                 await asyncio.sleep(15)
@@ -4386,6 +4490,11 @@ async def market_worker():
             ) else 30
             await asyncio.sleep(retry_delay)
         finally:
+            try:
+                live_quote_task.cancel()
+                await live_quote_task
+            except (Exception, asyncio.CancelledError):
+                pass
             try:await client.stop()
             except Exception:pass
             CLIENT=None
