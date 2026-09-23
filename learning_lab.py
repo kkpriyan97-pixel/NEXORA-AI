@@ -1222,6 +1222,76 @@ async def _send_campaign_batch(candidates):
             pass
     return accepted
 
+async def _verify_order_visibility(trade_id, account_id, pair):
+    """Cross-check that an accepted DEMO order is visible on the same broker account."""
+    client=_cfg.get("client_provider",lambda:None)()
+    if not client or not getattr(client.connection,"is_connected",False):
+        log.warning(
+            "LEARNING_ORDER_VISIBILITY trade_id=%s account_id=%s pair=%s "
+            "status=UNVERIFIABLE reason=broker_not_connected",
+            trade_id,account_id,pair
+        )
+        return False
+
+    for attempt, delay in enumerate((0.0,0.35,0.75), start=1):
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            open_trades=await asyncio.wait_for(
+                client.trade.get_open_trades(int(account_id),group="demo"),
+                timeout=3.0
+            )
+        except Exception as e:
+            log.warning(
+                "LEARNING_ORDER_VISIBILITY trade_id=%s account_id=%s pair=%s "
+                "attempt=%d status=QUERY_FAILED type=%s message=%s",
+                trade_id,account_id,pair,attempt,type(e).__name__,str(e)[:140]
+            )
+            continue
+
+        records=[]
+        if isinstance(open_trades,list):
+            records=[x for x in open_trades if isinstance(x,dict)]
+
+        def tid_of(item):
+            return str(
+                item.get("id")
+                or item.get("trade_id")
+                or item.get("order_id")
+                or item.get("orderId")
+                or ""
+            )
+
+        match=next((x for x in records if tid_of(x)==str(trade_id)),None)
+        cached22=[]
+        cached26=[]
+        try:
+            for event_id,target in ((22,cached22),(26,cached26)):
+                for message in client.get_cached_events(event_id) or []:
+                    payload=message.get("d") if isinstance(message,dict) else None
+                    items=payload if isinstance(payload,list) else [payload]
+                    target.extend(x for x in items if isinstance(x,dict))
+        except Exception:
+            pass
+
+        match22=any(tid_of(x)==str(trade_id) for x in cached22)
+        match26=any(tid_of(x)==str(trade_id) for x in cached26)
+        log.info(
+            "LEARNING_ORDER_VISIBILITY trade_id=%s account_id=%s pair=%s "
+            "attempt=%d open_items=%d open_match=%s event22_match=%s event26_match=%s status=%s",
+            trade_id,account_id,pair,attempt,len(records),bool(match),match22,match26,
+            str((match or {}).get("status") or "NOT_PRESENT").upper()
+        )
+        if match or match22 or match26:
+            return True
+
+    log.error(
+        "LEARNING_ORDER_VISIBILITY_MISSING trade_id=%s account_id=%s pair=%s "
+        "status=ACCEPTED_BUT_NOT_VISIBLE",
+        trade_id,account_id,pair
+    )
+    return False
+
 async def _place_demo(rec, actor_id):
     if not practice_active():
         return False,"LEARNING_WINDOW_CLOSED",None
@@ -1311,10 +1381,18 @@ async def _place_demo(rec, actor_id):
         "session_day":str(_learning_session_day(_now_uae())),
         "status":"OPEN","trade_id":str(trade_id),"accepted_by":int(actor_id),
         "placed_at":now,"entry_ts":now,"entry_price":entry_price,
+        "account_id":int(account_id),"account_group":"demo",
     })
     _open[str(trade_id)]=rec
     await persist_open_trade(rec)
-    print(f"LEARNING_ORDER_CONFIRMED pair={pair} trade_id={trade_id} entry={entry_price} account_id={account_id} group=demo")
+    print(
+        f"LEARNING_ORDER_CONFIRMED pair={pair} trade_id={trade_id} entry={entry_price} "
+        f"account_id={account_id} group=demo"
+    )
+    asyncio.create_task(
+        _verify_order_visibility(str(trade_id),int(account_id),pair),
+        name=f"learning_visibility_{trade_id}",
+    )
     return True,"PLACED",rec
 
 async def handle_callback(query):
