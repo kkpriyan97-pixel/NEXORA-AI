@@ -4108,6 +4108,22 @@ async def cycle_loop():
         # Immediately iterate to the next 3-minute target. The first scan
         # begins 150s before that target, preserving the fixed 30s delivery lead.
 
+async def learning_practice_supervisor():
+    """Keep the DEMO-only learning engine alive independently of other long-running workers."""
+    while True:
+        try:
+            log.info("LEARNING_PRACTICE_TASK_START")
+            await learning_practice_loop()
+            log.warning("LEARNING_PRACTICE_TASK_RETURNED reason=loop_exited")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception(
+                "LEARNING_PRACTICE_TASK_RESTART type=%s message=%s",
+                type(e).__name__, str(e)[:180]
+            )
+        await asyncio.sleep(2.0)
+
 async def cycle_loop_supervisor():
     """Keep the scheduler alive if cycle_loop exits unexpectedly."""
     while True:
@@ -4580,7 +4596,16 @@ async def main():
     )
     port=int(os.getenv("PORT","10000"));server=await asyncio.start_server(health,"0.0.0.0",port)
     await configure_telegram_webhook()
+    # Start the DEMO learning supervisor first, then yield once so it enters
+    # its own loop before the heavier market/research workers begin. This prevents
+    # a long-running startup task from starving the overnight DEMO scheduler.
+    learning_task=asyncio.create_task(
+        learning_practice_supervisor(),
+        name="learning_practice_supervisor",
+    )
+    await asyncio.sleep(0)
     await asyncio.gather(
+        learning_task,
         market_worker(),
         account_tick_subscription_worker(),
         account_live_feed_worker(),
@@ -4588,7 +4613,6 @@ async def main():
         ai_review_worker(),
         world_learning_loop(),
         strategy_knowledge_refresh_loop(),
-        learning_practice_loop(),
         server.serve_forever(),
     )
 if __name__=="__main__":asyncio.run(main())
