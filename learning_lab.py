@@ -1239,59 +1239,44 @@ async def _fallback_watch(rec):
         return out
 
     async def _direct_candles(attempt):
-        client_provider=_cfg.get("client_provider")
-        client=client_provider() if client_provider else None
-        if not client:
-            print(f"LEARNING_RESULT_DIRECT_CANDLE_UNAVAILABLE pair={pair} attempt={attempt} reason=no_client")
-            return []
-        connection=getattr(client,"connection",None)
-        connected=bool(connection and getattr(connection,"is_connected",False))
-        if not connected:
-            recovered=False
-            # Recover the existing authenticated client/session only; no new
-            # credentials or login flow is created by the result watcher.
-            for owner,name in (
-                (client,"start"),(client,"reconnect"),
-                (connection,"reconnect"),(connection,"connect")
-            ):
-                fn=getattr(owner,name,None) if owner is not None else None
-                if not callable(fn):
-                    continue
+        now=time.time()
+        cached=_direct_candle_cache.get(pair)
+        if cached and now-float(cached[0]) < RESULT_DIRECT_FETCH_CACHE_SECONDS:
+            return list(cached[1])
+        lock=_direct_candle_locks[pair]
+        async with lock:
+            now=time.time()
+            cached=_direct_candle_cache.get(pair)
+            if cached and now-float(cached[0]) < RESULT_DIRECT_FETCH_CACHE_SECONDS:
+                return list(cached[1])
+            async with _direct_candle_semaphore:
+                client_provider=_cfg.get("client_provider")
+                client=client_provider() if client_provider else None
+                if not client:
+                    print(f"LEARNING_RESULT_DIRECT_CANDLE_UNAVAILABLE pair={pair} attempt={attempt} reason=no_client")
+                    return []
+                connection=getattr(client,"connection",None)
+                connected=bool(connection and getattr(connection,"is_connected",False))
+                if not connected:
+                    print(f"LEARNING_RESULT_DIRECT_CANDLE_UNAVAILABLE pair={pair} attempt={attempt} reason=broker_disconnected")
+                    return []
                 try:
-                    value=fn()
-                    if hasattr(value,"__await__"):
-                        await asyncio.wait_for(value,timeout=5.0)
-                    recovered=True
-                    print(f"LEARNING_RESULT_CONNECTION_RECOVERY pair={pair} attempt={attempt} method={name}")
-                    break
+                    fresh=await asyncio.wait_for(
+                        client.market.get_candles(pair,size=60,count=5),timeout=4.0
+                    )
+                    candles=_normalise_candles(fresh)
+                    _direct_candle_cache[pair]=(time.time(),list(candles))
+                    print(
+                        f"LEARNING_RESULT_DIRECT_CANDLE_FETCH pair={pair} count={len(candles)} "
+                        f"attempt={attempt} connected={connected}"
+                    )
+                    return candles
                 except Exception as exc:
                     print(
-                        f"LEARNING_RESULT_CONNECTION_RECOVERY_FAILED pair={pair} "
-                        f"attempt={attempt} method={name} type={type(exc).__name__} "
-                        f"message={str(exc)[:100]}"
+                        f"LEARNING_RESULT_DIRECT_CANDLE_RETRY pair={pair} attempt={attempt} "
+                        f"type={type(exc).__name__} message={str(exc)[:120]}"
                     )
-            connection=getattr(client,"connection",None)
-            connected=bool(connection and getattr(connection,"is_connected",False))
-            if not connected and not recovered:
-                print(f"LEARNING_RESULT_DIRECT_CANDLE_UNAVAILABLE pair={pair} attempt={attempt} reason=broker_disconnected")
-                return []
-        try:
-            fresh=await asyncio.wait_for(
-                client.market.get_candles(pair,size=60,count=5),timeout=4.0
-            )
-            candles=_normalise_candles(fresh)
-            print(
-                f"LEARNING_RESULT_DIRECT_CANDLE_FETCH pair={pair} count={len(candles)} "
-                f"attempt={attempt} connected={connected}"
-            )
-            return candles
-        except Exception as exc:
-            print(
-                f"LEARNING_RESULT_DIRECT_CANDLE_RETRY pair={pair} attempt={attempt} "
-                f"type={type(exc).__name__} message={str(exc)[:120]}"
-            )
-            return []
-
+                    return []
     def _eligible(items,current_time):
         eligible=[]
         for c in items:
