@@ -112,6 +112,10 @@ def _window_end(day):
     return _window_start(day)+timedelta(minutes=WINDOW_MINUTES)
 
 def practice_active(now=None):
+    # Signal testing is exclusive: do not start new DEMO learning orders while
+    # FORCE_SIGNAL_MODE is enabled. Learning resumes automatically when disabled.
+    if os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}:
+        return False
     now=now or _now_uae()
     session_day=_learning_session_day(now)
     start=_window_start(session_day)
@@ -123,10 +127,12 @@ def status():
     session_day=_learning_session_day(n)
     start=_window_start(session_day)
     end=_window_end(session_day)
-    active=start<=n<end
+    force_signal_mode=os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}
+    active=(start<=n<end) and not force_signal_mode
     return {
         "enabled":os.getenv("LEARNING_PRACTICE_ENABLED","true").strip().lower()!="false",
         "active":active,
+        "signal_testing_exclusive":force_signal_mode,
         "start_uae":start.isoformat(),
         "end_uae":end.isoformat(),
         "duration_seconds":DURATION_SECONDS,
@@ -1533,6 +1539,12 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
         )
     else:
         validation_line="⏳ Own Strategy Brain → validation pending"
+    if os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}:
+        print(
+            f"LEARNING_RESULT_TELEGRAM_SUPPRESSED trade_id={tid} "
+            f"pair={rec.get('pair')} result={result} reason=force_signal_mode_exclusive"
+        )
+        return
     await _cfg["send_message"](
         "🧠 DEMO LEARNING RESULT\n\n"
         f"📊 {rec.get('display_name')}\n"
@@ -1761,6 +1773,9 @@ async def _send_daily_report(day):
     decided=stats["win"]+stats["loss"]
     accuracy=(100.0*stats["win"]/decided) if decided else 0.0
     validated=await _validated_strategy_ids()
+    if os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}:
+        print(f"LEARNING_REPORT_SUPPRESSED day={day} reason=force_signal_mode_exclusive")
+        return True
     sent=await _cfg["send_message"](
         "🧠 CANDICE • LEARNING REPORT\n\n"
         "🕕 Practice → 18:00–06:00 UAE\n"
