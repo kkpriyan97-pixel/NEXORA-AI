@@ -886,8 +886,13 @@ ACCOUNT_TICK_SUB_DELAY=0.35
 ACCOUNT_TICK_MAX_SLOTS=4
 ACCOUNT_TICK_PIN_SLOTS=4
 ACCOUNT_TICK_ROTATE_INTERVAL=15.0
+# Temporarily back off pairs that the authenticated event-12 channel explicitly
+# rejects, instead of wasting every rotation/final-boundary slot on them.
+ACCOUNT_TICK_REJECT_COOLDOWN=300.0
 ACCOUNT_TICK_SUBSCRIBED=set()
 ACCOUNT_TICK_LAST_ATTEMPT={}
+ACCOUNT_TICK_REJECT_COUNT=defaultdict(int)
+ACCOUNT_TICK_REJECT_UNTIL={}
 ACCOUNT_TICK_PINNED={}
 ACCOUNT_TICK_ROTATE_CURSOR=0
 ACCOUNT_TICK_LAST_ROTATION=0.0
@@ -1270,23 +1275,42 @@ async def _subscribe_account_tick(pair):
     client=CLIENT
     if not client or not pair:
         return False
+    now=time.time()
+    blocked_until=float(ACCOUNT_TICK_REJECT_UNTIL.get(pair) or 0.0)
+    if blocked_until>now:
+        log.info(
+            "ACCOUNT_TICK_SUBSCRIBE_SKIP pair=%s reason=rejection_cooldown seconds=%.1f",
+            pair,blocked_until-now
+        )
+        return False
     async with ACCOUNT_TICK_SUB_SEM:
         try:
-            # Broker-side event-12/13 rejects are transient when subscription
-            # churn is too fast. Keep the authenticated feed stable and retry
-            # on the next rotation instead of hammering the same connection.
-            await asyncio.sleep(ACCOUNT_TICK_SUB_DELAY)
-            await asyncio.wait_for(client.market.subscribe_ticks(pair),timeout=6.0)
+            # Let the caller control rotation pacing; this function itself must
+            # stay latency-bounded because it is also used before signal delivery.
+            await asyncio.wait_for(client.market.subscribe_ticks(pair),timeout=4.0)
             ACCOUNT_TICK_SUBSCRIBED.add(pair)
             ACCOUNT_TICK_LAST_ATTEMPT[pair]=time.time()
+            ACCOUNT_TICK_REJECT_COUNT[pair]=0
+            ACCOUNT_TICK_REJECT_UNTIL.pop(pair,None)
             log.info("ACCOUNT_TICK_SUBSCRIBE pair=%s status=accepted",pair)
             return True
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            attempt=ACCOUNT_TICK_REJECT_COUNT[pair]+1
+            ACCOUNT_TICK_REJECT_COUNT[pair]=attempt
             ACCOUNT_TICK_LAST_ATTEMPT[pair]=time.time()
-            log.warning("ACCOUNT_TICK_SUBSCRIBE pair=%s status=rejected type=%s message=%s",
-                        pair,type(e).__name__,str(e)[:120])
+            msg=str(e)[:180]
+            invalid="invalid request" in msg.lower() or "invalid_request" in msg.lower()
+            if invalid:
+                ACCOUNT_TICK_REJECT_UNTIL[pair]=time.time()+ACCOUNT_TICK_REJECT_COOLDOWN
+            log.warning(
+                "ACCOUNT_TICK_SUBSCRIBE pair=%s status=rejected attempt=%d invalid_request=%s cooldown_until=%s type=%s message=%s",
+                pair,attempt,invalid,
+                (datetime.fromtimestamp(ACCOUNT_TICK_REJECT_UNTIL[pair],tz=timezone.utc).strftime("%H:%M:%S")
+                 if pair in ACCOUNT_TICK_REJECT_UNTIL else "NONE"),
+                type(e).__name__,msg
+            )
             return False
 
 def _tick_pinned_pairs():
@@ -1308,7 +1332,7 @@ async def pin_account_tick_pairs(pairs,ttl=12.0):
                 seen.add(p);unique.append(p)
         probe_limit=min(
             len(unique),
-            max(ACCOUNT_TICK_PIN_SLOTS*2,ACCOUNT_TICK_PIN_SLOTS)
+            max(ACCOUNT_TICK_PIN_SLOTS*3,ACCOUNT_TICK_PIN_SLOTS)
         )
         targets=unique[:probe_limit]
         until=time.time()+float(ttl)
@@ -1390,7 +1414,13 @@ async def ensure_account_tick_subscriptions():
         if now-ACCOUNT_TICK_LAST_ROTATION < ACCOUNT_TICK_ROTATE_INTERVAL:
             return
 
-        pairs=[str(a["pair"]) for a in assets]
+        all_pairs=[str(a["pair"]) for a in assets]
+        now=time.time()
+        available_pairs=[
+            p for p in all_pairs
+            if float(ACCOUNT_TICK_REJECT_UNTIL.get(p) or 0.0)<=now
+        ]
+        pairs=available_pairs or all_pairs
         n=len(pairs)
         start=ACCOUNT_TICK_ROTATE_CURSOR % n
         targets=[pairs[(start+i) % n] for i in range(min(ACCOUNT_TICK_MAX_SLOTS,n))]
@@ -1407,7 +1437,7 @@ async def ensure_account_tick_subscriptions():
                 continue
             if await _subscribe_account_tick(p):
                 accepted+=1
-            await asyncio.sleep(ACCOUNT_TICK_SUB_DELAY)
+            await asyncio.sleep(0.05)
 
         ACCOUNT_TICK_LAST_ROTATION=now
         log.info("ACCOUNT_TICK_SLOT_ROTATION targets=%s accepted=%d active=%d cursor=%d",
@@ -2729,9 +2759,10 @@ async def result_watch(key):
 
 async def cycle_loop():
     # Fast 3-minute signal scheduler, active only during the UAE 06:00–18:00 signal session.
-    # For each target T:
-    #   - target = exact next 3-minute boundary
-    #   - Telegram signal = target minus an exact 30s lead
+    # For each cycle:
+    #   - cycle_start = T - 180s
+    #   - Telegram signal = cycle_start + 150s (2m30s after Candice cycle start)
+    #   - entry/expiry boundary T = cycle_start + 180s
     #   - five Brain passes are completed inside the same 150s pre-signal window
     #   - pass 5 is the deep/final qualification pass 15s before delivery
     #   - 5s + every complete 1m..15m frame are checked in each pass
@@ -2739,11 +2770,11 @@ async def cycle_loop():
     #     the scheduler, so one completed signal cannot stop the next cycle.
     # The Brain/AI strategy itself is unchanged; only the scheduling cadence
     # and the requested expiry are changed for DEMO analysis.
-    # Day signal session: every 3 minutes, with the Telegram alert exactly 30s
-    # before the 1-minute DEMO expiry boundary.
+    # Day signal session: every 3 minutes. Signal is fixed at +2m30s from
+    # cycle start; the 1-minute DEMO entry/expiry boundary is +3m00s.
     SIGNAL_INTERVAL=180.0
     SIGNAL_LEADS=(30.0,30.0)
-    SCAN_OFFSETS=(150.0,120.0,90.0,60.0,45.0)
+    SCAN_OFFSETS=(150.0,120.0,90.0,75.0,60.0)
 
     async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
         if not signal_session_active(target):
@@ -3017,6 +3048,20 @@ async def cycle_loop():
             target=None
             continue
 
+        # Explicit Candice cycle start: normal cycles begin exactly at the
+        # previous 1-minute expiry boundary (target - 180s). This makes the signal
+        # occur exactly 2m30s after cycle start and the entry boundary exactly 3m00s.
+        cycle_start=target-SIGNAL_INTERVAL
+        until_start=cycle_start-time.time()
+        if until_start>0:
+            log.info(
+                "CYCLE_START_WAIT cycle=%s start_utc=%s seconds=%.2f signal_utc=%s target_utc=%s",
+                cycle_id,time.strftime("%H:%M:%S",time.gmtime(cycle_start)),until_start,
+                time.strftime("%H:%M:%S",time.gmtime(signal_at)),
+                time.strftime("%H:%M:%S",time.gmtime(target))
+            )
+            await asyncio.sleep(until_start)
+
         # Root-cause guard: cycle analysis must never start with an empty or
         # unauthenticated account snapshot. A restart immediately before the
         # signal boundary cannot complete five passes safely, so skip that
@@ -3060,7 +3105,7 @@ async def cycle_loop():
         ))
 
         log.info(
-            "CYCLE_WINDOW_START cycle=%s sequence=%s interval=%ss signal_lead=%ss "
+            "CYCLE_WINDOW_START cycle=%s sequence=%s interval=%ss cycle_start_offset=150s signal_lead=%ss "
             "signal_utc=%s target_utc=%s analysis_passes=5 frames=5s,1m..15m",
             cycle_id,cycle_sequence,int(SIGNAL_INTERVAL),int(signal_lead),
             time.strftime("%H:%M:%S",time.gmtime(signal_at)),
@@ -3307,7 +3352,7 @@ async def cycle_loop():
                             # fresh-tick validation + Telegram delivery.
                             remaining_to_signal=max(0.0,signal_at-time.time())
                             final_reference=time.time()
-                            final_items=sorted(
+                            _final_ranked=sorted(
                                 prepared_selected,
                                 key=lambda x:(
                                     float(x.get("final_delivery_precheck") or -900.0),
@@ -3318,6 +3363,20 @@ async def cycle_loop():
                                 ),
                                 reverse=True
                             )
+                            # Final closed-candle preparation is bounded to 12 unique
+                            # assets so it always completes before the 30-second lead.
+                            # The complete deep-qualified candidate_pool remains intact
+                            # for fallback/learning; this only bounds expensive prep.
+                            final_items=[]
+                            _final_seen_pairs=set()
+                            for _item in _final_ranked:
+                                _p=str(_item.get("pair") or "")
+                                if not _p or _p in _final_seen_pairs:
+                                    continue
+                                _final_seen_pairs.add(_p)
+                                final_items.append(_item)
+                                if len(final_items)>=12:
+                                    break
                             for _item in final_items:
                                 p=_item.get("pair")
                                 expected=str(_item.get("direction") or "").upper()
