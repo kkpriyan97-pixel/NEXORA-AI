@@ -3217,23 +3217,17 @@ async def cycle_loop():
             cycle_id,s.pair,STATE["price_source"].get(s.pair,"unknown"),
             s.indicator_context or {}
         )
-        msg=(f"🚨 CANDICE AI SIGNAL\n\n"
-             f"👋 Market setup detected!\n\n"
-             f"📊 {s.display_name}\n\n"
-             f"<b>{'🔻 DOWN' if s.direction.upper() == 'DOWN' else '🟢 UP'}</b>\n"
-             f"<b>⏱️ {s.expiry_minutes} MIN EXPIRY</b>\n\n"
-             f"🕒 {uae_time(ts)} UAE\n"
-             f"🎯 Entry → {uae_time(target)}\n\n"
-             f"💰 Reference → {s.entry_price}\n"
-             f"🎯 Confidence → {s.confidence}%\n\n"
-             f"{indicator_check}\n"
-             f"📈 15m Trend → {s.trend_15m or '—'}\n"
-             f"🕯️ 1m Structure → {s.structure_1m or '—'}\n"
-             f"🧠 Strategy → {s.strategy}\n\n"
-             f"🟣 FLEX PROTOCOL • MANUAL ENTRY\n"
-             f"🔎 Candice 5-Scan → {CYCLE_SCAN_COUNT}/{CYCLE_SCAN_COUNT} complete\n"
-             f"🧠 Strategies Checked → 8\n"
-             f"🤖 Candice Brain • LIVE")
+        ind=s.indicator_context or {}
+        ef=float(ind.get("ema_fast") or 0.0); es=float(ind.get("ema_slow") or 0.0)
+        rv=float(ind.get("rsi") or 0.0); sk=float(ind.get("stochastic_k") or 0.0); sd=float(ind.get("stochastic_d") or 0.0)
+        msg=(f"🚨 <b>CANDICE SIGNAL</b>\n"
+             f"📊 {s.display_name} • <b>{'🔻 DOWN' if s.direction.upper() == 'DOWN' else '🟢 UP'}</b>\n"
+             f"⏱️ <b>{s.expiry_minutes} MIN</b> • 🕒 {uae_time(ts)} → {uae_time(target)} UAE\n"
+             f"💰 Ref {s.entry_price} • 🎯 {s.confidence}%\n"
+             f"📊 EMA {ef:.5f}/{es:.5f} • RSI {rv:.1f} • Stoch {sk:.0f}/{sd:.0f}\n"
+             f"📈 15M {s.trend_15m or '—'} • 1M {s.structure_1m or '—'} • 🧠 {s.strategy}\n"
+             f"🔎 Scan {CYCLE_SCAN_COUNT}/{CYCLE_SCAN_COUNT} • Strategies 8 • 📡 LIVE\n"
+             f"🟣 <b>FLEX • MANUAL ENTRY</b>")
 
         delivery_started=time.perf_counter()
         delivered=await telegram(msg,timeout_seconds=TELEGRAM_SIGNAL_TIMEOUT)
