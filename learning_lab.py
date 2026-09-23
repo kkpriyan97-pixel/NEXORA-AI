@@ -120,6 +120,108 @@ def status():
         "open_trades":len(_open),
     }
 
+async def ensure_session_stats_table():
+    """Create durable per-learning-window counters so reports survive Render restarts."""
+    if not DB_URL:
+        return False
+    try:
+        import psycopg
+        def init():
+            with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS nexora_learning_session_stats (
+                            session_day DATE PRIMARY KEY,
+                            placed INTEGER NOT NULL DEFAULT 0,
+                            wins INTEGER NOT NULL DEFAULT 0,
+                            losses INTEGER NOT NULL DEFAULT 0,
+                            ties INTEGER NOT NULL DEFAULT 0,
+                            blocked INTEGER NOT NULL DEFAULT 0,
+                            strategy_counts JSONB NOT NULL DEFAULT '{}'::jsonb,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                    """)
+                db.commit()
+        await asyncio.to_thread(init)
+        return True
+    except Exception as e:
+        print(f"LEARNING_SESSION_STATS_INIT_FAILED type={type(e).__name__} message={str(e)[:140]}")
+        return False
+
+async def _session_stat_update(day, *, placed=0, win=0, loss=0, tie=0, blocked=0, strategy=""):
+    if not DB_URL:
+        return False
+    try:
+        import psycopg
+        session_day=str(day)
+        strategy=str(strategy or "").upper()
+        def write():
+            with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO nexora_learning_session_stats(
+                            session_day,placed,wins,losses,ties,blocked
+                        )
+                        VALUES(%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT(session_day) DO UPDATE SET
+                            placed=nexora_learning_session_stats.placed+EXCLUDED.placed,
+                            wins=nexora_learning_session_stats.wins+EXCLUDED.wins,
+                            losses=nexora_learning_session_stats.losses+EXCLUDED.losses,
+                            ties=nexora_learning_session_stats.ties+EXCLUDED.ties,
+                            blocked=nexora_learning_session_stats.blocked+EXCLUDED.blocked,
+                            updated_at=NOW()
+                    """,(session_day,int(placed),int(win),int(loss),int(tie),int(blocked)))
+                    if strategy and placed:
+                        cur.execute("""
+                            UPDATE nexora_learning_session_stats
+                            SET strategy_counts=jsonb_set(
+                                COALESCE(strategy_counts,'{}'::jsonb),
+                                ARRAY[%s],
+                                to_jsonb(COALESCE((strategy_counts->>%s)::integer,0)+1),
+                                true
+                            ), updated_at=NOW()
+                            WHERE session_day=%s
+                        """,(strategy,strategy,session_day))
+                db.commit()
+        await asyncio.to_thread(write)
+        return True
+    except Exception as e:
+        print(f"LEARNING_SESSION_STATS_UPDATE_FAILED day={day} type={type(e).__name__} message={str(e)[:120]}")
+        return False
+
+async def _load_session_report(day):
+    if not DB_URL:
+        return None
+    try:
+        import psycopg
+        def read():
+            with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        SELECT placed,wins,losses,ties,blocked,strategy_counts
+                        FROM nexora_learning_session_stats
+                        WHERE session_day=%s
+                    """,(str(day),))
+                    return cur.fetchone()
+        row=await asyncio.to_thread(read)
+        if not row:
+            return None
+        placed,wins,losses,ties,blocked,strategy_counts=row
+        if isinstance(strategy_counts,str):
+            try: strategy_counts=json.loads(strategy_counts)
+            except Exception: strategy_counts={}
+        return {
+            "placed":int(placed or 0),
+            "win":int(wins or 0),
+            "loss":int(losses or 0),
+            "tie":int(ties or 0),
+            "blocked":int(blocked or 0),
+            "strategies":[str(k).upper() for k,v in (strategy_counts or {}).items() if int(v or 0)>0],
+        }
+    except Exception as e:
+        print(f"LEARNING_SESSION_REPORT_LOAD_FAILED day={day} type={type(e).__name__} message={str(e)[:120]}")
+        return None
+
 async def ensure_campaign_table():
     if not DB_URL:
         return False
