@@ -2175,7 +2175,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
             "FINAL_RECOVERY_START seeds=%d deep=%s require_live=%s",
             len(seed_list),deep_analysis,require_live_price
         )
-        for seed in seed_list[:20]:
+        for seed in seed_list[:100]:
             pair=str(seed.get("pair"))
             if pair in recovery_seen:
                 continue
@@ -2283,9 +2283,9 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     # Keep the final pass broad enough to preserve the 150/day operational
     # target without relaxing the Brain quality threshold. The final delivery
     # gate will still reject weak candidates and fall through to the next asset.
-    # Preliminary passes only seed the candidate pool. External AI verification
-    # is reserved for the final/deep pass so provider rate limits and latency
-    # cannot consume the five-pass timing window.
+    # Preliminary passes seed the candidate pool. Deep verification happens before the
+    # final 30-second signal boundary so delivery itself is reserved for the exact
+    # timed Telegram send.
     # Deep/final passes must not arbitrarily discard qualified account assets.
     # refresh_candles() already evaluates the full authenticated account asset set.
     # When deep_analysis is enabled, review every currently Brain-qualified setup
@@ -2491,7 +2491,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         # Pass 5 may provide several Brain+AI-qualified candidates. The delivery
         # stage will check the final candle/quote on each candidate in rank order.
         # This is the key fallback that prevents one asset from suppressing a cycle.
-        return ranked[:20]
+        return ranked[:100]
     if ranked and require_live_price:
         # The broker only keeps a small number of event-1 tick slots active.
         # Refresh candidates sequentially after Brain/AI qualification so a
@@ -2716,7 +2716,7 @@ async def cycle_loop():
     #   - target = exact next 3-minute boundary
     #   - Telegram signal = target minus an exact 30s lead
     #   - five Brain passes are completed inside the same 150s pre-signal window
-    #   - pass 5 is the deep/final qualification pass
+    #   - pass 5 is the deep/final qualification pass 15s before delivery
     #   - 5s + every complete 1m..15m frame are checked in each pass
     #   - result watching and History-AI remain background tasks and never block
     #     the scheduler, so one completed signal cannot stop the next cycle.
@@ -2726,7 +2726,7 @@ async def cycle_loop():
     # before the 1-minute DEMO expiry boundary.
     SIGNAL_INTERVAL=180.0
     SIGNAL_LEADS=(30.0,30.0)
-    SCAN_OFFSETS=(150.0,120.0,90.0,60.0,30.0)
+    SCAN_OFFSETS=(150.0,120.0,90.0,60.0,45.0)
 
     async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
         if not signal_session_active(target):
@@ -2774,78 +2774,35 @@ async def cycle_loop():
             )
             return False
 
-        # LAST-SECOND FINAL CONFIRMATION:
-        # 30s is intentionally removed. Immediately before delivery, keep the
-        # requested 2m candle confirmation PLUS volume/body-strength, 1m candle
-        # gate, and higher-timeframe gate. Indicators are not used here.
-        reference=time.time()
-        closed_1m=_closed_candles(STATE["candles"].get(p,[]),reference)
-        bars2=_aggregate_closed_minutes(closed_1m,2,reference)
-        two=_candle_confirmation_2m(bars2,expected)
-        one=_latest_closed_candle_direction(closed_1m)
-        final_mtf=build_multi_timeframe_context(p,closed_1m,reference,expected)
-        frames=final_mtf.get("frames") or {}
-        higher=[frames.get(f"{m}m",{}) for m in range(5,16)]
-        higher=[x for x in higher if x.get("status")=="READY" and x.get("direction") in {"UP","DOWN"}]
-        higher_align=sum(1 for x in higher if x.get("direction")==expected)
-        higher_opp=sum(1 for x in higher if x.get("direction")!=expected)
-        higher_agreement=higher_align/max(1,len(higher))
-        final_mtf_diag={
-            "2m":two.get("candle_direction",two.get("direction","NEUTRAL")),
-            "2m_bars":len(bars2),
-            "2m_volume_ok":two.get("volume_ok",False),
-            "2m_volume_ratio":two.get("volume_ratio",0),
-            "2m_body_ratio":two.get("body_ratio",0),
-            "1m":one.get("direction","NEUTRAL"),
-            "higher_align":higher_align,
-            "higher_opp":higher_opp,
-            "higher_agreement":round(higher_agreement,3),
-        }
-
-        confirm_reason=None
-        if two.get("status")!="READY":
-            confirm_reason="2m_candle_not_ready"
-        elif two.get("candle_direction")!=expected:
-            confirm_reason="2m_candle_trend_conflict"
-        elif not two.get("candle_ok"):
-            confirm_reason="2m_body_strength_failed"
-        elif two.get("volume_available") and not two.get("volume_ok"):
-            # Broker 2m candle payloads can legitimately omit volume. In that
-            # case volume cannot be used as a hard reject; preserve the volume
-            # rule whenever real volume data is actually available.
-            confirm_reason="2m_volume_confirmation_failed"
-        elif one.get("status")!="READY":
-            confirm_reason="1m_candle_not_ready"
-        elif one.get("direction")!=expected:
-            confirm_reason="1m_candle_trend_conflict"
-        elif len(higher)<1:
-            confirm_reason="higher_timeframe_not_ready"
-        elif higher_agreement<0.60 or higher_opp>2:
-            confirm_reason="higher_timeframe_conflict"
+        # Final closed-candle confirmation is prepared in SCAN_5, which now runs
+        # 15 seconds before the exact signal boundary. The signal second itself is
+        # reserved for the fresh authenticated quote + delivery, eliminating the
+        # previous ~200-300ms boundary race that caused valid setups to miss.
+        prepared_at=candidate.get("final_delivery_prepared_at")
+        prepared_ok=bool(candidate.get("final_delivery_confirmed"))
+        if prepared_at is None or time.time()-float(prepared_at)>20.0:
+            log.info(
+                "FINAL_DELIVERY_PREP_EXPIRED cycle=%s pair=%s prepared_at=%s age=%s next_asset=TRUE",
+                cycle_id,p,prepared_at,
+                ("NONE" if prepared_at is None else f"{time.time()-float(prepared_at):.3f}")
+            )
+            return False
+        if not prepared_ok:
+            log.info(
+                "FINAL_2M_VOLUME_BODY_1M_HIGHER_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
+                cycle_id,p,expected,
+                candidate.get("final_delivery_confirmation_reason","unknown"),
+                candidate.get("final_delivery_diagnostic") or {}
+            )
+            return False
 
         confidence=int(candidate.get("confidence") or 0)
         strategy_name=str(candidate.get("strategy") or "").upper()
         trend_name=str(candidate.get("trend_15m") or "").upper()
 
-        # Keep continuation strategies out of a sideways 15m regime at delivery as
-        # a second hard safety layer. This mirrors the Brain rule and prevents a
-        # stale/recovered candidate from bypassing the regime requirement.
-        if strategy_name in {"MOMENTUM","BREAKOUT"} and trend_name=="SIDEWAYS":
-            confirm_reason="sideways_regime_for_continuation_strategy"
-
-        # Do not relax the closed-candle body-strength gate. A high Brain score
-        # cannot override weak last-closed 2m price action at the exact entry boundary.
-        # This keeps delivery aligned with the same hard evidence used by the final gate.
-        if confirm_reason:
-            log.info(
-                "FINAL_2M_VOLUME_BODY_1M_HIGHER_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
-                cycle_id,p,expected,confirm_reason,final_mtf_diag
-            )
-            return False
-
         log.info(
             "FINAL_2M_VOLUME_BODY_1M_HIGHER_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
-            cycle_id,p,expected,final_mtf_diag
+            cycle_id,p,expected,candidate.get("final_delivery_diagnostic") or {}
         )
         if confidence < 90:
             log.info(
@@ -2855,7 +2812,7 @@ async def cycle_loop():
             return False
 
         ts=target-signal_lead
-        if time.time() > ts+0.25:
+        if time.time() > ts+0.75:
             log.info(
                 "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=deadline_passed",
                 cycle_id,p
@@ -3165,7 +3122,7 @@ async def cycle_loop():
 
             scan_budget=max(1.0,remaining-4.0)
             try:
-                # Pass 5 is delivery-critical. Never start a 52-asset candle
+                # Pass 5 is delivery-prep critical. Never start a 52-asset candle
                 # refresh here: any broker I/O in this 25-second-to-signal window
                 # can push the scheduler past the exact 30-second boundary.
                 # Passes 1-4 already refreshed the closed-candle dataset; final
@@ -3225,7 +3182,7 @@ async def cycle_loop():
                     timeout=max(1.0,remaining-0.50)
                 )
                 if isinstance(candidate,list):
-                    selected=candidate[:20]
+                    selected=candidate[:100]
                     if not selected:
                         log.info(
                             "SCAN_COMPLETE cycle=%s scan=SCAN_%s candidate=none analyzed=%d",
@@ -3301,10 +3258,12 @@ async def cycle_loop():
                                         pass_no,type(e).__name__,str(e)[:120]
                                     )
                         if pass_no==5:
+                            # Pass 5 is deliberately 15 seconds before the exact signal
+                            # boundary. Perform the expensive closed-candle/higher-timeframe
+                            # confirmation here and reserve the boundary itself for only
+                            # fresh-tick validation + Telegram delivery.
                             remaining_to_signal=max(0.0,signal_at-time.time())
                             final_reference=time.time()
-                            for _item in prepared_selected:
-                                _item["final_delivery_precheck"]=_final_delivery_precheck(_item,final_reference)
                             final_items=sorted(
                                 prepared_selected,
                                 key=lambda x:(
@@ -3315,9 +3274,92 @@ async def cycle_loop():
                                     float(x.get("market_quality") or 0)
                                 ),
                                 reverse=True
-                            )[:ACCOUNT_TICK_PIN_SLOTS]
-                            if final_items and remaining_to_signal>=15.0:
+                            )
+                            for _item in final_items:
+                                p=_item.get("pair")
+                                expected=str(_item.get("direction") or "").upper()
+                                closed_1m=_closed_candles(
+                                    STATE["candles"].get(p,[]),final_reference
+                                )
+                                bars2=_aggregate_closed_minutes(closed_1m,2,final_reference)
+                                two=_candle_confirmation_2m(bars2,expected)
+                                one=_latest_closed_candle_direction(closed_1m)
+                                mtf=build_multi_timeframe_context(
+                                    p,closed_1m,final_reference,expected
+                                )
+                                frames=mtf.get("frames") or {}
+                                higher=[
+                                    frames.get(f"{m}m",{})
+                                    for m in range(5,16)
+                                ]
+                                higher=[
+                                    x for x in higher
+                                    if x.get("status")=="READY"
+                                    and x.get("direction") in {"UP","DOWN"}
+                                ]
+                                higher_align=sum(
+                                    1 for x in higher if x.get("direction")==expected
+                                )
+                                higher_opp=sum(
+                                    1 for x in higher if x.get("direction")!=expected
+                                )
+                                higher_agreement=higher_align/max(1,len(higher))
+                                diag={
+                                    "2m":two.get("candle_direction",two.get("direction","NEUTRAL")),
+                                    "2m_bars":len(bars2),
+                                    "2m_volume_ok":two.get("volume_ok",False),
+                                    "2m_volume_ratio":two.get("volume_ratio",0),
+                                    "2m_body_ratio":two.get("body_ratio",0),
+                                    "1m":one.get("direction","NEUTRAL"),
+                                    "higher_align":higher_align,
+                                    "higher_opp":higher_opp,
+                                    "higher_agreement":round(higher_agreement,3),
+                                }
+                                reason=None
+                                if two.get("status")!="READY":
+                                    reason="2m_candle_not_ready"
+                                elif two.get("candle_direction")!=expected:
+                                    reason="2m_candle_trend_conflict"
+                                elif not two.get("candle_ok"):
+                                    reason="2m_body_strength_failed"
+                                elif two.get("volume_available") and not two.get("volume_ok"):
+                                    reason="2m_volume_confirmation_failed"
+                                elif one.get("status")!="READY":
+                                    reason="1m_candle_not_ready"
+                                elif one.get("direction")!=expected:
+                                    reason="1m_candle_trend_conflict"
+                                elif len(higher)<1:
+                                    reason="higher_timeframe_not_ready"
+                                elif higher_agreement<0.60 or higher_opp>2:
+                                    reason="higher_timeframe_conflict"
+                                strategy_name=str(_item.get("strategy") or "").upper()
+                                trend_name=str(_item.get("trend_15m") or "").upper()
+                                if (
+                                    strategy_name in {"MOMENTUM","BREAKOUT"}
+                                    and trend_name=="SIDEWAYS"
+                                ):
+                                    reason="sideways_regime_for_continuation_strategy"
+                                _item["final_delivery_confirmed"]=not bool(reason)
+                                _item["final_delivery_confirmation_reason"]=reason or "confirmed"
+                                _item["final_delivery_diagnostic"]=diag
+                                _item["final_delivery_prepared_at"]=final_reference
+                                if reason:
+                                    log.info(
+                                        "FINAL_DELIVERY_PREP_REJECTED cycle=%s pair=%s reason=%s diagnostic=%s",
+                                        cycle_id,p,reason,diag
+                                    )
+                                else:
+                                    log.info(
+                                        "FINAL_DELIVERY_PREP_CONFIRMED cycle=%s pair=%s diagnostic=%s seconds_to_signal=%.2f",
+                                        cycle_id,p,diag,remaining_to_signal
+                                    )
+
+                            final_items=final_items[:ACCOUNT_TICK_PIN_SLOTS]
+                            if final_items:
                                 try:
+                                    # Keep the strongest four live through the signal
+                                    # boundary. All remaining qualified candidates stay
+                                    # in the fallback pool and can be tried when one fails.
                                     pin_ttl=max(30.0,target-time.time()+12.0)
                                     active_prep=await pin_account_tick_pairs(
                                         [x.get("pair") for x in final_items],
@@ -3335,11 +3377,6 @@ async def cycle_loop():
                                         cycle_id,[x.get("pair") for x in final_items],
                                         pass_no,type(e).__name__,str(e)[:120]
                                     )
-                            elif final_items:
-                                log.info(
-                                    "FINAL_CANDIDATE_TICKS_FINAL_REPIN_SKIPPED_LATE cycle=%s seconds_to_signal=%.2f",
-                                    cycle_id,remaining_to_signal
-                                )
 
                         for item in selected:
                             log.info(
@@ -3455,7 +3492,7 @@ async def cycle_loop():
                             )
                             added=0
                             final_reference=time.time()
-                            for raw_recovered in recovered_list[:6]:
+                            for raw_recovered in recovered_list[:100]:
                                 if not isinstance(raw_recovered,dict) or not raw_recovered.get("pair"):
                                     continue
                                 item=raw_recovered.copy()
@@ -3549,10 +3586,10 @@ async def cycle_loop():
             and bool(x.get("deep_verified"))
         ]
         now_boundary=time.time()
-        # Pass 5 already calculated final_delivery_precheck ahead of this moment.
-        # Never recompute candle/timeframe evidence at the exact boundary: that
-        # work added ~300ms of latency in live verification. The final send routine
-        # remains the authoritative last-second hard gate.
+        # Pass 5 now runs 15 seconds before the signal boundary. It prepares the final
+        # closed-candle gate ahead of time; the exact signal second is delivery-only.
+        # This prevents a valid candidate from being rejected merely because local
+        # final verification consumed a few hundred milliseconds at the boundary.
         # The cached precheck is ranking evidence only, never a hard
         # eligibility gate. The authoritative send_cycle_signal() gate below
         # rechecks fresh price, closed 30s/1m/2m candles, higher timeframes,
