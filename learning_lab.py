@@ -474,8 +474,16 @@ async def _load_campaign(session_id):
 async def _initialize_campaign(session_id):
     if CAMPAIGN_STATE.get("session_id")==session_id and CAMPAIGN_STATE.get("strategy"):
         return CAMPAIGN_STATE
-    loaded=await _load_campaign(session_id)
+    try:
+        loaded=await asyncio.wait_for(_load_campaign(session_id),timeout=9.0)
+    except asyncio.TimeoutError:
+        log.warning("LEARNING_CAMPAIGN_LOAD_TIMEOUT session=%s",session_id)
+        loaded=None
+    except Exception as e:
+        log.warning("LEARNING_CAMPAIGN_LOAD_FAILED session=%s type=%s message=%s",session_id,type(e).__name__,str(e)[:120])
+        loaded=None
     if loaded:
+        log.info("LEARNING_CAMPAIGN_RESTORED session=%s strategy=%s sampled=%s",session_id,loaded.get("strategy"),loaded.get("sampled",0))
         return loaded
 
     # Ask the council once at session start. Its result determines the first
@@ -483,7 +491,9 @@ async def _initialize_campaign(session_id):
     strategy=""
     votes={}
     try:
+        log.info("LEARNING_CAMPAIGN_SEED_START session=%s",session_id)
         seed=await asyncio.wait_for(_build_candidate(),timeout=LEARNING_SCAN_TIMEOUT_SECONDS)
+        log.info("LEARNING_CAMPAIGN_SEED_DONE session=%s candidate=%s",session_id,bool(seed))
         if seed:
             strategy=str(seed.get("council_consensus") or seed.get("strategy") or "").upper()
             votes=dict(seed.get("council_votes") or {})
@@ -518,7 +528,18 @@ async def _initialize_campaign(session_id):
         "strategy_index":0,"sampled":0,"wins":0,"losses":0,"ties":0,
         "status":"ACTIVE","strategies":ordered,"started_at":time.time(),
     })
-    await _save_campaign()
+    try:
+        saved=await asyncio.wait_for(_save_campaign(),timeout=9.0)
+    except asyncio.TimeoutError:
+        saved=False
+        log.warning("LEARNING_CAMPAIGN_SAVE_TIMEOUT session=%s strategy=%s",session_id,ordered[0])
+    except Exception as e:
+        saved=False
+        log.warning("LEARNING_CAMPAIGN_SAVE_FAILED session=%s strategy=%s type=%s message=%s",session_id,ordered[0],type(e).__name__,str(e)[:120])
+    log.info(
+        "LEARNING_STRATEGY_CAMPAIGN_START session=%s strategy=%s index=0 target_trades=100 min_win_rate=85%% target_win_rate=90%% db_saved=%s",
+        session_id,ordered[0],saved
+    )
     print(
         f"LEARNING_STRATEGY_CAMPAIGN_START session={session_id} "
         f"strategy={ordered[0]} index=0 target_trades=100 min_win_rate=85% target_win_rate=90%"
@@ -1685,6 +1706,11 @@ async def run_forever():
             if practice_active(now):
                 if time.time()-last_heartbeat >= 60:
                     last_heartbeat=time.time()
+                    log.info(
+                        "LEARNING_HEARTBEAT day=%s active=True pending=%s open=%s placed=%s win=%s loss=%s tie=%s blocked=%s campaign_strategy=%s campaign_progress=%s/100",
+                        day,len(_pending),len(_open),_daily["placed"],_daily["win"],_daily["loss"],_daily["tie"],_daily["blocked"],
+                        CAMPAIGN_STATE.get("strategy") or "INIT",CAMPAIGN_STATE.get("sampled",0)
+                    )
                     print(
                         f"LEARNING_HEARTBEAT day={day} active=True pending={len(_pending)} "
                         f"open={len(_open)} placed={_daily['placed']} win={_daily['win']} "
@@ -1693,7 +1719,9 @@ async def run_forever():
                         f"campaign_progress={CAMPAIGN_STATE.get('sampled',0)}/100"
                     )
                 if CAMPAIGN_STATE.get("session_id")!=str(day) or not CAMPAIGN_STATE.get("strategy"):
+                    log.info("LEARNING_CAMPAIGN_INIT_REQUEST day=%s current_session=%s current_strategy=%s",day,CAMPAIGN_STATE.get("session_id"),CAMPAIGN_STATE.get("strategy"))
                     await _initialize_campaign(str(day))
+                    log.info("LEARNING_CAMPAIGN_INIT_DONE day=%s strategy=%s status=%s",day,CAMPAIGN_STATE.get("strategy"),CAMPAIGN_STATE.get("status"))
                 if CAMPAIGN_STATE.get("status")=="ACTIVE" and time.time()-last_scan >= LOOP_SECONDS:
                     last_scan=time.time()
                     strategy=str(CAMPAIGN_STATE.get("strategy") or "").upper()
@@ -1702,6 +1730,7 @@ async def run_forever():
                         f"timezone=Asia/Dubai ai_council=True fixed_strategy={strategy} "
                         f"target=100 min_win_rate=85%"
                     )
+                    log.info("LEARNING_SCAN_START day=%s strategy=%s",day,strategy)
                     try:
                         candidates=await asyncio.wait_for(
                             _build_candidate(strategy,return_all=True),
@@ -1713,7 +1742,8 @@ async def run_forever():
                     except Exception as e:
                         candidates=[]
                         print(f"LEARNING_SCAN_FAILED type={type(e).__name__} message={str(e)[:160]} fallback=next_scan")
-                    await _send_campaign_batch(candidates)
+                    accepted=await _send_campaign_batch(candidates)
+                    log.info("LEARNING_SCAN_DONE day=%s strategy=%s candidates=%s accepted=%s",day,strategy,len(candidates),accepted)
             # While the 2h window is active, allow another candidate only after the
             # previous order has completed. This prevents overlapping demo orders.
             for tid,rec in list(_open.items()):
