@@ -2871,13 +2871,10 @@ async def cycle_loop():
             return False
 
         try:
-            # Preserve the Brain-selected expiry. The previous hard-coded
-            # expiry_minutes=1 silently converted every live signal to 1 minute
-            # and prevented legitimate 3-minute signals from reaching Telegram.
-            try:
-                signal_expiry=max(1,min(15,int(candidate.get("expiry_minutes") or 3)))
-            except (TypeError,ValueError):
-                signal_expiry=3
+            # Live signal expiry is permanently fixed at 1 minute.
+            # The 3-minute value is the cycle interval only; it must never
+            # change the DEMO signal expiry in this delivery lane.
+            signal_expiry=1
             s=BRAIN.mark_signal_sent(
                 account_id=STATE.get("account_id"),
                 pair=p,display_name=candidate["display_name"],
@@ -3670,9 +3667,8 @@ async def cycle_loop():
         )
         await asyncio.sleep(0)
 
-        # Immediately iterate to the next 2m30s target. Because the first
-        # scan of the next target is 2m30s before that target, the next cycle
-        # is queued as soon as the current signal boundary is released.
+        # Immediately iterate to the next 3-minute target. The first scan
+        # begins 150s before that target, preserving the fixed 30s delivery lead.
 
 async def cycle_loop_supervisor():
     """Keep the scheduler alive if cycle_loop exits unexpectedly."""
