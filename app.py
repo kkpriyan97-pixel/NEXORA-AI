@@ -26,6 +26,14 @@ from learning_lab import (
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+class _BrokerTickCapabilityFilter(logging.Filter):
+    def filter(self, record):
+        msg = str(record.getMessage() or "")
+        if record.name == "olymptrade_ws.api.market" and "Tick subscription event=12 rejected" in msg and ("invalid_request" in msg.lower() or "invalid request" in msg.lower()):
+            record.levelno = logging.INFO
+            record.levelname = "INFO"
+        return True
+logging.getLogger("olymptrade_ws.api.market").addFilter(_BrokerTickCapabilityFilter())
 log=logging.getLogger("candice")
 
 LEARNING_DB_URL=os.getenv("DATABASE_URL","").strip()
@@ -888,7 +896,8 @@ ACCOUNT_TICK_PIN_SLOTS=2
 ACCOUNT_TICK_ROTATE_INTERVAL=15.0
 # Temporarily back off pairs that the authenticated event-12 channel explicitly
 # rejects, instead of wasting every rotation/final-boundary slot on them.
-ACCOUNT_TICK_REJECT_COOLDOWN=60.0
+ACCOUNT_TICK_REJECT_COOLDOWN=600.0
+ACCOUNT_TICK_REJECT_BACKOFF=(600.0,1800.0,7200.0,43200.0,86400.0)
 ACCOUNT_TICK_FRESH_WAIT=0.5
 ACCOUNT_TICK_FINAL_PROBE_LIMIT=8
 ACCOUNT_TICK_SUB_TIMEOUT=1.8
@@ -1321,14 +1330,11 @@ async def _subscribe_account_tick(pair):
                 or "rejected after 2 attempts" in lower
             )
             if broker_unusable:
-                ACCOUNT_TICK_REJECT_UNTIL[pair]=time.time()+ACCOUNT_TICK_REJECT_COOLDOWN
-            log.warning(
-                "ACCOUNT_TICK_SUBSCRIBE pair=%s status=rejected attempt=%d broker_unusable=%s cooldown_until=%s type=%s message=%s",
-                pair,attempt,broker_unusable,
-                (datetime.fromtimestamp(ACCOUNT_TICK_REJECT_UNTIL[pair],tz=timezone.utc).strftime("%H:%M:%S")
-                 if pair in ACCOUNT_TICK_REJECT_UNTIL else "NONE"),
-                type(e).__name__,msg
-            )
+                backoff=ACCOUNT_TICK_REJECT_BACKOFF[min(attempt-1,len(ACCOUNT_TICK_REJECT_BACKOFF)-1)]
+                ACCOUNT_TICK_REJECT_UNTIL[pair]=time.time()+backoff
+                log.info("ACCOUNT_TICK_CAPABILITY_MISS pair=%s attempt=%d retry_after=%.0fs action=skip_and_fallback type=%s", pair,attempt,backoff,type(e).__name__)
+            else:
+                log.warning("ACCOUNT_TICK_SUBSCRIBE pair=%s status=rejected attempt=%d broker_unusable=false type=%s message=%s", pair,attempt,type(e).__name__,msg)
             return False
 
 def _tick_pinned_pairs():
@@ -1418,78 +1424,21 @@ async def pin_account_tick_pairs(pairs,ttl=12.0,require_fresh=False,fresh_wait=N
         return active_targets
 
 async def ensure_account_tick_subscriptions():
-    """Rotate the authenticated event-1 tick slots across the exact account asset universe.
+    """Candidate-driven authenticated event-1 coverage manager.
 
-    The authenticated broker feed has been observed to accept four simultaneous
-    per-connection pair subscriptions. Rotate those four live slots across the
-    complete account universe and pin final candidates before the exact boundary.
-    Never attempt to subscribe all account assets at once.
+    Final candidate preparation owns event-12 live slots. Do not rotate
+    subscriptions across the full account universe; that creates avoidable
+    INVALID_REQUEST churn and can consume the timing budget.
     """
-    global ACCOUNT_TICK_ROTATE_CURSOR, ACCOUNT_TICK_LAST_ROTATION
-    client=CLIENT
-    if not client or not client.connection.is_connected:
-        return
-    # Live-feed coverage must include every account asset. Signal eligibility is
-    # a Brain decision-layer concern and must not remove an asset from the
-    # authenticated market-data rotation.
-    assets=[a for a in list(STATE["assets"]) if a.get("pair")]
-    if not assets:
-        return
-
-    async with ACCOUNT_TICK_CONTROL_LOCK:
-        pinned=_tick_pinned_pairs()
-        if pinned:
-            # pin_account_tick_pairs() owns this same lock and already made the
-            # pinned subscriptions live. Never run normal rotation while a
-            # final candidate is pinned; doing so could unsubscribe it between
-            # the final-candidate pin and the signal deadline.
-            return
-
-        now=time.time()
-        if now-ACCOUNT_TICK_LAST_ROTATION < ACCOUNT_TICK_ROTATE_INTERVAL:
-            return
-
-        all_pairs=[str(a["pair"]) for a in assets]
-        now=time.time()
-        available_pairs=[
-            p for p in all_pairs
-            if float(ACCOUNT_TICK_REJECT_UNTIL.get(p) or 0.0)<=now
-        ]
-        pairs=available_pairs or all_pairs
-        n=len(pairs)
-        start=ACCOUNT_TICK_ROTATE_CURSOR % n
-        targets=[pairs[(start+i) % n] for i in range(min(ACCOUNT_TICK_MAX_SLOTS,n))]
-        ACCOUNT_TICK_ROTATE_CURSOR=(start+len(targets)) % n
-
-        # Free existing slots first; event 13 is the authenticated tick unsubscribe.
-        for p in list(ACCOUNT_TICK_SUBSCRIBED):
-            if p not in targets:
-                await _unsubscribe_account_tick(p)
-
-        accepted=0
-        for p in targets:
-            if p in ACCOUNT_TICK_SUBSCRIBED:
-                continue
-            if await _subscribe_account_tick(p):
-                accepted+=1
-            await asyncio.sleep(0.05)
-
-        ACCOUNT_TICK_LAST_ROTATION=now
-        log.info("ACCOUNT_TICK_SLOT_ROTATION targets=%s accepted=%d active=%d cursor=%d",
-                 targets,accepted,len(ACCOUNT_TICK_SUBSCRIBED),ACCOUNT_TICK_ROTATE_CURSOR)
+    return None
 
 async def account_tick_subscription_worker():
+    # Event-12 ownership is candidate-driven now; no background subscription churn.
     while True:
         try:
-            if CLIENT and CLIENT.connection.is_connected:
-                await ensure_account_tick_subscriptions()
+            await asyncio.sleep(5.0)
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            log.warning("ACCOUNT_TICK_SUBSCRIPTION_WORKER_ERROR type=%s message=%s",
-                        type(e).__name__,str(e)[:160])
-        await asyncio.sleep(1.0)
-
 TELEGRAM_HTTP_CLIENT=None
 TELEGRAM_HTTP_CLIENT_LOCK=asyncio.Lock()
 TELEGRAM_SIGNAL_TIMEOUT=2.0
