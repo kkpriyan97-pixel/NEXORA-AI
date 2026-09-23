@@ -3002,7 +3002,7 @@ async def result_watch(key):
     direction_icon="⬆️" if rec["direction"]=="UP" else "⬇️"
     result_icon={"WIN":"✅","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
     await telegram(
-        f"🧪 SIGNAL TEST RESULT\n"
+        f"📊 LIVE SIGNAL RESULT\n"
         f"\n"
         f"📈 {label}\n"
         f"\n"
@@ -3020,7 +3020,7 @@ async def result_watch(key):
         f"\n"
         f"{result_icon} {rec['result']}\n"
         f"\n"
-        f"⚠️ SIGNAL TEST ONLY — DEMO AUTO-TRADE OFF"
+        f"⚠️ LIVE SIGNAL — MANUAL • DEMO AUTO-TRADE OFF"
     )
     await complete_result_watch(watch_id)
     log.info(
@@ -3193,7 +3193,7 @@ async def cycle_loop():
              f"📈 Trend → {s.trend_15m or '—'}\n"
              f"🕯️ Structure → {s.structure_1m or '—'}\n"
              f"🧠 Strategy → {s.strategy}\n\n"
-             f"🟢 DEMO • READ ONLY\n"
+             f"🟢 LIVE SIGNAL • MANUAL\n"
              f"🤖 CANDICE BRAIN")
 
         delivery_started=time.perf_counter()
