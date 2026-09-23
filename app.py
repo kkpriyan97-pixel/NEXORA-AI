@@ -1300,7 +1300,7 @@ async def account_live_feed_worker():
 
 async def _unsubscribe_account_tick(pair):
     client=CLIENT
-    if not client or not pair:
+    if not client or not pair or not getattr(client.connection,"is_connected",False):
         return False
     try:
         await asyncio.wait_for(client.market.unsubscribe_ticks(pair),timeout=4.0)
@@ -1314,7 +1314,7 @@ async def _unsubscribe_account_tick(pair):
 
 async def _subscribe_account_tick(pair):
     client=CLIENT
-    if not client or not pair:
+    if not client or not pair or not getattr(client.connection,"is_connected",False):
         return False
     # Hard broker-capacity invariant. The authenticated connection currently
     # accepts two simultaneous Event-12 subscriptions. Never send Event-12
@@ -4157,6 +4157,13 @@ async def market_worker():
             last_asset_sync=time.time()
             while True:
                 await asyncio.sleep(15)
+                # If the authenticated websocket drops after startup, restart the
+                # market worker instead of keeping a dead client alive and repeatedly
+                # issuing "Not connected" market requests. The outer retry path
+                # recreates the client and re-establishes the demo session.
+                if not getattr(client.connection,"is_connected",False):
+                    STATE["status"]="reconnecting"
+                    raise ConnectionError("WebSocket disconnected during runtime")
                 now_sync=time.time()
                 if now_sync-last_asset_sync>=60.0:
                     if await sync_account_assets(client,reason="periodic"):
@@ -4168,7 +4175,11 @@ async def market_worker():
             log.exception("MARKET_WORKER_ERROR %s",e)
             # Connection startup failures are retried quickly so a transient
             # broker websocket drop cannot suppress the next signal cycle.
-            retry_delay=4 if "Not connected" in str(e) or "WebSocket dropped" in str(e) else 30
+            retry_delay=4 if (
+                "Not connected" in str(e)
+                or "WebSocket dropped" in str(e)
+                or "WebSocket disconnected" in str(e)
+            ) else 30
             await asyncio.sleep(retry_delay)
         finally:
             try:await client.stop()
