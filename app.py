@@ -2689,7 +2689,7 @@ async def result_watch(key):
     client=CLIENT
     for attempt in range(1,5):
         try:
-            if client:
+            if client and getattr(client.connection,"is_connected",False):
                 raw=await asyncio.wait_for(
                     client.market.get_candles(s.pair,size=60,count=60),
                     timeout=2.0
@@ -2725,7 +2725,7 @@ async def result_watch(key):
             client=CLIENT
             for attempt in range(1,5):
                 try:
-                    if client:
+                    if client and getattr(client.connection,"is_connected",False):
                         raw=await asyncio.wait_for(
                             client.market.get_candles(s.pair,size=60,count=60),
                             timeout=2.0
