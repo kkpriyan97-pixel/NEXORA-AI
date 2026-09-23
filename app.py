@@ -2110,7 +2110,13 @@ def build_multi_timeframe_context(pair,candles,reference_ts=None,expected=None):
     }
 
 def multi_timeframe_confirmation(context,expected):
-    """Final closed-candle confirmation gate for a 1-minute signal."""
+    """Final closed-candle confirmation gate for a 1-minute signal.
+
+    The authenticated event-1 tick stream is not guaranteed to provide enough
+    30-second buckets for every asset. A missing 30s frame therefore uses a
+    clearly-labelled strict substitute built from closed 1m/2m + higher frames;
+    it never fabricates a 30s candle.
+    """
     expected=str(expected or "").upper()
     frames=dict((context or {}).get("frames") or {})
     if expected not in {"UP","DOWN"}:
@@ -2121,10 +2127,25 @@ def multi_timeframe_confirmation(context,expected):
     one=frames.get("1m",{})
     two=frames.get("2m",{}).get("candle_confirmation") or {}
 
-    if thirty.get("status")!="READY":
-        return False,{"reason":"30s_confirmation_insufficient","bars":thirty.get("bars",0)}
-    if thirty.get("direction")!=expected:
-        return False,{"reason":"30s_candle_trend_conflict","direction":thirty.get("direction","NEUTRAL")}
+    thirty_status=str(thirty.get("status") or "")
+    thirty_available=thirty_status=="READY" and int(thirty.get("bars") or 0)>=2
+    thirty_mode="CONFIRMED" if thirty_available else "UNAVAILABLE_STRICT_SUBSTITUTE"
+
+    if thirty_available:
+        if thirty.get("direction")!=expected:
+            return False,{
+                "reason":"30s_candle_trend_conflict",
+                "direction":thirty.get("direction","NEUTRAL")
+            }
+    else:
+        # Never synthesize a 30s candle from 1m data. When the broker stream has
+        # fewer than two closed 30s buckets, rely on a stronger closed-candle
+        # substitute below.
+        if int(thirty.get("bars") or 0):
+            log.info(
+                "30S_CONFIRMATION_UNAVAILABLE reason=insufficient_closed_30s_bars bars=%s mode=%s",
+                thirty.get("bars",0),thirty_mode
+            )
 
     if one.get("status")!="READY":
         return False,{"reason":"1m_confirmation_insufficient","bars":one.get("bars",0)}
@@ -2145,8 +2166,6 @@ def multi_timeframe_confirmation(context,expected):
 
     volume_available=bool(two.get("volume_available"))
     volume_ok=bool(two.get("volume_ok"))
-    # Volume is used when the broker provides it. When it is unavailable, do not
-    # pretend it was confirmed; require a stronger candle/structure substitute.
     if volume_available and not volume_ok:
         return False,{"reason":"2m_volume_confirmation_failed",
                        "volume_ratio":two.get("volume_ratio",0),
@@ -2159,19 +2178,27 @@ def multi_timeframe_confirmation(context,expected):
         return False,{"reason":"short_frames_insufficient","ready":len(short)}
     short_align=sum(1 for x in short if x.get("direction")==expected)
     short_opp=sum(1 for x in short if x.get("direction") not in {expected,"NEUTRAL"})
-    required_align=3
-    if not volume_available:
-        # Missing volume requires all four short frames to agree and a stronger
-        # 2m candle, reducing false continuation signals without blocking the
-        # scheduler itself.
-        required_align=4
-        if float(two.get("body_ratio") or 0.0)<0.65:
-            return False,{"reason":"volume_unavailable_requires_stronger_body",
-                           "body_ratio":two.get("body_ratio",0)}
+
+    # Normal path: at least 3 of 4 short frames agree.
+    # Strict substitute path: when 30s is unavailable, demand all 4 short
+    # frames and a stronger 2m candle. This restores signal continuity without
+    # allowing a weak 30s data gap to become a false approval.
+    required_align=4 if not thirty_available else 3
+    minimum_body=0.65 if not thirty_available else 0.45
     if short_align<required_align or short_opp>1:
-        return False,{"reason":"short_frame_conflict",
-                       "align":short_align,"opp":short_opp,
-                       "required_align":required_align}
+        return False,{
+            "reason":"short_frame_conflict",
+            "align":short_align,"opp":short_opp,
+            "required_align":required_align,
+            "30s_mode":thirty_mode
+        }
+    if float(two.get("body_ratio") or 0.0)<minimum_body:
+        return False,{
+            "reason":"strict_substitute_body_insufficient" if not thirty_available else "2m_candle_strength_insufficient",
+            "body_ratio":two.get("body_ratio",0),
+            "required_body_ratio":minimum_body,
+            "30s_mode":thirty_mode
+        }
 
     all_ready=[]
     for m in range(5,16):
@@ -2182,12 +2209,15 @@ def multi_timeframe_confirmation(context,expected):
     align=sum(1 for x in directional if x.get("direction")==expected)
     opp=sum(1 for x in directional if x.get("direction")!=expected)
     agreement=align/max(1,len(directional))
-    required_higher=0.70 if not volume_available else 0.60
+    required_higher=0.70 if (not thirty_available or not volume_available) else 0.60
     if directional and (agreement<required_higher or opp>2):
-        return False,{"reason":"higher_frame_conflict",
-                       "align":align,"opp":opp,"directional":len(directional),
-                       "agreement":round(agreement,3),
-                       "required_agreement":required_higher}
+        return False,{
+            "reason":"higher_frame_conflict",
+            "align":align,"opp":opp,"directional":len(directional),
+            "agreement":round(agreement,3),
+            "required_agreement":required_higher,
+            "30s_mode":thirty_mode
+        }
 
     five_status=five.get("status")
     five_direction=five.get("direction","NEUTRAL")
@@ -2199,6 +2229,7 @@ def multi_timeframe_confirmation(context,expected):
         "reason":"multi_timeframe_confirmed",
         "30s":thirty.get("direction","NEUTRAL"),
         "30s_bars":thirty.get("bars",0),
+        "30s_mode":thirty_mode,
         "1m":one.get("direction","NEUTRAL"),
         "2m":two.get("candle_direction","NEUTRAL"),
         "2m_same_direction_candles":two.get("same_direction_candles",0),
