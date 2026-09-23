@@ -1306,23 +1306,40 @@ async def pin_account_tick_pairs(pairs,ttl=12.0):
             p=str(p or "")
             if p and p not in seen:
                 seen.add(p);unique.append(p)
-        targets=unique[:ACCOUNT_TICK_PIN_SLOTS]
+        probe_limit=min(
+            len(unique),
+            max(ACCOUNT_TICK_PIN_SLOTS*2,ACCOUNT_TICK_PIN_SLOTS)
+        )
+        targets=unique[:probe_limit]
         until=time.time()+float(ttl)
-        for p in targets:
-            ACCOUNT_TICK_PINNED[p]=until
 
         # Never turn a transient event-12 rejection into zero live-tick coverage.
-        # Remember healthy slots and restore any unused slot when a target cannot
-        # be subscribed. The Brain candidate/direction is unchanged; this is only
-        # read-only quote-feed resilience.
+        # Probe beyond the first four candidates and keep no more than four
+        # subscriptions active. This improves the chance that the strongest
+        # fallback assets have authenticated event-1 coverage.
         previous_active=set(ACCOUNT_TICK_SUBSCRIBED)
         for p in list(previous_active):
             if p not in targets:
                 await _unsubscribe_account_tick(p)
 
+        accepted_targets=[]
         for p in targets:
-            if p not in ACCOUNT_TICK_SUBSCRIBED:
-                await _subscribe_account_tick(p)
+            if p in ACCOUNT_TICK_SUBSCRIBED:
+                accepted_targets.append(p)
+                if len(accepted_targets)>=ACCOUNT_TICK_PIN_SLOTS:
+                    break
+                continue
+            if await _subscribe_account_tick(p):
+                accepted_targets.append(p)
+            if len(accepted_targets)>=ACCOUNT_TICK_PIN_SLOTS:
+                break
+
+        # Pin only assets that are actually subscribed.
+        for p in list(ACCOUNT_TICK_PINNED):
+            if p not in accepted_targets:
+                ACCOUNT_TICK_PINNED.pop(p,None)
+        for p in accepted_targets:
+            ACCOUNT_TICK_PINNED[p]=until
 
         restored=[]
         for p in sorted(previous_active):
@@ -1333,11 +1350,11 @@ async def pin_account_tick_pairs(pairs,ttl=12.0):
             if await _subscribe_account_tick(p):
                 restored.append(p)
 
-        active_targets=sum(1 for p in targets if p in ACCOUNT_TICK_SUBSCRIBED)
+        active_targets=sum(1 for p in accepted_targets if p in ACCOUNT_TICK_SUBSCRIBED)
         ACCOUNT_TICK_LAST_ROTATION=time.time()
         log.info(
             "ACCOUNT_TICK_PIN targets=%s active=%s active_targets=%d restored=%s ttl=%.1f",
-            targets,sorted(ACCOUNT_TICK_SUBSCRIBED),active_targets,restored,float(ttl)
+            accepted_targets,sorted(ACCOUNT_TICK_SUBSCRIBED),active_targets,restored,float(ttl)
         )
         return active_targets
 
@@ -3127,7 +3144,7 @@ async def cycle_loop():
                 # can push the scheduler past the exact 30-second boundary.
                 # Passes 1-4 already refreshed the closed-candle dataset; final
                 # delivery separately enforces live-tick freshness.
-                force_refresh=(pass_no!=5)
+                force_refresh=(pass_no in (1,4))
                 if pass_no==5:
                     await asyncio.sleep(0)
                     force_refresh=False
@@ -3166,21 +3183,37 @@ async def cycle_loop():
                 break
 
             try:
-                candidate=await asyncio.wait_for(
-                    final_candidate(
-                        # Pass 4 has enough time to perform external AI verification
-                        # and warm its cache. Pass 5 is the exact delivery pass, so
-                        # it must be cache-only; no provider timeout may consume the
-                        # final signal window.
-                        require_live_price=False,
-                        deep_analysis=(pass_no in (4,5)),
-                        use_cached_only=(pass_no==5),
-                        # Rank several candidates in the deep passes. Pass 4 uses
-                        # that ranked set to prepare authenticated tick coverage.
-                        return_ranked=(pass_no in (4,5))
-                    ),
-                    timeout=max(1.0,remaining-0.50)
-                )
+                if pass_no==5:
+                    # PASS_5 is delivery preparation only. The expensive Brain/AI
+                    # qualification is already completed in pass 4. Reusing the
+                    # current deep-qualified pool avoids the boundary race that
+                    # previously consumed the last seconds before Telegram delivery.
+                    candidate=sorted(
+                        [
+                            x for x in candidate_pool.values()
+                            if isinstance(x,dict)
+                            and x.get("pair")
+                            and int(x.get("qualified_pass") or 0)>=4
+                            and bool(x.get("deep_verified"))
+                        ],
+                        key=lambda x:(
+                            int(x.get("confidence") or 0),
+                            float(x.get("strategy_margin") or 0),
+                            float(x.get("direction_agreement") or 0),
+                            float(x.get("market_quality") or 0)
+                        ),
+                        reverse=True
+                    )[:100]
+                else:
+                    candidate=await asyncio.wait_for(
+                        final_candidate(
+                            require_live_price=False,
+                            deep_analysis=(pass_no==4),
+                            use_cached_only=False,
+                            return_ranked=(pass_no==4)
+                        ),
+                        timeout=max(1.0,remaining-0.50)
+                    )
                 if isinstance(candidate,list):
                     selected=candidate[:100]
                     if not selected:
@@ -3225,7 +3258,7 @@ async def cycle_loop():
                             prep_reference=time.time()
                             for _item in prepared_selected:
                                 _item["final_delivery_precheck"]=_final_delivery_precheck(_item,prep_reference)
-                            prep_items=sorted(
+                            _prep_ranked=sorted(
                                 prepared_selected,
                                 key=lambda x:(
                                     float(x.get("final_delivery_precheck") or -900.0),
@@ -3235,7 +3268,17 @@ async def cycle_loop():
                                     float(x.get("market_quality") or 0)
                                 ),
                                 reverse=True
-                            )[:ACCOUNT_TICK_PIN_SLOTS]
+                            )
+                            prep_items=[]
+                            _prep_seen_pairs=set()
+                            for _item in _prep_ranked:
+                                _p=str(_item.get("pair") or "")
+                                if not _p or _p in _prep_seen_pairs:
+                                    continue
+                                _prep_seen_pairs.add(_p)
+                                prep_items.append(_item)
+                                if len(prep_items)>=ACCOUNT_TICK_PIN_SLOTS:
+                                    break
                             if prep_items:
                                 pin_ttl=max(45.0,target-time.time()+20.0)
                                 try:
@@ -3354,27 +3397,36 @@ async def cycle_loop():
                                         cycle_id,p,diag,remaining_to_signal
                                     )
 
-                            final_items=final_items[:ACCOUNT_TICK_PIN_SLOTS]
-                            if final_items:
+                            _pin_items=[]
+                            _pin_seen_pairs=set()
+                            for _item in final_items:
+                                _p=str(_item.get("pair") or "")
+                                if not _p or _p in _pin_seen_pairs:
+                                    continue
+                                _pin_seen_pairs.add(_p)
+                                _pin_items.append(_item)
+                                if len(_pin_items)>=ACCOUNT_TICK_PIN_SLOTS:
+                                    break
+                            if _pin_items:
                                 try:
-                                    # Keep the strongest four live through the signal
-                                    # boundary. All remaining qualified candidates stay
-                                    # in the fallback pool and can be tried when one fails.
+                                    # Keep the strongest four UNIQUE assets live
+                                    # through the exact signal boundary. The full
+                                    # candidate_pool remains available for fallback.
                                     pin_ttl=max(30.0,target-time.time()+12.0)
                                     active_prep=await pin_account_tick_pairs(
-                                        [x.get("pair") for x in final_items],
+                                        [x.get("pair") for x in _pin_items],
                                         ttl=pin_ttl
                                     )
                                     log.info(
                                         "FINAL_CANDIDATE_TICKS_FINAL_PREPARED cycle=%s pairs=%s pass=%s active=%s ttl=%.1f seconds_to_signal=%.2f",
-                                        cycle_id,[x.get("pair") for x in final_items],
+                                        cycle_id,[x.get("pair") for x in _pin_items],
                                         pass_no,active_prep,pin_ttl,
                                         max(0.0,signal_at-time.time())
                                     )
                                 except Exception as e:
                                     log.warning(
                                         "FINAL_CANDIDATE_TICKS_FINAL_PREPARE_FAILED cycle=%s pairs=%s pass=%s type=%s message=%s",
-                                        cycle_id,[x.get("pair") for x in final_items],
+                                        cycle_id,[x.get("pair") for x in _pin_items],
                                         pass_no,type(e).__name__,str(e)[:120]
                                     )
 
@@ -3383,7 +3435,7 @@ async def cycle_loop():
                                 "SCAN_CANDIDATE_SELECTED cycle=%s scan=SCAN_%s pass=%s pair=%s "
                                 "confidence=%s strategy=%s expiry=%s pool=%s deep=%s",
                                 cycle_id,pass_no,pass_no,item.get("pair"),
-                                item.get("confidence"),item.get("strategy"),item.get("expiry_minutes"),
+                                item.get("confidence"),item.get("strategy"),1,
                                 len(candidate_pool),pass_no==5
                             )
                 elif candidate is None:
@@ -3597,15 +3649,18 @@ async def cycle_loop():
         # become conservative/stale while the live candidate remains valid;
         # filtering it here was able to suppress an entire cycle before the
         # authoritative gate had a chance to try the fallback candidate.
-        boundary_pool=list(final_candidates)
+        boundary_pool=[
+            x for x in final_candidates
+            if bool(x.get("final_delivery_confirmed"))
+        ]
         log.info(
-            "FINAL_BOUNDARY_POOL cycle=%s candidates=%d precheck_eligible=%d",
-            cycle_id,len(boundary_pool),
-            sum(1 for x in boundary_pool if float(x.get("final_delivery_precheck") or -900.0)>=200.0)
+            "FINAL_BOUNDARY_POOL cycle=%s candidates=%d prepared_confirmed=%d total_deep=%d",
+            cycle_id,len(boundary_pool),len(boundary_pool),len(final_candidates)
         )
         ranked_pool=sorted(
             boundary_pool,
             key=lambda x:(
+                1 if bool(x.get("final_delivery_confirmed")) else 0,
                 1 if has_fresh_live_price(x.get("pair"),now_boundary,LIVE_TICK_MAX_AGE) else 0,
                 float(x.get("final_delivery_precheck") or -900.0),
                 int(x.get("confidence") or 0),
