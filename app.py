@@ -586,6 +586,25 @@ async def persist_result_watch_background(watch_id,s):
         log.warning("RESULT_WATCH_BACKGROUND_PERSIST_FAILED watch_id=%s type=%s message=%s",
                     watch_id,type(e).__name__,str(e)[:160])
 
+# Per-process guard: a broker reconnect/re-authentication must never start a second watcher for the same signal.
+RESULT_WATCH_TASKS: dict[str, asyncio.Task] = {}
+
+
+def start_result_watch(key):
+    existing=RESULT_WATCH_TASKS.get(key)
+    if existing is not None and not existing.done():
+        log.info("RESULT_WATCH_DUPLICATE_SUPPRESSED watch_key=%s",key)
+        return False
+    task=asyncio.create_task(result_watch(key))
+    RESULT_WATCH_TASKS[key]=task
+
+    def _clear(done_task):
+        if RESULT_WATCH_TASKS.get(key) is done_task:
+            RESULT_WATCH_TASKS.pop(key,None)
+    task.add_done_callback(_clear)
+    return True
+
+
 async def complete_result_watch(watch_id):
     if not LEARNING_DB_URL:return False
     try:
@@ -638,7 +657,7 @@ async def restore_pending_result_watches():
                     cur.execute("""
                         SELECT watch_id,record
                         FROM candice_result_watch_queue
-                        WHERE status='PENDING'
+                        WHERE status IN ('PENDING','PROCESSING')
                           AND created_at > NOW() - INTERVAL '2 days'
                         ORDER BY created_at
                     """)
@@ -672,8 +691,8 @@ async def restore_pending_result_watches():
                         self_strategy_version=str(record.get("self_strategy_version") or ""),
                         indicator_context=dict(record.get("indicator_context") or {}),
                     )
-                asyncio.create_task(result_watch(key))
-                restored+=1
+                if start_result_watch(key):
+                    restored+=1
                 log.info("RESULT_WATCH_RESTORED watch_id=%s pair=%s entry_ts=%s",watch_id,pair,entry_ts)
             except Exception as e:
                 log.warning("RESULT_WATCH_RESTORE_FAILED watch_id=%s type=%s message=%s",
@@ -2698,11 +2717,49 @@ async def result_watch(key):
             await asyncio.sleep(0.5)
 
     if expiry_price is None:
-        log.warning("RESULT_PENDING_NO_CLOSED_CANDLE pair=%s entry=%s durable_watch=%s",s.pair,s.entry_price,watch_id)
-        if key in BRAIN.active_signals:
+        # Do not recurse: repeated closed-candle misses must not build an
+        # unbounded Python call chain. Retry iteratively for a short bounded window.
+        retry_deadline=time.time()+20.0
+        while expiry_price is None and time.time()<retry_deadline and key in BRAIN.active_signals:
             await asyncio.sleep(1.0)
-            return await result_watch(key)
-        return
+            client=CLIENT
+            for attempt in range(1,5):
+                try:
+                    if client:
+                        raw=await asyncio.wait_for(
+                            client.market.get_candles(s.pair,size=60,count=60),
+                            timeout=2.0
+                        )
+                        normalized=[]
+                        if isinstance(raw,list):
+                            for item in raw:
+                                if isinstance(item,dict) and isinstance(item.get("candles"),list):
+                                    normalized.extend(x for x in item["candles"] if isinstance(x,dict))
+                                elif isinstance(item,dict) and any(k in item for k in ("open","o","high","h","low","l","close","c")):
+                                    normalized.append(item)
+                        if normalized:
+                            try:normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
+                            except Exception:pass
+                            closed=_closed_candles(normalized,time.time())
+                            if closed:
+                                expiry_price=float(closed[-1].get("close",closed[-1].get("c")))
+                                STATE["candles"][s.pair]=normalized
+                                expiry_source="candle-closed"
+                                break
+                except Exception as e:
+                    log.warning("RESULT_CANDLE_RETRY_FAILED pair=%s attempt=%d type=%s message=%s",
+                                s.pair,attempt,type(e).__name__,str(e)[:120])
+                if expiry_price is not None or attempt>=4:
+                    break
+        if expiry_price is None:
+            log.warning(
+                "RESULT_PENDING_NO_CLOSED_CANDLE_FINAL pair=%s entry=%s durable_watch=%s "
+                "reason=bounded_retry_exhausted",
+                s.pair,s.entry_price,watch_id
+            )
+            await mark_result_watch_error(watch_id,"no_closed_candle_bounded_retry")
+            BRAIN.active_signals.pop(key,None)
+            return
 
     rec=BRAIN.finish_signal(key,expiry_price)
 
@@ -2950,7 +3007,7 @@ async def cycle_loop():
             target-time.time()
         )
         asyncio.create_task(persist_result_watch_background(key,s))
-        asyncio.create_task(result_watch(key))
+        start_result_watch(key)
         return True
 
     cycle_sequence=0
