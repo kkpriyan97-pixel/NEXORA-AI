@@ -3005,6 +3005,7 @@ async def result_watch(key):
         f"💰 Entry: {rec['entry_price']}\n"
         f"🏁 Expiry: {rec['exit_price']}\n"
         f"⏱️ Duration: {rec['expiry_minutes']} MIN\n"
+        f"{format_live_indicator_check(rec.get("indicator_context") or {}, "authenticated_broker_live_candle / event1-preferred")}\n"
         f"🧠 Brain Strategy: {rec['strategy'] or '—'}\n"
         f"🧬 Self Strategy: {rec.get('self_strategy') or '—'} ({rec.get('self_strategy_version') or '—'})\n"
         f"🎯 Brain Confidence: {rec['confidence']}%\n"
@@ -3202,6 +3203,15 @@ async def cycle_loop():
             return False
 
         key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
+        indicator_check=format_live_indicator_check(
+            s.indicator_context,
+            STATE["price_source"].get(s.pair,"authenticated_broker_live_candle")
+        )
+        log.info(
+            "LIVE_INDICATOR_SNAPSHOT cycle=%s pair=%s source=%s indicators=%s",
+            cycle_id,s.pair,STATE["price_source"].get(s.pair,"unknown"),
+            s.indicator_context or {}
+        )
         msg=(f"🚨 CANDICE AI SIGNAL\n\n"
              f"👋 Market setup detected!\n\n"
              f"📊 {s.display_name}\n\n"
@@ -3211,8 +3221,9 @@ async def cycle_loop():
              f"🎯 Entry → {uae_time(target)}\n\n"
              f"💰 Reference → {s.entry_price}\n"
              f"🎯 Confidence → {s.confidence}%\n\n"
-             f"📈 Trend → {s.trend_15m or '—'}\n"
-             f"🕯️ Structure → {s.structure_1m or '—'}\n"
+             f"{indicator_check}\n"
+             f"📈 15m Trend → {s.trend_15m or '—'}\n"
+             f"🕯️ 1m Structure → {s.structure_1m or '—'}\n"
              f"🧠 Strategy → {s.strategy}\n\n"
              f"🟢 LIVE SIGNAL • MANUAL\n"
              f"🤖 CANDICE BRAIN")
