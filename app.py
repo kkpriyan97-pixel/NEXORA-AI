@@ -867,7 +867,7 @@ async def member_access_active(telegram_id):
 def uae_time(ts):
     return datetime.fromtimestamp(float(ts),tz=UAE_TZ).strftime("%H:%M:%S")
 
-STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"network":{},"read_only":True,"cycle":0,"last_cycle":None,"account_id":None,"account_group":"demo","feed_source":"authenticated_websocket"}
+STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"network":{},"read_only":True,"cycle":0,"last_cycle":None,"account_id":None,"account_group":"demo","feed_source":"authenticated_websocket","live_orders":{},"live_order_events":[],"live_order_monitor":{"connected":False,"updated_at":None,"last_query_at":None,"last_error":None,"source":"authenticated_broker_event21_22_26+event31_poll"}}
 CANDLE_FETCH_SEM=asyncio.Semaphore(24)
 CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
@@ -4539,6 +4539,113 @@ async def audit_outbound_network():
             raise
         return ""
 
+async def _account_trade_record(item,event_code=None,source="broker_event"):
+    """Normalize broker order/position payloads for read-only live visibility."""
+    if not isinstance(item,dict):
+        return None
+    tid=str(item.get("id") or item.get("trade_id") or item.get("order_id") or item.get("orderId") or "").strip()
+    if not tid:
+        return None
+    rec=dict(item)
+    rec["_trade_id"]=tid
+    rec["_event"]=int(event_code) if event_code is not None else None
+    rec["_source"]=str(source)
+    rec["_received_at"]=time.time()
+    # Never copy credential/session fields into the live dashboard.
+    for k in ("access_token","token","password","cookie","cookies","authorization"):
+        rec.pop(k,None)
+    STATE["live_orders"][tid]=rec
+    events=list(STATE.get("live_order_events") or [])
+    events.append({
+        "trade_id":tid,
+        "event":int(event_code) if event_code is not None else None,
+        "source":str(source),
+        "received_at":rec["_received_at"],
+        "status":str(rec.get("status") or rec.get("state") or "").upper(),
+        "pair":str(rec.get("pair") or rec.get("p") or rec.get("symbol") or ""),
+        "direction":str(rec.get("direction") or rec.get("dir") or "").upper(),
+        "amount":rec.get("amount"),
+        "profit":rec.get("profit") if rec.get("profit") is not None else rec.get("pnl"),
+        "price":rec.get("price") if rec.get("price") is not None else rec.get("open_price"),
+        "expiry_price":rec.get("expiry_price") if rec.get("expiry_price") is not None else rec.get("close_price"),
+        "is_flex":bool(rec.get("is_flex",rec.get("flex",False))),
+    })
+    STATE["live_order_events"]=events[-80:]
+    return rec
+
+async def on_account_trade_update(message):
+    """Capture unsolicited order/position lifecycle events without placing trades."""
+    try:
+        event_code=message.get("e") if isinstance(message,dict) else None
+        payload=message.get("d") if isinstance(message,dict) else None
+        items=payload if isinstance(payload,list) else [payload]
+        added=0
+        for item in items:
+            if isinstance(item,dict) and await _account_trade_record(item,event_code,"broker_event"):
+                added+=1
+        if added:
+            log.info(
+                "ACCOUNT_ORDER_EVENT_LIVE event=%s records=%s live_orders=%s",
+                event_code,added,len(STATE.get("live_orders") or {})
+            )
+    except Exception as e:
+        log.warning(
+            "ACCOUNT_ORDER_EVENT_CAPTURE_FAILED type=%s message=%s",
+            type(e).__name__,str(e)[:160]
+        )
+
+async def account_order_position_worker():
+    """Poll the authenticated Demo account's open-order list for manual trades."""
+    while True:
+        try:
+            client=CLIENT
+            account_id=STATE.get("account_id")
+            monitor=STATE.setdefault("live_order_monitor",{})
+            monitor["connected"]=bool(
+                client and getattr(getattr(client,"connection",None),"is_connected",False)
+            )
+            if client and monitor["connected"] and account_id:
+                monitor["last_query_at"]=time.time()
+                try:
+                    rows=await asyncio.wait_for(
+                        client.trade.get_open_trades(int(account_id),group="demo"),
+                        timeout=2.5
+                    )
+                    records=[x for x in (rows or []) if isinstance(x,dict)] if isinstance(rows,list) else []
+                    open_ids=set()
+                    for item in records:
+                        tid=str(item.get("id") or item.get("trade_id") or item.get("order_id") or item.get("orderId") or "").strip()
+                        if not tid:
+                            continue
+                        open_ids.add(tid)
+                        await _account_trade_record(item,31,"broker_event31_open_poll")
+                    for tid,rec in list((STATE.get("live_orders") or {}).items()):
+                        status=str(rec.get("status") or rec.get("state") or "").upper()
+                        if tid not in open_ids and status not in {"CLOSED","EXPIRED","SETTLED","FINISHED","DONE","LOSS","WIN","TIE"}:
+                            rec["_open_missing_at"]=time.time()
+                    monitor["last_error"]=None
+                    monitor["updated_at"]=time.time()
+                    log.info(
+                        "ACCOUNT_ORDER_POSITION_LIVE open_items=%s tracked=%s account_id=%s source=event31_poll+event21_22_26",
+                        len(records),len(STATE.get("live_orders") or {}),account_id
+                    )
+                except Exception as e:
+                    monitor["last_error"]=f"{type(e).__name__}: {str(e)[:140]}"
+                    monitor["updated_at"]=time.time()
+                    log.info(
+                        "ACCOUNT_ORDER_POSITION_QUERY_FAILED account_id=%s type=%s message=%s",
+                        account_id,type(e).__name__,str(e)[:140]
+                    )
+            await asyncio.sleep(1.5)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(
+                "ACCOUNT_ORDER_POSITION_WORKER_FAILED type=%s message=%s",
+                type(e).__name__,str(e)[:160]
+            )
+            await asyncio.sleep(1.5)
+
 async def market_worker():
     global CLIENT
     while True:
@@ -4567,7 +4674,13 @@ async def market_worker():
         # They exist only for automatic DEMO learning practice orders.
         client.register_callback(parameters.E_TRADE_ACCEPTED,on_learning_trade_update)
         client.register_callback(parameters.E_TRADE_CLOSED,on_learning_trade_update)
+        # Read-only live visibility for manual account orders/positions.
+        # These callbacks never create, modify, or close a trade.
+        client.register_callback(parameters.E_TRADE_UPDATE_INTERIM,on_account_trade_update)
+        client.register_callback(parameters.E_TRADE_ACCEPTED,on_account_trade_update)
+        client.register_callback(parameters.E_TRADE_CLOSED,on_account_trade_update)
         live_quote_task=None
+        order_position_task=None
         try:
             STATE["status"]="connecting"
             # Let the websocket/auth handshake settle before the first
@@ -4708,7 +4821,9 @@ async def market_worker():
             log.info("TICK_SUBSCRIPTION_MODE authenticated_event1 preferred; broker_current_candle_fallback=enabled; asset_inventory_source=user_pdf_104_assets; no asset-list API")
             await refresh_candles(force=True)
             live_quote_task=asyncio.create_task(account_live_quote_worker(),name="account_live_quote_worker")
-            log.info("ACCOUNT_BRAIN_FEED_READY source=authenticated_session asset_universe=account_event_182 live_quote=broker_current_candle tick_preferred=true")
+            order_position_task=asyncio.create_task(account_order_position_worker(),name="account_order_position_worker")
+            STATE["live_order_monitor"]["connected"]=True
+            log.info("ACCOUNT_BRAIN_FEED_READY source=authenticated_session asset_universe=account_event_182 live_quote=broker_current_candle tick_preferred=true order_position_monitor=live")
             last_asset_sync=time.time()
             while True:
                 await asyncio.sleep(15)
@@ -4743,6 +4858,13 @@ async def market_worker():
                     await live_quote_task
                 except (Exception, asyncio.CancelledError):
                     pass
+            if order_position_task is not None:
+                try:
+                    order_position_task.cancel()
+                    await order_position_task
+                except (Exception, asyncio.CancelledError):
+                    pass
+            STATE["live_order_monitor"]["connected"]=False
             try:await client.stop()
             except Exception:pass
             CLIENT=None
@@ -4887,6 +5009,9 @@ async def build_live_analysis_payload():
         "protocol":"FLEX_MANUAL",
         "signal_expiry_minutes":1,
         "flex_auto_trade":False,
+        "order_position_monitor":dict(STATE.get("live_order_monitor") or {}),
+        "live_orders":[dict(v) for v in (STATE.get("live_orders") or {}).values()],
+        "live_order_events":list(STATE.get("live_order_events") or [])[-40:],
         "updated_utc":datetime.now(timezone.utc).isoformat(),
         "assets":rows,
     }
