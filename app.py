@@ -2871,10 +2871,17 @@ async def cycle_loop():
             return False
 
         try:
+            # Preserve the Brain-selected expiry. The previous hard-coded
+            # expiry_minutes=1 silently converted every live signal to 1 minute
+            # and prevented legitimate 3-minute signals from reaching Telegram.
+            try:
+                signal_expiry=max(1,min(15,int(candidate.get("expiry_minutes") or 3)))
+            except (TypeError,ValueError):
+                signal_expiry=3
             s=BRAIN.mark_signal_sent(
                 account_id=STATE.get("account_id"),
                 pair=p,display_name=candidate["display_name"],
-                direction=candidate["direction"],expiry_minutes=1,
+                direction=candidate["direction"],expiry_minutes=signal_expiry,
                 entry_price=entry,entry_ts=target,
                 entry_candle_ts=candidate["entry_candle_ts"],
                 strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence,
