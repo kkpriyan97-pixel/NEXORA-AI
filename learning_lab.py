@@ -1312,7 +1312,7 @@ async def _place_demo(rec, actor_id):
     if direction not in {"up","down"} or not pair:
         return False,"INVALID_DIRECTION_OR_PAIR",None
     try:
-        print(f"LEARNING_ORDER_ATTEMPT pair={pair} direction={direction.upper()} mode=FLEX group=demo amount={AMOUNT} duration={DURATION_SECONDS}")
+        print(f"LEARNING_ORDER_ATTEMPT pair={pair} direction={direction.upper()} mode=FIXED_TIME group=demo amount={AMOUNT} duration={DURATION_SECONDS}")
         # Use the canonical DEMO order signature supported by the OlympTrade
         # client: pair, amount, direction, duration, account_id, group.
         # Avoid optional payload flags that can cause a server-side Invalid request.
@@ -1320,7 +1320,7 @@ async def _place_demo(rec, actor_id):
             client.trade.place_order(
                 pair=pair,amount=AMOUNT,direction=direction,
                 duration=DURATION_SECONDS,account_id=int(account_id),
-                group="demo",is_flex=True
+                group="demo",is_flex=False
             ),
             timeout=5.0
         )
@@ -1386,7 +1386,7 @@ async def _place_demo(rec, actor_id):
     _open[str(trade_id)]=rec
     await persist_open_trade(rec)
     print(
-        f"LEARNING_ORDER_CONFIRMED pair={pair} mode=FLEX trade_id={trade_id} entry={entry_price} "
+        f"LEARNING_ORDER_CONFIRMED pair={pair} mode=FIXED_TIME trade_id={trade_id} entry={entry_price} "
         f"account_id={account_id} group=demo"
     )
     asyncio.create_task(
