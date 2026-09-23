@@ -1649,8 +1649,8 @@ async def run_forever():
     except Exception:
         _lab_log=None
     if os.getenv("LEARNING_PRACTICE_ENABLED","true").strip().lower()=="false":
-        logmsg="LEARNING_PRACTICE_LOOP_DISABLED reason=env"
-        print(logmsg)
+        if _lab_log:
+            _lab_log.warning("LEARNING_PRACTICE_LOOP_DISABLED reason=env")
         return
 
     # Enter the scheduler immediately. The old startup path awaited several
@@ -1693,14 +1693,20 @@ async def run_forever():
                     f"type={type(e).__name__} message={str(e)[:120]}"
                 )
 
-    # Run recovery/DDL separately so it can never block the first practice scan.
-    asyncio.create_task(startup_maintenance(),name="learning_startup_maintenance")
-
+    # Do not start maintenance before the scheduler's first tick. The broker
+    # market workers and the learning database both share this event loop; even
+    # background startup work can delay the first practice opportunity.
+    startup_maintenance_task=None
     last_heartbeat=0.0
     last_scan=0.0
     while True:
         try:
             now=_now_uae()
+            if _lab_log:
+                _lab_log.info(
+                    "LEARNING_FIRST_TICK_REACHED now_uae=%s active=%s",
+                    now.isoformat(),practice_active(now)
+                )
             session_day=_learning_session_day(now)
             day=session_day
             if _daily["day"] != str(day):
@@ -1718,18 +1724,14 @@ async def run_forever():
                     _last_report_day = day
             elif now >= report_deadline and _last_report_day != day:
                 _last_report_day = day
-                print(
-                    f"LEARNING_REPORT_SUPPRESSED_LATE day={day} "
-                    f"reason=outside_report_grace_window"
-                )
+                if _lab_log:
+                    _lab_log.info(
+                        "LEARNING_REPORT_SUPPRESSED_LATE day=%s reason=outside_report_grace_window",
+                        day,
+                    )
             if practice_active(now):
                 if time.time()-last_heartbeat >= 60:
                     last_heartbeat=time.time()
-                    log.info(
-                        "LEARNING_HEARTBEAT day=%s active=True pending=%s open=%s placed=%s win=%s loss=%s tie=%s blocked=%s campaign_strategy=%s campaign_progress=%s/100",
-                        day,len(_pending),len(_open),_daily["placed"],_daily["win"],_daily["loss"],_daily["tie"],_daily["blocked"],
-                        CAMPAIGN_STATE.get("strategy") or "INIT",CAMPAIGN_STATE.get("sampled",0)
-                    )
                     if _lab_log:
                         _lab_log.info(
                             "LEARNING_HEARTBEAT day=%s active=True pending=%s open=%s placed=%s "
@@ -1741,7 +1743,15 @@ async def run_forever():
                             CAMPAIGN_STATE.get("sampled",0),
                         )
                 if CAMPAIGN_STATE.get("session_id")!=str(day) or not CAMPAIGN_STATE.get("strategy"):
-                    log.info("LEARNING_CAMPAIGN_INIT_REQUEST day=%s current_session=%s current_strategy=%s",day,CAMPAIGN_STATE.get("session_id"),CAMPAIGN_STATE.get("strategy"))
+                    if startup_maintenance_task is None:
+                        startup_maintenance_task=asyncio.create_task(
+                            startup_maintenance(),name="learning_startup_maintenance"
+                        )
+                    if _lab_log:
+                        _lab_log.info(
+                            "LEARNING_CAMPAIGN_INIT_REQUEST day=%s current_session=%s current_strategy=%s",
+                            day,CAMPAIGN_STATE.get("session_id"),CAMPAIGN_STATE.get("strategy")
+                        )
                     await _initialize_campaign(str(day))
                     log.info("LEARNING_CAMPAIGN_INIT_DONE day=%s strategy=%s status=%s",day,CAMPAIGN_STATE.get("strategy"),CAMPAIGN_STATE.get("status"))
                 if CAMPAIGN_STATE.get("status")=="ACTIVE" and time.time()-last_scan >= LOOP_SECONDS:
@@ -1754,7 +1764,8 @@ async def run_forever():
                             "target=100 min_win_rate=85%%",
                             day,strategy,
                         )
-                    log.info("LEARNING_SCAN_START day=%s strategy=%s",day,strategy)
+                    if _lab_log:
+                        _lab_log.info("LEARNING_SCAN_START day=%s strategy=%s",day,strategy)
                     try:
                         candidates=await asyncio.wait_for(
                             _build_candidate(strategy,return_all=True),
@@ -1762,12 +1773,24 @@ async def run_forever():
                         )
                     except asyncio.TimeoutError:
                         candidates=[]
-                        print(f"LEARNING_SCAN_TIMEOUT seconds={LEARNING_SCAN_TIMEOUT_SECONDS} fallback=next_scan")
+                        if _lab_log:
+                            _lab_log.warning(
+                                "LEARNING_SCAN_TIMEOUT seconds=%s fallback=next_scan",
+                                LEARNING_SCAN_TIMEOUT_SECONDS,
+                            )
                     except Exception as e:
                         candidates=[]
-                        print(f"LEARNING_SCAN_FAILED type={type(e).__name__} message={str(e)[:160]} fallback=next_scan")
+                        if _lab_log:
+                            _lab_log.warning(
+                                "LEARNING_SCAN_FAILED type=%s message=%s fallback=next_scan",
+                                type(e).__name__,str(e)[:160],
+                            )
                     accepted=await _send_campaign_batch(candidates)
-                    log.info("LEARNING_SCAN_DONE day=%s strategy=%s candidates=%s accepted=%s",day,strategy,len(candidates),accepted)
+                    if _lab_log:
+                        _lab_log.info(
+                            "LEARNING_SCAN_DONE day=%s strategy=%s candidates=%s accepted=%s",
+                            day,strategy,len(candidates),accepted
+                        )
             # While the 2h window is active, allow another candidate only after the
             # previous order has completed. This prevents overlapping demo orders.
             for tid,rec in list(_open.items()):
@@ -1783,5 +1806,9 @@ async def run_forever():
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            print(f"LEARNING_PRACTICE_ERROR type={type(exc).__name__} message={str(exc)[:160]}")
+            if _lab_log:
+                _lab_log.exception(
+                    "LEARNING_PRACTICE_ERROR type=%s message=%s",
+                    type(exc).__name__,str(exc)[:160]
+                )
             await asyncio.sleep(LOOP_SECONDS)
