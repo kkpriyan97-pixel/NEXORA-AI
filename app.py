@@ -2259,7 +2259,7 @@ def multi_timeframe_confirmation(context,expected):
 
     thirty_status=str(thirty.get("status") or "")
     thirty_available=thirty_status=="READY" and int(thirty.get("bars") or 0)>=2
-    thirty_mode="CONFIRMED" if thirty_available else "UNAVAILABLE_STRICT_SUBSTITUTE"
+    thirty_mode="CONFIRMED" if thirty_available else "1M_2M_FALLBACK"
 
     if thirty_available:
         if thirty.get("direction")!=expected:
@@ -2268,18 +2268,14 @@ def multi_timeframe_confirmation(context,expected):
                 "direction":thirty.get("direction","NEUTRAL")
             }
     else:
-        # A sparse 30s feed is a data-quality failure for a 1-minute entry.
-        # The previous strict substitute allowed live approval from slower
-        # frames alone. Do not count a data-gap substitute as confirmation.
+        # Event-1 tick history is not guaranteed to contain two completed 30s
+        # buckets for every authenticated account asset. 30s is therefore an
+        # optional micro-confirmation, while the signal's exact 30-second lead
+        # timing remains mandatory in the scheduler. Never fabricate a 30s bar.
         log.info(
-            "30S_CONFIRMATION_UNAVAILABLE reason=insufficient_closed_30s_bars bars=%s mode=%s action=reject_live",
+            "30S_CONFIRMATION_UNAVAILABLE reason=insufficient_closed_30s_bars bars=%s mode=%s action=fallback_1m_2m",
             thirty.get("bars",0),thirty_mode
         )
-        return False,{
-            "reason":"30s_confirmation_unavailable",
-            "bars":int(thirty.get("bars") or 0),
-            "30s_mode":thirty_mode
-        }
 
     if one.get("status")!="READY":
         return False,{"reason":"1m_confirmation_insufficient","bars":one.get("bars",0)}
@@ -2313,10 +2309,8 @@ def multi_timeframe_confirmation(context,expected):
     short_align=sum(1 for x in short if x.get("direction")==expected)
     short_opp=sum(1 for x in short if x.get("direction") not in {expected,"NEUTRAL"})
 
-    # Normal path: at least 3 of 4 short frames agree.
-    # Strict substitute path: when 30s is unavailable, demand all 4 short
-    # frames and a stronger 2m candle. This restores signal continuity without
-    # allowing a weak 30s data gap to become a false approval.
+    # Normal path: at least 3 of 4 short frames agree. When the optional 30s
+    # micro-frame is unavailable, require stronger 1m/2m agreement instead.
     required_align=4 if not thirty_available else 3
     minimum_body=0.65 if not thirty_available else 0.45
     if short_align<required_align or short_opp>1:
@@ -2328,7 +2322,7 @@ def multi_timeframe_confirmation(context,expected):
         }
     if float(two.get("body_ratio") or 0.0)<minimum_body:
         return False,{
-            "reason":"strict_substitute_body_insufficient" if not thirty_available else "2m_candle_strength_insufficient",
+            "reason":"fallback_1m_2m_body_insufficient" if not thirty_available else "2m_candle_strength_insufficient",
             "body_ratio":two.get("body_ratio",0),
             "required_body_ratio":minimum_body,
             "30s_mode":thirty_mode
