@@ -218,6 +218,27 @@ async def _load_session_report(day):
                     return cur.fetchone()
         row=await asyncio.to_thread(read)
         if not row:
+            try:
+                def recover():
+                    with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                        with db.cursor() as cur:
+                            cur.execute("""
+                                SELECT COUNT(*), COUNT(*) FILTER (WHERE result='WIN'),
+                                       COUNT(*) FILTER (WHERE result='LOSS'),
+                                       COUNT(*) FILTER (WHERE result='TIE'),
+                                       ARRAY_AGG(DISTINCT UPPER(strategy_id))
+                                FROM nexora_learning_practice_log
+                                WHERE created_at >= (%s::date + INTERVAL '18 hours') AT TIME ZONE 'Asia/Dubai'
+                                  AND created_at < (%s::date + INTERVAL '30 hours') AT TIME ZONE 'Asia/Dubai'
+                            """,(str(day),str(day)))
+                            return cur.fetchone()
+                rr=await asyncio.to_thread(recover)
+                if rr and int(rr[0] or 0)>0:
+                    return {"placed":int(rr[0] or 0),"win":int(rr[1] or 0),
+                            "loss":int(rr[2] or 0),"tie":int(rr[3] or 0),"blocked":0,
+                            "strategies":[str(x).upper() for x in (rr[4] or []) if x]}
+            except Exception as e:
+                print(f"LEARNING_SESSION_REPORT_RECONSTRUCT_FAILED day={day} type={type(e).__name__} message={str(e)[:120]}")
             return None
         placed,wins,losses,ties,blocked,strategy_counts=row
         if isinstance(strategy_counts,str):
@@ -1235,7 +1256,8 @@ async def _fallback_watch(rec):
     if not tid:
         return
     expiry_ts=float(rec.get("entry_ts") or rec.get("placed_at") or time.time()) + DURATION_SECONDS
-    deadline=max(expiry_ts + RESULT_WATCH_EXTRA_SECONDS, time.time() + (RESULT_WATCH_RESTART_GRACE_SECONDS if rec.get("_restored") else 0.0))
+    # Never extend a restored watch indefinitely across Render restarts.
+    deadline=expiry_ts + RESULT_WATCH_EXTRA_SECONDS
     provider=_cfg.get("snapshot_provider")
     attempts=0
     pair=str(rec.get("pair") or "")
@@ -1362,7 +1384,8 @@ async def _fallback_watch(rec):
 
     if tid in _open and tid not in _finalized:
         # A timeout is a data-availability failure, never a guessed WIN/LOSS.
-        # Release the active practice slot so the learning loop continues.
+        # Outside 18:00–06:00 UAE it is silent and cannot disturb the daytime bot.
+        in_learning_window=practice_active(_now_uae())
         _open.pop(tid,None)
         await save_error(
             rec.get("strategy","UNKNOWN"),
@@ -1373,13 +1396,14 @@ async def _fallback_watch(rec):
             f"LEARNING_RESULT_SLOT_RELEASED trade_id={tid} pair={pair} "
             f"reason=RESULT_UNAVAILABLE_TIMEOUT attempts={attempts}"
         )
-        await _cfg["send_message"](
-            "⚠️ DEMO RESULT WATCH TIMEOUT\\n\\n"
-            f"📊 {rec.get('display_name') or pair}\\n"
-            "🔓 Next demo practice slot unlocked\\n"
-            "📦 Result was not classified as WIN/LOSS.",
-            chat_id=_cfg.get("admin_id") or None
-        )
+        if in_learning_window:
+            await _cfg["send_message"](
+                "⚠️ DEMO RESULT WATCH TIMEOUT\\n\\n"
+                f"📊 {rec.get('display_name') or pair}\\n"
+                "🔓 Next demo practice slot unlocked\\n"
+                "📦 Result was not classified as WIN/LOSS.",
+                chat_id=_cfg.get("admin_id") or None
+            )
 
 
 async def _strategy_validation_snapshot(strategy_id):
@@ -1423,6 +1447,11 @@ async def _validated_strategy_ids():
 
 async def _send_daily_report(day):
     persisted=await _load_session_report(day)
+    if not persisted or (
+        int(persisted.get("placed",0))==0 and int(persisted.get("win",0))==0 and
+        int(persisted.get("loss",0))==0 and int(persisted.get("tie",0))==0
+    ):
+        persisted=await _load_session_report(day) or persisted
     stats=persisted or {
         "placed":_daily["placed"],"win":_daily["win"],"loss":_daily["loss"],
         "tie":_daily["tie"],"blocked":_daily["blocked"],
