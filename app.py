@@ -875,7 +875,7 @@ ACCOUNT_LIVE_SCAN_CURSOR=0
 # Account-wide event-1 tick subscription manager. Subscriptions are read-only;
 # the worker only requests market quotes and never places/modifies trades.
 ACCOUNT_TICK_SUB_SEM=asyncio.Semaphore(1)
-ACCOUNT_TICK_SUB_BATCH=4
+ACCOUNT_TICK_SUB_BATCH=2
 ACCOUNT_TICK_SUB_RETRY=2.0
 ACCOUNT_TICK_SUB_DELAY=0.35
 # The authenticated broker feed has been observed to accept four simultaneous
@@ -883,12 +883,12 @@ ACCOUNT_TICK_SUB_DELAY=0.35
 # keep multiple independent candidates live at the exact signal boundary.
 # This does not change Brain direction/quality gates; it only preserves live
 # quote coverage for fallback candidates.
-ACCOUNT_TICK_MAX_SLOTS=4
-ACCOUNT_TICK_PIN_SLOTS=4
+ACCOUNT_TICK_MAX_SLOTS=2
+ACCOUNT_TICK_PIN_SLOTS=2
 ACCOUNT_TICK_ROTATE_INTERVAL=15.0
 # Temporarily back off pairs that the authenticated event-12 channel explicitly
 # rejects, instead of wasting every rotation/final-boundary slot on them.
-ACCOUNT_TICK_REJECT_COOLDOWN=600.0
+ACCOUNT_TICK_REJECT_COOLDOWN=60.0
 ACCOUNT_TICK_FRESH_WAIT=0.5
 ACCOUNT_TICK_FINAL_PROBE_LIMIT=8
 ACCOUNT_TICK_SUB_TIMEOUT=1.8
@@ -1277,6 +1277,16 @@ async def _unsubscribe_account_tick(pair):
 async def _subscribe_account_tick(pair):
     client=CLIENT
     if not client or not pair:
+        return False
+    # Hard broker-capacity invariant. The authenticated connection currently
+    # accepts two simultaneous Event-12 subscriptions. Never send Event-12
+    # while both slots are occupied; this prevents capacity-induced
+    # invalid_request responses and protects the signal-time feed.
+    if pair not in ACCOUNT_TICK_SUBSCRIBED and len(ACCOUNT_TICK_SUBSCRIBED)>=ACCOUNT_TICK_MAX_SLOTS:
+        log.info(
+            "ACCOUNT_TICK_SUBSCRIBE_SKIP pair=%s reason=slot_capacity active=%d max=%d",
+            pair,len(ACCOUNT_TICK_SUBSCRIBED),ACCOUNT_TICK_MAX_SLOTS
+        )
         return False
     now=time.time()
     blocked_until=float(ACCOUNT_TICK_REJECT_UNTIL.get(pair) or 0.0)
