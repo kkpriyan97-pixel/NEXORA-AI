@@ -1186,6 +1186,7 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
                                      "members":rec.get("council_members"),
                                      "votes":rec.get("council_votes"),
                                  })
+    await _session_stat_update(rec.get("session_day") or _learning_session_day(_now_uae()), **({"win":1} if result=="WIN" else {"loss":1} if result=="LOSS" else {"tie":1}))
     await _campaign_result(result,rec.get("strategy","UNKNOWN"))
     validation=await _strategy_validation_snapshot(rec.get("strategy","UNKNOWN"))
     if tid:
@@ -1408,19 +1409,25 @@ async def _validated_strategy_ids():
         return []
 
 async def _send_daily_report(day):
-    decided = _daily["win"] + _daily["loss"]
-    accuracy = (100.0 * _daily["win"] / decided) if decided else 0.0
-    validated = await _validated_strategy_ids()
+    persisted=await _load_session_report(day)
+    stats=persisted or {
+        "placed":_daily["placed"],"win":_daily["win"],"loss":_daily["loss"],
+        "tie":_daily["tie"],"blocked":_daily["blocked"],
+        "strategies":sorted(_daily["strategies"]),
+    }
+    decided=stats["win"]+stats["loss"]
+    accuracy=(100.0*stats["win"]/decided) if decided else 0.0
+    validated=await _validated_strategy_ids()
     await _cfg["send_message"](
         "🧠 CANDICE • LEARNING REPORT\n\n"
         "🕕 Practice → 18:00–06:00 UAE\n"
         f"📅 Day → {day}\n"
-        f"🤖 DEMO AUTO-TRADE → {_daily['placed']} trades\n"
-        f"🟢 WIN → {_daily['win']}\n"
-        f"🔴 LOSS → {_daily['loss']}\n"
-        f"🟡 TIE → {_daily['tie']}\n"
+        f"🤖 DEMO AUTO-TRADE → {stats['placed']} trades\n"
+        f"🟢 WIN → {stats['win']}\n"
+        f"🔴 LOSS → {stats['loss']}\n"
+        f"🟡 TIE → {stats['tie']}\n"
         f"🎯 Accuracy → {accuracy:.1f}%\n"
-        f"⛔ Blocked → {_daily['blocked']}\n\n"
+        f"⛔ Blocked → {stats['blocked']}\n\n"
         f"✅ VALIDATED / OWN STRATEGY READY → {len(validated)}\n"
         f"🧩 Strategies → {', '.join(validated[:20]) if validated else 'None'}\n\n"
         "🔴 06:00 → Learning Auto-Trade OFF\n"
@@ -1446,6 +1453,10 @@ async def run_forever():
         print("LEARNING_TRADE_RESTORE_TIMEOUT seconds=5 fallback=memory_only")
     except Exception as e:
         print(f"LEARNING_TRADE_RESTORE_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]} fallback=memory_only")
+    try:
+        await asyncio.wait_for(ensure_session_stats_table(),timeout=5.0)
+    except Exception as e:
+        print(f"LEARNING_SESSION_STATS_INIT_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]}")
     try:
         await asyncio.wait_for(ensure_campaign_table(),timeout=5.0)
     except Exception as e:
