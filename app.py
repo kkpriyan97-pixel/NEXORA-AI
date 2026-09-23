@@ -15,9 +15,9 @@ from ai_router import analyze_with_fallback,review_result_with_fallback
 from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot_async, world_learning_loop
 from strategy_knowledge import ensure_tables as ensure_strategy_knowledge_tables, refresh as refresh_strategy_knowledge, refresh_loop as strategy_knowledge_refresh_loop
 from account_asset_catalog import build_account_asset_snapshot
+import learning_lab as learning_lab_module
 from learning_lab import (
     configure as configure_learning_lab,
-    run_forever as learning_practice_loop,
     status as learning_practice_status,
     handle_callback as handle_learning_callback,
     handle_trade_update as handle_learning_trade_update,
@@ -4109,11 +4109,28 @@ async def cycle_loop():
         # begins 150s before that target, preserving the fixed 30s delivery lead.
 
 async def learning_practice_supervisor():
-    """Keep the DEMO-only learning engine alive independently of other long-running workers."""
+    """Run the DEMO-only learning engine with explicit task-state diagnostics."""
     while True:
         try:
-            log.info("LEARNING_PRACTICE_TASK_START")
-            await learning_practice_loop()
+            runner=getattr(learning_lab_module,"run_forever",None)
+            log.info(
+                "LEARNING_PRACTICE_TASK_START module=%s runner=%s coroutine=%s",
+                getattr(learning_lab_module,"__name__",""),
+                getattr(runner,"__qualname__",""),
+                asyncio.iscoroutinefunction(runner),
+            )
+            if not asyncio.iscoroutinefunction(runner):
+                raise RuntimeError("learning_lab.run_forever is not an async coroutine")
+            task=asyncio.create_task(
+                runner(),
+                name="learning_practice_engine",
+            )
+            await asyncio.sleep(0)
+            log.info(
+                "LEARNING_PRACTICE_TASK_CREATED done=%s cancelled=%s",
+                task.done(),task.cancelled()
+            )
+            await task
             log.warning("LEARNING_PRACTICE_TASK_RETURNED reason=loop_exited")
         except asyncio.CancelledError:
             raise
