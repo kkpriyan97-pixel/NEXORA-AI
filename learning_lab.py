@@ -1638,6 +1638,16 @@ async def _send_daily_report(day):
         print(f"LEARNING_REPORT_SENT_ONCE day={day}")
     return True
 async def run_forever():
+    try:
+        import logging
+        _lab_log=logging.getLogger("candice.learning_lab")
+        _lab_log.info(
+            "LEARNING_PRACTICE_RUNNER_ENTER enabled_env=%s active_now=%s",
+            os.getenv("LEARNING_PRACTICE_ENABLED","true"),
+            practice_active(_now_uae())
+        )
+    except Exception:
+        _lab_log=None
     if os.getenv("LEARNING_PRACTICE_ENABLED","true").strip().lower()=="false":
         logmsg="LEARNING_PRACTICE_LOOP_DISABLED reason=env"
         print(logmsg)
@@ -1648,6 +1658,11 @@ async def run_forever():
     # a slow database operation could therefore hold the entire DEMO learning
     # engine before its 18:00–06:00 window was ever evaluated. Those operations
     # are maintenance metadata, not prerequisites for placing a DEMO order.
+    if _lab_log:
+        _lab_log.info(
+            "LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=18:00-06:00 "
+            "demo_only=True"
+        )
     print(
         "LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=18:00-06:00 "
         "timezone=Asia/Dubai demo_only=True ai_council=True "
