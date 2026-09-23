@@ -1663,11 +1663,15 @@ async def run_forever():
             "LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=18:00-06:00 "
             "demo_only=True"
         )
-    print(
-        "LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=18:00-06:00 "
-        "timezone=Asia/Dubai demo_only=True ai_council=True "
-        "campaign=ONE_STRATEGY_AT_A_TIME target=100 min_win_rate=85% target=90%"
-    )
+    # Do not use synchronous stdout in the critical scheduler path. Render's
+    # log collector can apply backpressure; a blocking print here can freeze
+    # the learning coroutine immediately after it starts.
+    if _lab_log:
+        _lab_log.info(
+            "LEARNING_PRACTICE_LOOP_READY schedule=DAILY window=18:00-06:00 "
+            "demo_only=True ai_council=True campaign=ONE_STRATEGY_AT_A_TIME "
+            "target=100 min_win_rate=85%% target=90%%"
+        )
 
     async def startup_maintenance():
         jobs=(
@@ -1726,13 +1730,16 @@ async def run_forever():
                         day,len(_pending),len(_open),_daily["placed"],_daily["win"],_daily["loss"],_daily["tie"],_daily["blocked"],
                         CAMPAIGN_STATE.get("strategy") or "INIT",CAMPAIGN_STATE.get("sampled",0)
                     )
-                    print(
-                        f"LEARNING_HEARTBEAT day={day} active=True pending={len(_pending)} "
-                        f"open={len(_open)} placed={_daily['placed']} win={_daily['win']} "
-                        f"loss={_daily['loss']} tie={_daily['tie']} blocked={_daily['blocked']} "
-                        f"campaign_strategy={CAMPAIGN_STATE.get('strategy') or 'INIT'} "
-                        f"campaign_progress={CAMPAIGN_STATE.get('sampled',0)}/100"
-                    )
+                    if _lab_log:
+                        _lab_log.info(
+                            "LEARNING_HEARTBEAT day=%s active=True pending=%s open=%s placed=%s "
+                            "win=%s loss=%s tie=%s blocked=%s campaign_strategy=%s "
+                            "campaign_progress=%s/100",
+                            day,len(_pending),len(_open),_daily["placed"],_daily["win"],
+                            _daily["loss"],_daily["tie"],_daily["blocked"],
+                            CAMPAIGN_STATE.get("strategy") or "INIT",
+                            CAMPAIGN_STATE.get("sampled",0),
+                        )
                 if CAMPAIGN_STATE.get("session_id")!=str(day) or not CAMPAIGN_STATE.get("strategy"):
                     log.info("LEARNING_CAMPAIGN_INIT_REQUEST day=%s current_session=%s current_strategy=%s",day,CAMPAIGN_STATE.get("session_id"),CAMPAIGN_STATE.get("strategy"))
                     await _initialize_campaign(str(day))
@@ -1740,11 +1747,13 @@ async def run_forever():
                 if CAMPAIGN_STATE.get("status")=="ACTIVE" and time.time()-last_scan >= LOOP_SECONDS:
                     last_scan=time.time()
                     strategy=str(CAMPAIGN_STATE.get("strategy") or "").upper()
-                    print(
-                        f"LEARNING_WINDOW_ACTIVE day={day} start=18:00 end=06:00 "
-                        f"timezone=Asia/Dubai ai_council=True fixed_strategy={strategy} "
-                        f"target=100 min_win_rate=85%"
-                    )
+                    if _lab_log:
+                        _lab_log.info(
+                            "LEARNING_WINDOW_ACTIVE day=%s start=18:00 end=06:00 "
+                            "timezone=Asia/Dubai ai_council=True fixed_strategy=%s "
+                            "target=100 min_win_rate=85%%",
+                            day,strategy,
+                        )
                     log.info("LEARNING_SCAN_START day=%s strategy=%s",day,strategy)
                     try:
                         candidates=await asyncio.wait_for(
