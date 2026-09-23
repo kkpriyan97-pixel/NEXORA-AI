@@ -34,6 +34,16 @@ class _BrokerTickCapabilityFilter(logging.Filter):
             record.levelname = "INFO"
         return True
 logging.getLogger("olymptrade_ws.api.market").addFilter(_BrokerTickCapabilityFilter())
+
+class _ResolvedDemoIdentityFilter(logging.Filter):
+    def filter(self, record):
+        msg=str(record.getMessage() or "")
+        if record.name == "olymptrade_ws.core.client" and "SESSION_DEMO_ACCOUNT_NOT_VERIFIED" in msg:
+            record.levelno=logging.INFO
+            record.levelname="INFO"
+        return True
+
+logging.getLogger("olymptrade_ws.core.client").addFilter(_ResolvedDemoIdentityFilter())
 log=logging.getLogger("candice")
 
 LEARNING_DB_URL=os.getenv("DATABASE_URL","").strip()
