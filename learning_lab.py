@@ -1618,39 +1618,44 @@ async def _send_daily_report(day):
     return True
 async def run_forever():
     if os.getenv("LEARNING_PRACTICE_ENABLED","true").strip().lower()=="false":
+        logmsg="LEARNING_PRACTICE_LOOP_DISABLED reason=env"
+        print(logmsg)
         return
-    # Startup recovery must never block the learning scheduler. The Render/Postgres
-    # connection can temporarily stall during a broker reconnect; DB state is recovery
-    # metadata only, so bound both operations and continue into the live learning loop.
-    try:
-        await asyncio.wait_for(ensure_learning_trade_state_table(), timeout=5.0)
-    except asyncio.TimeoutError:
-        print("LEARNING_TRADE_STATE_INIT_TIMEOUT seconds=5 fallback=memory_only")
-    except Exception as e:
-        print(f"LEARNING_TRADE_STATE_INIT_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]} fallback=memory_only")
-    try:
-        await asyncio.wait_for(restore_open_trades(), timeout=5.0)
-    except asyncio.TimeoutError:
-        print("LEARNING_TRADE_RESTORE_TIMEOUT seconds=5 fallback=memory_only")
-    except Exception as e:
-        print(f"LEARNING_TRADE_RESTORE_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]} fallback=memory_only")
-    try:
-        await asyncio.wait_for(ensure_session_stats_table(),timeout=5.0)
-    except Exception as e:
-        print(f"LEARNING_SESSION_STATS_INIT_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]}")
-    try:
-        await asyncio.wait_for(ensure_campaign_table(),timeout=5.0)
-    except Exception as e:
-        print(f"LEARNING_CAMPAIGN_INIT_FAILED type={type(e).__name__} message={str(e)[:120]}")
-    try:
-        await asyncio.wait_for(ensure_report_state_table(),timeout=5.0)
-    except Exception as e:
-        print(f"LEARNING_REPORT_STATE_INIT_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]}")
+
+    # Enter the scheduler immediately. The old startup path awaited several
+    # Postgres DDL/recovery calls before printing LEARNING_PRACTICE_LOOP_STARTED;
+    # a slow database operation could therefore hold the entire DEMO learning
+    # engine before its 18:00–06:00 window was ever evaluated. Those operations
+    # are maintenance metadata, not prerequisites for placing a DEMO order.
     print(
         "LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=18:00-06:00 "
         "timezone=Asia/Dubai demo_only=True ai_council=True "
         "campaign=ONE_STRATEGY_AT_A_TIME target=100 min_win_rate=85% target=90%"
     )
+
+    async def startup_maintenance():
+        jobs=(
+            ("trade_state_table",ensure_learning_trade_state_table,5.0),
+            ("trade_restore",restore_open_trades,5.0),
+            ("session_stats_table",ensure_session_stats_table,5.0),
+            ("campaign_table",ensure_campaign_table,5.0),
+            ("report_state_table",ensure_report_state_table,5.0),
+        )
+        for name,fn,timeout in jobs:
+            try:
+                await asyncio.wait_for(fn(),timeout=timeout)
+                print(f"LEARNING_STARTUP_MAINTENANCE_OK task={name}")
+            except asyncio.TimeoutError:
+                print(f"LEARNING_STARTUP_MAINTENANCE_TIMEOUT task={name} seconds={timeout:g}")
+            except Exception as e:
+                print(
+                    f"LEARNING_STARTUP_MAINTENANCE_FAILED task={name} "
+                    f"type={type(e).__name__} message={str(e)[:120]}"
+                )
+
+    # Run recovery/DDL separately so it can never block the first practice scan.
+    asyncio.create_task(startup_maintenance(),name="learning_startup_maintenance")
+
     last_heartbeat=0.0
     last_scan=0.0
     while True:
