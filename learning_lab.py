@@ -87,6 +87,19 @@ def _learning_session_day(now=None):
     # One learning session spans 18:00 on day D through 06:00 on day D+1.
     return now.date() if now.hour >= START_HOUR else (now-timedelta(days=1)).date()
 
+def _record_session_day(rec):
+    """Return the original learning-window day for a trade, including legacy restored records."""
+    stored=str((rec or {}).get("session_day") or "").strip()
+    if stored:
+        return stored
+    for key in ("placed_at","entry_ts","created_at"):
+        try:
+            value=float((rec or {}).get(key))
+            if value>0:
+                return str(_learning_session_day(datetime.fromtimestamp(value,tz=timezone.utc).astimezone(UAE)))
+        except (TypeError,ValueError,OverflowError):
+            pass
+    return str(_learning_session_day(_now_uae()))
 def _window_start(day):
     return datetime(day.year,day.month,day.day,START_HOUR,START_MINUTE,0,tzinfo=UAE)
 
@@ -901,7 +914,7 @@ async def _send_request(candidate, notify=True):
 
         _daily["placed"] += 1
         _daily["strategies"].add(str(rec.get("strategy") or "UNKNOWN"))
-        await _session_stat_update(rec.get("session_day") or _learning_session_day(_now_uae()),placed=1,strategy=rec.get("strategy",""))
+        await _session_stat_update(_record_session_day(placed),placed=1,strategy=placed.get("strategy",""))
         print(
             f"LEARNING_ORDER_ACCEPTED pair={placed['pair']} direction={placed['direction']} "
             f"strategy={placed['strategy']} trade_id={placed['trade_id']} "
@@ -1186,7 +1199,7 @@ async def _record_result(rec,result,source,exit_price=None,pnl=None):
                                      "members":rec.get("council_members"),
                                      "votes":rec.get("council_votes"),
                                  })
-    await _session_stat_update(rec.get("session_day") or _learning_session_day(_now_uae()), **({"win":1} if result=="WIN" else {"loss":1} if result=="LOSS" else {"tie":1}))
+    await _session_stat_update(_record_session_day(rec), **({"win":1} if result=="WIN" else {"loss":1} if result=="LOSS" else {"tie":1}))
     await _campaign_result(result,rec.get("strategy","UNKNOWN"))
     validation=await _strategy_validation_snapshot(rec.get("strategy","UNKNOWN"))
     if tid:
