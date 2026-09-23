@@ -3073,13 +3073,40 @@ async def cycle_loop():
         quote_now=time.time()
         quote_age=live_price_age(p,quote_now)
         if not has_fresh_live_price(p,quote_now,LIVE_TICK_MAX_AGE):
-            log.info(
-                "FINAL_QUOTE_STALE_SKIP cycle=%s pair=%s quote_age=%s max_age=%.1f next_asset=TRUE",
-                cycle_id,p,
-                ("NONE" if quote_age is None else f"{quote_age:.3f}"),
-                float(LIVE_TICK_MAX_AGE)
-            )
-            return False
+            # Event-1 delivery ticks are preferred, but the authenticated broker
+            # current-candle endpoint is the authoritative fallback. Refresh the
+            # exact candidate at the signal boundary instead of rejecting a valid
+            # setup merely because the account-wide 2s rotation has not touched it
+            # within the last five seconds.
+            refreshed=False
+            try:
+                refreshed=await asyncio.wait_for(
+                    refresh_broker_live_quote(p),timeout=2.5
+                )
+            except Exception as e:
+                log.info(
+                    "FINAL_QUOTE_BROKER_REFRESH_FAILED cycle=%s pair=%s "
+                    "type=%s message=%s",
+                    cycle_id,p,type(e).__name__,str(e)[:120]
+                )
+            quote_now=time.time()
+            quote_age=live_price_age(p,quote_now)
+            if refreshed and has_fresh_live_price(
+                p,quote_now,max(LIVE_TICK_MAX_AGE,2.5)
+            ):
+                log.info(
+                    "FINAL_QUOTE_BROKER_REFRESHED cycle=%s pair=%s quote_age=%.3f "
+                    "source=authenticated_broker_live_candle",
+                    cycle_id,p,float(quote_age or 0.0)
+                )
+            else:
+                log.info(
+                    "FINAL_QUOTE_STALE_SKIP cycle=%s pair=%s quote_age=%s max_age=%.1f next_asset=TRUE",
+                    cycle_id,p,
+                    ("NONE" if quote_age is None else f"{quote_age:.3f}"),
+                    float(LIVE_TICK_MAX_AGE)
+                )
+                return False
 
         entry=STATE["prices"].get(p,(None,None))[0]
         if entry is None:
