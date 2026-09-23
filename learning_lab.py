@@ -1649,8 +1649,8 @@ async def run_forever():
     except Exception:
         _lab_log=None
     if os.getenv("LEARNING_PRACTICE_ENABLED","true").strip().lower()=="false":
-        logmsg="LEARNING_PRACTICE_LOOP_DISABLED reason=env"
-        print(logmsg)
+        if _lab_log:
+            _lab_log.warning("LEARNING_PRACTICE_LOOP_DISABLED reason=env")
         return
 
     # Enter the scheduler immediately. The old startup path awaited several
@@ -1724,10 +1724,11 @@ async def run_forever():
                     _last_report_day = day
             elif now >= report_deadline and _last_report_day != day:
                 _last_report_day = day
-                print(
-                    f"LEARNING_REPORT_SUPPRESSED_LATE day={day} "
-                    f"reason=outside_report_grace_window"
-                )
+                if _lab_log:
+                    _lab_log.info(
+                        "LEARNING_REPORT_SUPPRESSED_LATE day=%s reason=outside_report_grace_window",
+                        day,
+                    )
             if practice_active(now):
                 if time.time()-last_heartbeat >= 60:
                     last_heartbeat=time.time()
@@ -1772,10 +1773,18 @@ async def run_forever():
                         )
                     except asyncio.TimeoutError:
                         candidates=[]
-                        print(f"LEARNING_SCAN_TIMEOUT seconds={LEARNING_SCAN_TIMEOUT_SECONDS} fallback=next_scan")
+                        if _lab_log:
+                            _lab_log.warning(
+                                "LEARNING_SCAN_TIMEOUT seconds=%s fallback=next_scan",
+                                LEARNING_SCAN_TIMEOUT_SECONDS,
+                            )
                     except Exception as e:
                         candidates=[]
-                        print(f"LEARNING_SCAN_FAILED type={type(e).__name__} message={str(e)[:160]} fallback=next_scan")
+                        if _lab_log:
+                            _lab_log.warning(
+                                "LEARNING_SCAN_FAILED type=%s message=%s fallback=next_scan",
+                                type(e).__name__,str(e)[:160],
+                            )
                     accepted=await _send_campaign_batch(candidates)
                     if _lab_log:
                         _lab_log.info(
