@@ -844,7 +844,11 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,
         stats["usable_candles"]+=1
         try:
             price=(prices.get(pair) or [None,None])[0]
-            brain=analyze_asset(asset,cs,price,forced_strategy=forced_strategy)
+            brain=analyze_asset(
+                asset,cs,price,
+                forced_strategy=forced_strategy,
+                learning_campaign=bool(forced_strategy),
+            )
         except Exception as e:
             log.debug(
                 "LEARNING_BRAIN_ERROR pair=%s type=%s message=%s",
