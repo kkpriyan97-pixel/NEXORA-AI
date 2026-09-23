@@ -888,9 +888,10 @@ ACCOUNT_TICK_PIN_SLOTS=4
 ACCOUNT_TICK_ROTATE_INTERVAL=15.0
 # Temporarily back off pairs that the authenticated event-12 channel explicitly
 # rejects, instead of wasting every rotation/final-boundary slot on them.
-ACCOUNT_TICK_REJECT_COOLDOWN=120.0
-ACCOUNT_TICK_FRESH_WAIT=1.5
-ACCOUNT_TICK_FINAL_PROBE_LIMIT=16
+ACCOUNT_TICK_REJECT_COOLDOWN=600.0
+ACCOUNT_TICK_FRESH_WAIT=0.5
+ACCOUNT_TICK_FINAL_PROBE_LIMIT=8
+ACCOUNT_TICK_SUB_TIMEOUT=1.8
 ACCOUNT_TICK_SUBSCRIBED=set()
 ACCOUNT_TICK_LAST_ATTEMPT={}
 ACCOUNT_TICK_REJECT_COUNT=defaultdict(int)
@@ -1289,7 +1290,7 @@ async def _subscribe_account_tick(pair):
         try:
             # Let the caller control rotation pacing; this function itself must
             # stay latency-bounded because it is also used before signal delivery.
-            await asyncio.wait_for(client.market.subscribe_ticks(pair),timeout=4.0)
+            await asyncio.wait_for(client.market.subscribe_ticks(pair),timeout=ACCOUNT_TICK_SUB_TIMEOUT)
             ACCOUNT_TICK_SUBSCRIBED.add(pair)
             ACCOUNT_TICK_LAST_ATTEMPT[pair]=time.time()
             ACCOUNT_TICK_REJECT_COUNT[pair]=0
@@ -3156,7 +3157,7 @@ async def cycle_loop():
         ))
 
         log.info(
-            "CYCLE_WINDOW_START cycle=%s sequence=%s interval=%ss cycle_start_offset=150s signal_lead=%ss "
+            "CYCLE_WINDOW_START cycle=%s sequence=%s interval=%ss cycle_start_offset=0s signal_offset=150s signal_lead=%ss "
             "signal_utc=%s target_utc=%s analysis_passes=5 frames=5s,1m..15m",
             cycle_id,cycle_sequence,int(SIGNAL_INTERVAL),int(signal_lead),
             time.strftime("%H:%M:%S",time.gmtime(signal_at)),
@@ -3426,7 +3427,7 @@ async def cycle_loop():
                                     continue
                                 _final_seen_pairs.add(_p)
                                 final_items.append(_item)
-                                if len(final_items)>=16:
+                                if len(final_items)>=ACCOUNT_TICK_FINAL_PROBE_LIMIT:
                                     break
                             for _item in final_items:
                                 p=_item.get("pair")
@@ -3527,7 +3528,7 @@ async def cycle_loop():
                                         [x.get("pair") for x in _pin_items],
                                         ttl=pin_ttl,
                                         require_fresh=True,
-                                        fresh_wait=1.5
+                                        fresh_wait=ACCOUNT_TICK_FRESH_WAIT
                                     )
                                     log.info(
                                         "FINAL_CANDIDATE_TICKS_FINAL_PREPARED cycle=%s probe=%s active=%s pass=%s ttl=%.1f seconds_to_signal=%.2f",
@@ -3824,6 +3825,11 @@ async def cycle_loop():
             attempted_final=0
             for candidate in ranked_pool:
                 attempted_final+=1
+                log.info(
+                    "FINAL_FALLBACK_ATTEMPT cycle=%s rank=%d/%d pair=%s fresh=%s",
+                    cycle_id,attempted_final,len(ranked_pool),candidate.get("pair"),
+                    has_fresh_live_price(candidate.get("pair"),time.time(),LIVE_TICK_MAX_AGE)
+                )
                 try:
                     log.info(
                         "FINAL_SIGNAL_ATTEMPT cycle=%s rank=%s pair=%s confidence=%s direction=%s",
