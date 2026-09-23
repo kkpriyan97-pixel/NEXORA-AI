@@ -1574,7 +1574,7 @@ async def _send_daily_report(day):
     decided=stats["win"]+stats["loss"]
     accuracy=(100.0*stats["win"]/decided) if decided else 0.0
     validated=await _validated_strategy_ids()
-    await _cfg["send_message"](
+    sent=await _cfg["send_message"](
         "🧠 CANDICE • LEARNING REPORT\n\n"
         "🕕 Practice → 18:00–06:00 UAE\n"
         f"📅 Day → {day}\n"
@@ -1589,7 +1589,8 @@ async def _send_daily_report(day):
         "🔴 06:00 → Learning Auto-Trade OFF\n"
         "🔐 ADMIN ONLY",
         chat_id=_cfg.get("admin_id") or None
-    )    if sent is False:
+    )
+    if sent is False:
         await _release_daily_report_claim(day)
         print(f"LEARNING_REPORT_SEND_FAILED day={day} claim_released=True")
         return False
@@ -1625,6 +1626,10 @@ async def run_forever():
         await asyncio.wait_for(ensure_campaign_table(),timeout=5.0)
     except Exception as e:
         print(f"LEARNING_CAMPAIGN_INIT_FAILED type={type(e).__name__} message={str(e)[:120]}")
+    try:
+        await asyncio.wait_for(ensure_report_state_table(),timeout=5.0)
+    except Exception as e:
+        print(f"LEARNING_REPORT_STATE_INIT_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]}")
     print(
         "LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=18:00-06:00 "
         "timezone=Asia/Dubai demo_only=True ai_council=True "
