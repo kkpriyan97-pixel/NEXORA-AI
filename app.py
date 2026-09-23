@@ -5018,169 +5018,150 @@ async def build_live_analysis_payload():
 
 
 async def account_setups_page():
-    """Read-only mobile view of the authenticated account's Candice setups and live orders."""
-    payload=json.dumps(await build_live_analysis_payload(),ensure_ascii=False,default=str)
-    html="""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>CANDICE • Account Setups</title>
-<style>
-*{box-sizing:border-box}
-body{margin:0;background:#070b0f;color:#eef4f6;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-.wrap{max-width:760px;margin:auto;padding:14px}
-.top{position:sticky;top:0;background:#070b0fee;backdrop-filter:blur(12px);z-index:5;padding:4px 0 12px}
-h1{font-size:22px;margin:8px 0 4px}.sub{opacity:.72;font-size:12px}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:12px 0}
-.card,.setup{background:#10161c;border:1px solid #26323b;border-radius:14px;padding:12px}
-.kpi{font-size:20px;font-weight:800}.label{font-size:11px;opacity:.65;text-transform:uppercase}
-.setup{margin:8px 0}.row{display:flex;justify-content:space-between;gap:10px;align-items:center}
+    """Read-only server-rendered live view; no browser JavaScript required."""
+    d=await build_live_analysis_payload()
+    def esc(v):
+        import html as _html
+        return _html.escape(str(v if v is not None else "—"))
+
+    css="""*{box-sizing:border-box}body{margin:0;background:#070b0f;color:#eef4f6;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.wrap{max-width:760px;margin:auto;padding:14px}.top{background:#070b0f;padding:4px 0 12px}
+h1{font-size:22px;margin:8px 0 4px}.sub{opacity:.72;font-size:12px}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:12px 0}
+.card,.setup{background:#10161c;border:1px solid #26323b;border-radius:14px;padding:12px}.kpi{font-size:20px;font-weight:800}
+.label{font-size:11px;opacity:.65;text-transform:uppercase}.setup{margin:8px 0}.row{display:flex;justify-content:space-between;gap:10px;align-items:center}
 .assetname{font-size:16px;font-weight:800}.up{color:#45ef8a;font-weight:800}.down{color:#ff6d7a;font-weight:800}
-.meta{font-size:11px;opacity:.75;line-height:1.55}details{margin-top:8px}
-summary{cursor:pointer;font-weight:700;font-size:12px}
-pre{white-space:pre-wrap;word-break:break-word;font-size:11px;opacity:.85}
-.empty{opacity:.65;text-align:center;padding:30px 10px}.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#45ef8a;margin-right:6px}
-.small{font-size:11px;opacity:.75}
-</style>
-</head>
-<body>
-<div class="wrap">
-<div class="top">
+.meta{font-size:11px;opacity:.75;line-height:1.55}details{margin-top:8px}summary{cursor:pointer;font-weight:700;font-size:12px}
+pre{white-space:pre-wrap;word-break:break-word;font-size:11px;opacity:.85}.empty{opacity:.65;text-align:center;padding:30px 10px}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#45ef8a;margin-right:6px}.small{font-size:11px;opacity:.75}a{color:#8fc7ff}"""
+
+    c=d.get("five_scan_cycle") or {}
+    monitor=d.get("order_position_monitor") or {}
+    orders=d.get("live_orders") or []
+    events=d.get("live_order_events") or []
+
+    setup_rows=[]
+    for asset in d.get("assets") or []:
+        candidates=asset.get("strategy_candidates") or []
+        # Show every live candidate, plus the asset itself when only a single
+        # selected strategy is present.
+        if candidates:
+            for cand in candidates:
+                setup_rows.append((asset,cand))
+        elif asset.get("strategy"):
+            setup_rows.append((asset,{
+                "strategy":asset.get("strategy"),
+                "direction":asset.get("direction"),
+                "score":asset.get("confidence")
+            }))
+
+    cards=[]
+    for idx,(asset,cand) in enumerate(sorted(
+        setup_rows,key=lambda z:float(z[1].get("score") or 0),reverse=True
+    ),1):
+        direction=str(cand.get("direction") or asset.get("direction") or "—").upper()
+        dc="up" if direction=="UP" else "down"
+        audits=asset.get("strategy_audit") or []
+        audit_html="<br>".join(
+            esc(a.get("strategy"))+" → UP "+esc(a.get("up_score"))+
+            " / DOWN "+esc(a.get("down_score"))+
+            (" • QUALIFIED" if a.get("up_qualified") or a.get("down_qualified") else "")
+            for a in audits
+        ) or "No strategy audit available"
+        ind=asset.get("indicators") or {}
+        ind_text="\n".join([
+            "EMA 9/21: %s / %s"%(esc(ind.get("ema_fast")),esc(ind.get("ema_slow"))),
+            "RSI 14: %s"%esc(ind.get("rsi")),
+            "Stoch 14/3/3: %s / %s / %s"%(esc(ind.get("stochastic_k")),esc(ind.get("stochastic_d")),esc(ind.get("stochastic_cross"))),
+            "Bollinger 30/2.2: %s • %s"%(esc(ind.get("bollinger_signal")),esc(ind.get("bollinger_position"))),
+            "Donchian 30: %s • %s"%(esc(ind.get("donchian_state")), "EXPANDING" if ind.get("donchian_expansion") else "FLAT"),
+            "ATR 14: %s"%esc(ind.get("atr")),
+            "Momentum: %s ATR"%esc(ind.get("momentum_norm_atr")),
+            "Volatility: %s"%esc(ind.get("volatility_ratio")),
+            "Support / Resistance: %s / %s"%(esc(ind.get("support")),esc(ind.get("resistance")))
+        ])
+        cards.append(
+            '<div class="setup"><div class="row"><div><div class="assetname">%d. %s</div>'
+            '<div class="meta">%s • Live %s • %s</div></div>'
+            '<div class="%s">%s</div></div>'
+            '<div class="meta">🎯 %s • Confidence %s%% • 15m %s • 1m %s</div>'
+            '<details><summary>📊 Full live indicators</summary><pre>%s</pre></details>'
+            '<details><summary>🧠 All 8 strategy checks</summary><pre>%s</pre></details></div>'
+            % (idx,esc(asset.get("display_name") or asset.get("pair")),
+               esc(asset.get("pair")),esc(asset.get("live_price")),esc(asset.get("live_price_source")),
+               dc,esc(direction),esc(cand.get("strategy") or asset.get("strategy")),
+               esc(cand.get("score") if cand.get("score") is not None else asset.get("confidence")),
+               esc(asset.get("trend_15m")),esc(asset.get("structure_1m")),
+               esc(ind_text),audit_html)
+        )
+
+    if orders:
+        order_html=""
+        for o in orders[:12]:
+            direction=str(o.get("direction") or o.get("dir") or "—").upper()
+            dc="up" if direction=="UP" else "down"
+            status=str(o.get("status") or o.get("state") or "OPEN").upper()
+            entry=o.get("price")
+            if entry is None: entry=o.get("open_price",o.get("entry_price"))
+            exitp=o.get("expiry_price")
+            if exitp is None: exitp=o.get("close_price",o.get("exit_price"))
+            profit=o.get("profit")
+            if profit is None: profit=o.get("pnl")
+            order_html += (
+                '<div class="setup"><div class="row"><div class="assetname">%s</div>'
+                '<div class="%s">%s</div></div>'
+                '<div class="meta">ID %s • %s • %s • $%s</div>'
+                '<div class="meta">Entry %s • Live/Expiry %s • P/L %s</div>'
+                '<div class="meta">Source %s</div></div>'
+                % (esc(o.get("pair") or o.get("symbol") or "Unknown"),dc,esc(direction),
+                   esc(o.get("_trade_id") or o.get("id")),esc(status),
+                   "FLEX" if o.get("is_flex") else "ORDER",esc(o.get("amount")),
+                   esc(entry),esc(exitp),esc(profit),esc(o.get("_source") or "broker"))
+            )
+    else:
+        order_html='<div class="small">No broker-side open/manual position detected at this moment.</div>'
+
+    if events:
+        event_lines=[]
+        for e in list(events)[-16:][::-1]:
+            try:
+                tt=datetime.fromtimestamp(float(e.get("received_at") or 0),tz=timezone.utc).astimezone().strftime("%H:%M:%S")
+            except Exception:
+                tt="—"
+            event_lines.append(
+                "%s • e:%s • %s • %s • %s • P/L %s" %
+                (tt,esc(e.get("event")),esc(e.get("pair")),esc(e.get("direction")),
+                 esc(e.get("status")),esc(e.get("profit")))
+            )
+        event_html="<pre>%s</pre>"%"\\n".join(event_lines)
+    else:
+        event_html='<div class="small">Waiting for broker Event 21 / 22 / 26 / 31…</div>'
+
+    body="""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta http-equiv="refresh" content="3">
+<title>CANDICE • MY DEMO ACCOUNT</title><style>%s</style></head><body>
+<div class="wrap"><div class="top">
 <h1>🧠 CANDICE • MY DEMO ACCOUNT</h1>
 <div class="sub"><span class="dot"></span>Authenticated live data • READ ONLY • Flex trade is manual</div>
-<div id="status" class="small">Loading…</div>
-</div>
+<div class="small">Updated %s • Feed %s • Order monitor %s</div></div>
 <div class="grid">
-<div class="card"><div class="label">Account Assets</div><div id="assets" class="kpi">—</div></div>
-<div class="card"><div class="label">Detected Setups</div><div id="setupsN" class="kpi">—</div></div>
+<div class="card"><div class="label">Account Assets</div><div class="kpi">%s</div></div>
+<div class="card"><div class="label">Detected Setups</div><div class="kpi">%s</div></div>
 <div class="card"><div class="label">Strategies Checked</div><div class="kpi">8</div></div>
-<div class="card"><div class="label">Signal Expiry</div><div class="kpi">1 MIN</div></div>
-</div>
-<div class="card" id="cycle">🔎 5-scan cycle: loading…</div>
-<div class="card" id="orders"><b>💼 LIVE ORDER / POSITION</b><div class="small">No broker-side manual position detected.</div></div>
-<div class="card" id="events"><b>🛰️ BROKER ORDER EVENTS</b><div class="small">Waiting for Event 21/22/26/31…</div></div>
-<div id="list"></div>
-</div>
-<script>
-const initial={service:"CANDICE-AI",assets:[],live_orders:[],live_order_events:[],five_scan_cycle:{},asset_count:0,authenticated_account_feed:false,order_position_monitor:{}};
-function nfmt(x){
- const n=Number(x);
- return Number.isFinite(n)?n.toFixed(5):"—";
-}
-function indicatorText(i){
- if(!i) return "";
- return [
-  "EMA 9/21: "+nfmt(i.ema_fast)+" / "+nfmt(i.ema_slow),
-  "RSI 14: "+nfmt(i.rsi),
-  "Stoch 14/3/3: "+nfmt(i.stochastic_k)+" / "+nfmt(i.stochastic_d)+" / "+(i.stochastic_cross||"—"),
-  "Bollinger 30/2.2: "+(i.bollinger_signal||"—")+" • "+(i.bollinger_position||"—"),
-  "Donchian 30: "+(i.donchian_state||"—")+" • "+(i.donchian_expansion?"EXPANDING":"FLAT"),
-  "ATR 14: "+nfmt(i.atr),
-  "Momentum: "+nfmt(i.momentum_norm_atr)+" ATR",
-  "Volatility: "+nfmt(i.volatility_ratio),
-  "Support / Resistance: "+nfmt(i.support)+" / "+nfmt(i.resistance)
- ].join("\n");
-}
-function render(d){
- document.getElementById("assets").textContent=d.asset_count||0;
- const setups=[];
- for(const a of (d.assets||[])){
-   const vs=a.strategy_candidates||[];
-   if(vs.length){
-     for(const v of vs){
-       setups.push({asset:a,strategy:v.strategy||a.strategy||"—",direction:v.direction||a.direction||"—",confidence:v.score??a.confidence??0});
-     }
-   }else if(a.strategy){
-     setups.push({asset:a,strategy:a.strategy,direction:a.direction||"—",confidence:a.confidence||0});
-   }
- }
- setups.sort((x,y)=>Number(y.confidence)-Number(x.confidence));
- document.getElementById("setupsN").textContent=setups.length;
-
- const c=d.five_scan_cycle||{};
- document.getElementById("cycle").innerHTML=
-  "<b>🔎 5-SCAN CYCLE</b><br>"+
-  "Cycle: "+(c.cycle_id??"—")+" • Pass: "+(c.completed_pass??0)+"/5<br>"+
-  "Protocol: <b>FLEX MANUAL</b> • Bot order placement: <b>OFF</b>";
-
- document.getElementById("status").textContent=
-  "Updated "+new Date().toLocaleTimeString()+
-  " • Authenticated account feed "+(d.authenticated_account_feed?"OK":"NOT READY")+
-  " • Order monitor "+((d.order_position_monitor||{}).connected?"CONNECTED":"WAITING");
-
- const liveOrders=(d.live_orders||[]).slice().sort((a,b)=>Number(b._received_at||0)-Number(a._received_at||0));
- const oo=document.getElementById("orders");
- if(!liveOrders.length){
-   oo.innerHTML='<b>💼 LIVE ORDER / POSITION</b><div class="small">No broker-side manual position detected at this moment. Make the Flex trade manually in Demo and this panel will update.</div>';
- }else{
-   oo.innerHTML='<b>💼 LIVE ORDER / POSITION</b>'+
-   liveOrders.slice(0,12).map(function(o){
-     const dir=String(o.direction||o.dir||"").toUpperCase();
-     const status=String(o.status||o.state||"OPEN").toUpperCase();
-     const price=o.price??o.open_price??o.entry_price;
-     const expiry=o.expiry_price??o.close_price??o.exit_price;
-     const profit=o.profit??o.pnl;
-     return '<div class="setup">'+
-       '<div class="row"><div class="assetname">'+(o.pair||o.symbol||"Unknown")+'</div>'+
-       '<b class="'+(dir==="UP"?"up":"down")+'">'+(dir||"—")+'</b></div>'+
-       '<div class="meta">ID '+(o._trade_id||o.id||"—")+' • '+status+' • '+(o.is_flex?"FLEX":"ORDER")+' • $'+(o.amount??"—")+'</div>'+
-       '<div class="meta">Entry '+(price??"—")+' • Live/Expiry '+(expiry??"—")+' • P/L '+(profit??"—")+'</div>'+
-       '<div class="meta">Source '+(o._source||"broker")+'</div>'+
-     '</div>';
-   }).join("");
- }
-
- const ev=(d.live_order_events||[]).slice(-12).reverse();
- const ee=document.getElementById("events");
- if(!ev.length){
-   ee.innerHTML='<b>🛰️ BROKER ORDER EVENTS</b><div class="small">Waiting for Event 21 / 22 / 26 / 31…</div>';
- }else{
-   ee.innerHTML='<b>🛰️ BROKER ORDER EVENTS</b><pre>'+
-     ev.map(function(e){
-       const t=new Date(Number(e.received_at||0)*1000).toLocaleTimeString();
-       return t+" • e:"+e.event+" • "+(e.pair||"—")+" • "+(e.direction||"—")+" • "+(e.status||"—")+" • P/L "+(e.profit??"—");
-     }).join("\n")+
-   "</pre>";
- }
-
- const el=document.getElementById("list");
- if(!setups.length){
-   el.innerHTML='<div class="empty">Candice is scanning the account. No qualifying setup right now.</div>';
-   return;
- }
- el.innerHTML=setups.map(function(x,idx){
-   const a=x.asset;
-   const up=String(x.direction).toUpperCase()==="UP";
-   const audits=a.strategy_audit||[];
-   const auditText=audits.map(function(z){
-     return (z.strategy||"—")+" → UP "+(z.up_score??"—")+" / DOWN "+(z.down_score??"—")+
-       ((z.up_qualified||z.down_qualified)?" • QUALIFIED":"");
-   }).join("\n");
-   return '<div class="setup">'+
-     '<div class="row"><div><div class="assetname">'+(idx+1)+'. '+(a.display_name||a.pair)+'</div>'+
-     '<div class="meta">'+a.pair+' • Live '+nfmt(a.live_price)+' • '+(a.live_price_source||"—")+'</div></div>'+
-     '<div class="'+(up?"up":"down")+'">'+(up?"⬆️ UP":"⬇️ DOWN")+'</div></div>'+
-     '<div class="meta">🎯 '+x.strategy+' • Confidence '+x.confidence+'% • 15m '+(a.trend_15m||"—")+' • 1m '+(a.structure_1m||"—")+'</div>'+
-     '<details><summary>📊 Full live indicators</summary><pre>'+indicatorText(a.indicators)+'</pre></details>'+
-     '<details><summary>🧠 All 8 strategy checks</summary><pre>'+auditText+'</pre></details>'+
-   '</div>';
- }).join("");
-}
-try{render(initial);}catch(e){document.getElementById("status").textContent="Live page starting…";}
-async function tick(){
- try{
-   const r=await fetch("/live-analysis?ts="+Date.now(),{cache:"no-store"});
-   if(r.ok) render(await r.json());
- }catch(e){
-   document.getElementById("status").textContent="Live refresh waiting…";
- }
-}
-setTimeout(tick,100); setInterval(tick,2000);
-</script>
-</body>
-</html>"""
-    return html.replace("__INITIAL_PAYLOAD__",payload).encode("utf-8")
+<div class="card"><div class="label">Signal Expiry</div><div class="kpi">1 MIN</div></div></div>
+<div class="card"><b>🔎 5-SCAN CYCLE</b><br>Cycle: %s • Pass: %s/5<br>Protocol: <b>FLEX MANUAL</b> • Bot order placement: <b>OFF</b></div>
+<div class="card"><b>💼 LIVE ORDER / POSITION</b>%s</div>
+<div class="card"><b>🛰️ BROKER ORDER EVENTS</b>%s</div>
+<div><div class="small">Showing %s qualifying setup rows. Refreshes every 3 seconds.</div>%s</div>
+</div></body></html>""" % (
+        css,esc(datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")),
+        "OK" if d.get("authenticated_account_feed") else "WAITING",
+        "CONNECTED" if monitor.get("connected") else "WAITING",
+        esc(d.get("asset_count")),esc(len(setup_rows)),esc(c.get("cycle_id") or "—"),
+        esc(c.get("completed_pass") or 0),order_html,event_html,esc(len(setup_rows)),
+        "".join(cards) or '<div class="empty">Candice is scanning the account. No qualifying setup at this moment.</div>'
+    )
+    return body.encode("utf-8")
 
 async def health(reader,writer):
     try:
