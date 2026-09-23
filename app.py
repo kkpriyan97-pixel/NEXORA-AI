@@ -2138,14 +2138,18 @@ def multi_timeframe_confirmation(context,expected):
                 "direction":thirty.get("direction","NEUTRAL")
             }
     else:
-        # Never synthesize a 30s candle from 1m data. When the broker stream has
-        # fewer than two closed 30s buckets, rely on a stronger closed-candle
-        # substitute below.
-        if int(thirty.get("bars") or 0):
-            log.info(
-                "30S_CONFIRMATION_UNAVAILABLE reason=insufficient_closed_30s_bars bars=%s mode=%s",
-                thirty.get("bars",0),thirty_mode
-            )
+        # A sparse 30s feed is a data-quality failure for a 1-minute entry.
+        # The previous strict substitute allowed live approval from slower
+        # frames alone. Do not count a data-gap substitute as confirmation.
+        log.info(
+            "30S_CONFIRMATION_UNAVAILABLE reason=insufficient_closed_30s_bars bars=%s mode=%s action=reject_live",
+            thirty.get("bars",0),thirty_mode
+        )
+        return False,{
+            "reason":"30s_confirmation_unavailable",
+            "bars":int(thirty.get("bars") or 0),
+            "30s_mode":thirty_mode
+        }
 
     if one.get("status")!="READY":
         return False,{"reason":"1m_confirmation_insufficient","bars":one.get("bars",0)}
@@ -3746,6 +3750,38 @@ async def cycle_loop():
                     "SCAN_EVALUATION_FAILED cycle=%s scan=SCAN_%s pass=%s type=%s message=%s",
                     cycle_id,pass_no,type(e).__name__,str(e)[:160]
                 )
+
+            # Warm candidate tick subscriptions during passes 1-3 so genuine
+            # 30s buckets can accumulate before the final 1-minute gate.
+            # This is read-only market-data preparation; Brain direction,
+            # strategy, expiry, and the Telegram send rules remain unchanged.
+            if pass_no in (1,2,3) and candidate_pool:
+                warm_pool=sorted(
+                    [x for x in candidate_pool.values()
+                     if isinstance(x,dict) and x.get("pair")],
+                    key=lambda x:(
+                        int(x.get("confidence") or 0),
+                        float(x.get("market_quality") or 0),
+                    ),
+                    reverse=True
+                )[:ACCOUNT_TICK_PIN_SLOTS]
+                try:
+                    warm_ttl=max(75.0,target-time.time()+45.0)
+                    active_warm=await pin_account_tick_pairs(
+                        [x.get("pair") for x in warm_pool],
+                        ttl=warm_ttl
+                    )
+                    log.info(
+                        "EARLY_30S_TICK_WARM cycle=%s pass=%s pairs=%s active=%s ttl=%.1f seconds_to_signal=%.2f",
+                        cycle_id,pass_no,[x.get("pair") for x in warm_pool],
+                        active_warm,warm_ttl,
+                        max(0.0,signal_at-time.time())
+                    )
+                except Exception as e:
+                    log.warning(
+                        "EARLY_30S_TICK_WARM_FAILED cycle=%s pass=%s type=%s message=%s",
+                        cycle_id,pass_no,type(e).__name__,str(e)[:120]
+                    )
 
             # Final recovery window: a narrow pass-5 result is still recoverable.
             # The previous condition only retried when pass 5 returned NO candidate.
