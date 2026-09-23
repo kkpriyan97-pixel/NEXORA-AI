@@ -888,7 +888,9 @@ ACCOUNT_TICK_PIN_SLOTS=4
 ACCOUNT_TICK_ROTATE_INTERVAL=15.0
 # Temporarily back off pairs that the authenticated event-12 channel explicitly
 # rejects, instead of wasting every rotation/final-boundary slot on them.
-ACCOUNT_TICK_REJECT_COOLDOWN=300.0
+ACCOUNT_TICK_REJECT_COOLDOWN=120.0
+ACCOUNT_TICK_FRESH_WAIT=1.5
+ACCOUNT_TICK_FINAL_PROBE_LIMIT=16
 ACCOUNT_TICK_SUBSCRIBED=set()
 ACCOUNT_TICK_LAST_ATTEMPT={}
 ACCOUNT_TICK_REJECT_COUNT=defaultdict(int)
@@ -1320,8 +1322,8 @@ def _tick_pinned_pairs():
         ACCOUNT_TICK_PINNED.pop(p,None)
     return [p for p,until in ACCOUNT_TICK_PINNED.items() if float(until)>now]
 
-async def pin_account_tick_pairs(pairs,ttl=12.0):
-    """Pin final candidate tick slots without destroying healthy fallback coverage."""
+async def pin_account_tick_pairs(pairs,ttl=12.0,require_fresh=False,fresh_wait=None):
+    """Pin final candidate tick slots; optionally require an actual fresh event-1 tick."""
     global ACCOUNT_TICK_LAST_ROTATION
     async with ACCOUNT_TICK_CONTROL_LOCK:
         unique=[]
@@ -1332,7 +1334,11 @@ async def pin_account_tick_pairs(pairs,ttl=12.0):
                 seen.add(p);unique.append(p)
         probe_limit=min(
             len(unique),
-            max(ACCOUNT_TICK_PIN_SLOTS*3,ACCOUNT_TICK_PIN_SLOTS)
+            int(
+                ACCOUNT_TICK_FINAL_PROBE_LIMIT
+                if require_fresh
+                else max(ACCOUNT_TICK_PIN_SLOTS*3,ACCOUNT_TICK_PIN_SLOTS)
+            )
         )
         targets=unique[:probe_limit]
         until=time.time()+float(ttl)
@@ -1348,13 +1354,26 @@ async def pin_account_tick_pairs(pairs,ttl=12.0):
 
         accepted_targets=[]
         for p in targets:
-            if p in ACCOUNT_TICK_SUBSCRIBED:
-                accepted_targets.append(p)
-                if len(accepted_targets)>=ACCOUNT_TICK_PIN_SLOTS:
-                    break
+            ok=(p in ACCOUNT_TICK_SUBSCRIBED) or await _subscribe_account_tick(p)
+            if not ok:
                 continue
-            if await _subscribe_account_tick(p):
-                accepted_targets.append(p)
+            if require_fresh:
+                wait_limit=float(
+                    fresh_wait if fresh_wait is not None else ACCOUNT_TICK_FRESH_WAIT
+                )
+                deadline=time.time()+max(0.25,min(3.0,wait_limit))
+                while time.time()<deadline and not has_fresh_live_price(
+                    p,time.time(),LIVE_TICK_MAX_AGE
+                ):
+                    await asyncio.sleep(0.10)
+                if not has_fresh_live_price(p,time.time(),LIVE_TICK_MAX_AGE):
+                    log.info(
+                        "ACCOUNT_TICK_SUBSCRIBE_NO_FRESH pair=%s wait=%.1f next_asset=TRUE",
+                        p,wait_limit
+                    )
+                    await _unsubscribe_account_tick(p)
+                    continue
+            accepted_targets.append(p)
             if len(accepted_targets)>=ACCOUNT_TICK_PIN_SLOTS:
                 break
 
@@ -3375,7 +3394,7 @@ async def cycle_loop():
                                     continue
                                 _final_seen_pairs.add(_p)
                                 final_items.append(_item)
-                                if len(final_items)>=12:
+                                if len(final_items)>=16:
                                     break
                             for _item in final_items:
                                 p=_item.get("pair")
@@ -3464,27 +3483,29 @@ async def cycle_loop():
                                     continue
                                 _pin_seen_pairs.add(_p)
                                 _pin_items.append(_item)
-                                if len(_pin_items)>=ACCOUNT_TICK_PIN_SLOTS:
+                                if len(_pin_items)>=16:
                                     break
                             if _pin_items:
                                 try:
-                                    # Keep the strongest four UNIQUE assets live
-                                    # through the exact signal boundary. The full
-                                    # candidate_pool remains available for fallback.
-                                    pin_ttl=max(30.0,target-time.time()+12.0)
+                                    # Probe the full prepared fallback set. The tick manager
+                                    # keeps only four assets active, skips unusable broker
+                                    # subscriptions, and requires a real fresh event-1 tick.
+                                    pin_ttl=max(45.0,target-time.time()+20.0)
                                     active_prep=await pin_account_tick_pairs(
                                         [x.get("pair") for x in _pin_items],
-                                        ttl=pin_ttl
+                                        ttl=pin_ttl,
+                                        require_fresh=True,
+                                        fresh_wait=1.5
                                     )
                                     log.info(
-                                        "FINAL_CANDIDATE_TICKS_FINAL_PREPARED cycle=%s pairs=%s pass=%s active=%s ttl=%.1f seconds_to_signal=%.2f",
+                                        "FINAL_CANDIDATE_TICKS_FINAL_PREPARED cycle=%s probe=%s active=%s pass=%s ttl=%.1f seconds_to_signal=%.2f",
                                         cycle_id,[x.get("pair") for x in _pin_items],
-                                        pass_no,active_prep,pin_ttl,
+                                        active_prep,pass_no,pin_ttl,
                                         max(0.0,signal_at-time.time())
                                     )
                                 except Exception as e:
                                     log.warning(
-                                        "FINAL_CANDIDATE_TICKS_FINAL_PREPARE_FAILED cycle=%s pairs=%s pass=%s type=%s message=%s",
+                                        "FINAL_CANDIDATE_TICKS_FINAL_PREPARE_FAILED cycle=%s probe=%s pass=%s type=%s message=%s",
                                         cycle_id,[x.get("pair") for x in _pin_items],
                                         pass_no,type(e).__name__,str(e)[:120]
                                     )
@@ -3712,9 +3733,32 @@ async def cycle_loop():
             x for x in final_candidates
             if bool(x.get("final_delivery_confirmed"))
         ]
+        _boundary_unique=[]
+        _boundary_seen=set()
+        for _x in sorted(
+            boundary_pool,
+            key=lambda x:(
+                1 if has_fresh_live_price(x.get("pair"),now_boundary,LIVE_TICK_MAX_AGE) else 0,
+                int(x.get("confidence") or 0),
+                float(x.get("final_delivery_precheck") or -900.0),
+                float(x.get("strategy_margin") or 0),
+                float(x.get("direction_agreement") or 0),
+            ),
+            reverse=True
+        ):
+            _p=str(_x.get("pair") or "")
+            if not _p or _p in _boundary_seen:
+                continue
+            _boundary_seen.add(_p)
+            _boundary_unique.append(_x)
+        boundary_pool=_boundary_unique
         log.info(
-            "FINAL_BOUNDARY_POOL cycle=%s candidates=%d prepared_confirmed=%d total_deep=%d",
-            cycle_id,len(boundary_pool),len(boundary_pool),len(final_candidates)
+            "FINAL_BOUNDARY_POOL cycle=%s candidates=%d prepared_confirmed=%d total_deep=%d unique_assets=%d fresh_now=%d",
+            cycle_id,len(boundary_pool),len(boundary_pool),len(final_candidates),
+            len(boundary_pool),
+            sum(1 for x in boundary_pool if has_fresh_live_price(
+                x.get("pair"),now_boundary,LIVE_TICK_MAX_AGE
+            ))
         )
         ranked_pool=sorted(
             boundary_pool,
