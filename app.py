@@ -1303,12 +1303,17 @@ async def _subscribe_account_tick(pair):
             ACCOUNT_TICK_REJECT_COUNT[pair]=attempt
             ACCOUNT_TICK_LAST_ATTEMPT[pair]=time.time()
             msg=str(e)[:180]
-            invalid="invalid request" in msg.lower() or "invalid_request" in msg.lower()
-            if invalid:
+            lower=msg.lower()
+            broker_unusable=(
+                "invalid request" in lower
+                or "invalid_request" in lower
+                or "rejected after 2 attempts" in lower
+            )
+            if broker_unusable:
                 ACCOUNT_TICK_REJECT_UNTIL[pair]=time.time()+ACCOUNT_TICK_REJECT_COOLDOWN
             log.warning(
-                "ACCOUNT_TICK_SUBSCRIBE pair=%s status=rejected attempt=%d invalid_request=%s cooldown_until=%s type=%s message=%s",
-                pair,attempt,invalid,
+                "ACCOUNT_TICK_SUBSCRIBE pair=%s status=rejected attempt=%d broker_unusable=%s cooldown_until=%s type=%s message=%s",
+                pair,attempt,broker_unusable,
                 (datetime.fromtimestamp(ACCOUNT_TICK_REJECT_UNTIL[pair],tz=timezone.utc).strftime("%H:%M:%S")
                  if pair in ACCOUNT_TICK_REJECT_UNTIL else "NONE"),
                 type(e).__name__,msg
@@ -3067,10 +3072,27 @@ async def cycle_loop():
             target=None
             continue
 
-        # Explicit Candice cycle start: normal cycles begin exactly at the
-        # previous 1-minute expiry boundary (target - 180s). This makes the signal
-        # occur exactly 2m30s after cycle start and the entry boundary exactly 3m00s.
+        # Restart guard: a fresh Candice cycle must never begin in the middle
+        # of its 150-second analysis window. If restart happens after the ideal
+        # start but before the signal, skip that partial boundary and start the
+        # next complete cycle.
         cycle_start=target-SIGNAL_INTERVAL
+        if time.time()>cycle_start+5.0 and not recovered:
+            old_target=target
+            target+=SIGNAL_INTERVAL
+            cycle_id=int(target//SIGNAL_INTERVAL)
+            cycle_sequence=(cycle_id % 20) or 20
+            signal_lead=30.0
+            signal_at=target-signal_lead
+            cycle_start=target-SIGNAL_INTERVAL
+            log.info(
+                "CYCLE_RESTART_ALIGNMENT cycle=%s old_target_utc=%s new_start_utc=%s signal_utc=%s target_utc=%s",
+                cycle_id,
+                time.strftime("%H:%M:%S",time.gmtime(old_target)),
+                time.strftime("%H:%M:%S",time.gmtime(cycle_start)),
+                time.strftime("%H:%M:%S",time.gmtime(signal_at)),
+                time.strftime("%H:%M:%S",time.gmtime(target))
+            )
         until_start=cycle_start-time.time()
         if until_start>0:
             log.info(
