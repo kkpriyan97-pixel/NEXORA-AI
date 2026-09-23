@@ -2110,7 +2110,7 @@ def build_multi_timeframe_context(pair,candles,reference_ts=None,expected=None):
     }
 
 def multi_timeframe_confirmation(context,expected):
-    """Final local confirmation gate using all available requested frames."""
+    """Final closed-candle confirmation gate for a 1-minute signal."""
     expected=str(expected or "").upper()
     frames=dict((context or {}).get("frames") or {})
     if expected not in {"UP","DOWN"}:
@@ -2121,37 +2121,37 @@ def multi_timeframe_confirmation(context,expected):
     one=frames.get("1m",{})
     two=frames.get("2m",{}).get("candle_confirmation") or {}
 
-    # Candle-first DEMO 1-minute gate: closed 30s, 1m and 2m trends must agree.
-    # The 2m candle trend is primary; indicators are not hard gates.
     if thirty.get("status")!="READY":
         return False,{"reason":"30s_confirmation_insufficient","bars":thirty.get("bars",0)}
     if thirty.get("direction")!=expected:
         return False,{"reason":"30s_candle_trend_conflict","direction":thirty.get("direction","NEUTRAL")}
+
     if one.get("status")!="READY":
         return False,{"reason":"1m_confirmation_insufficient","bars":one.get("bars",0)}
     if one.get("direction")!=expected:
         return False,{"reason":"1m_candle_trend_conflict","direction":one.get("direction","NEUTRAL")}
+
     if two.get("status")!="READY":
         return False,{"reason":"2m_confirmation_insufficient"}
-    if two.get("direction")!=expected:
-        return False,{"reason":"2m_candle_trend_conflict","direction":two.get("direction","NEUTRAL"),"same_direction_candles":two.get("same_direction_candles",0)}
+    if two.get("candle_direction")!=expected:
+        return False,{"reason":"2m_candle_trend_conflict",
+                       "direction":two.get("candle_direction","NEUTRAL"),
+                       "same_direction_candles":two.get("same_direction_candles",0)}
     if not two.get("trend_ok") or not two.get("candle_ok"):
-        return False,{"reason":"2m_candle_strength_insufficient","trend_ok":two.get("trend_ok",False),"candle_ok":two.get("candle_ok",False),"body_ratio":two.get("body_ratio",0)}
-    if not two.get("volume_ok"):
-        return False,{"reason":"2m_volume_confirmation_failed","volume_ratio":two.get("volume_ratio",0),"volume_available":two.get("volume_available",False)}
-    # 5s remains diagnostic microstructure; it is not promoted to a hard veto.
-    # This preserves the earlier structural fix where a brief 5s reversal cannot
-    # erase a confirmed 1m/2m setup.
-    # 5s is microstructure context, not a hard veto on the Candice Brain.
-    # A brief 5s reversal must not erase an otherwise valid 1m..15m setup.
-    five_status=five.get("status")
-    five_direction=five.get("direction","NEUTRAL")
-    if five_status!="READY":
-        five_warning="5s_insufficient"
-    elif five_direction not in {expected,"NEUTRAL"}:
-        five_warning="5s_opposite"
-    else:
-        five_warning="none"
+        return False,{"reason":"2m_candle_strength_insufficient",
+                       "trend_ok":two.get("trend_ok",False),
+                       "candle_ok":two.get("candle_ok",False),
+                       "body_ratio":two.get("body_ratio",0)}
+
+    volume_available=bool(two.get("volume_available"))
+    volume_ok=bool(two.get("volume_ok"))
+    # Volume is used when the broker provides it. When it is unavailable, do not
+    # pretend it was confirmed; require a stronger candle/structure substitute.
+    if volume_available and not volume_ok:
+        return False,{"reason":"2m_volume_confirmation_failed",
+                       "volume_ratio":two.get("volume_ratio",0),
+                       "volume_available":True}
+    volume_mode="CONFIRMED" if volume_available else "UNAVAILABLE_STRICT_SUBSTITUTE"
 
     short=[frames.get(f"{m}m",{}) for m in (1,2,3,4)]
     short=[x for x in short if x.get("status")=="READY"]
@@ -2159,8 +2159,19 @@ def multi_timeframe_confirmation(context,expected):
         return False,{"reason":"short_frames_insufficient","ready":len(short)}
     short_align=sum(1 for x in short if x.get("direction")==expected)
     short_opp=sum(1 for x in short if x.get("direction") not in {expected,"NEUTRAL"})
-    if short_align<3 or short_opp>1:
-        return False,{"reason":"short_frame_conflict","align":short_align,"opp":short_opp}
+    required_align=3
+    if not volume_available:
+        # Missing volume requires all four short frames to agree and a stronger
+        # 2m candle, reducing false continuation signals without blocking the
+        # scheduler itself.
+        required_align=4
+        if float(two.get("body_ratio") or 0.0)<0.65:
+            return False,{"reason":"volume_unavailable_requires_stronger_body",
+                           "body_ratio":two.get("body_ratio",0)}
+    if short_align<required_align or short_opp>1:
+        return False,{"reason":"short_frame_conflict",
+                       "align":short_align,"opp":short_opp,
+                       "required_align":required_align}
 
     all_ready=[]
     for m in range(5,16):
@@ -2169,29 +2180,42 @@ def multi_timeframe_confirmation(context,expected):
             all_ready.append(x)
     directional=[x for x in all_ready if x.get("direction") in {"UP","DOWN"}]
     align=sum(1 for x in directional if x.get("direction")==expected)
-    opp=sum(1 for x in directional if x.get("direction") not in {expected,"NEUTRAL"})
-    agreement=(align/max(1,len(directional)))
-    if directional and (agreement<0.60 or opp>2):
-        return False,{"reason":"higher_frame_conflict","align":align,"opp":opp,"directional":len(directional),"agreement":round(agreement,3)}
+    opp=sum(1 for x in directional if x.get("direction")!=expected)
+    agreement=align/max(1,len(directional))
+    required_higher=0.70 if not volume_available else 0.60
+    if directional and (agreement<required_higher or opp>2):
+        return False,{"reason":"higher_frame_conflict",
+                       "align":align,"opp":opp,"directional":len(directional),
+                       "agreement":round(agreement,3),
+                       "required_agreement":required_higher}
+
+    five_status=five.get("status")
+    five_direction=five.get("direction","NEUTRAL")
+    five_warning="5s_insufficient" if five_status!="READY" else (
+        "5s_opposite" if five_direction not in {expected,"NEUTRAL"} else "none"
+    )
 
     return True,{
         "reason":"multi_timeframe_confirmed",
         "30s":thirty.get("direction","NEUTRAL"),
         "30s_bars":thirty.get("bars",0),
         "1m":one.get("direction","NEUTRAL"),
-        "2m":two.get("direction","NEUTRAL"),
+        "2m":two.get("candle_direction","NEUTRAL"),
         "2m_same_direction_candles":two.get("same_direction_candles",0),
         "2m_candle_direction":two.get("candle_direction","NEUTRAL"),
         "2m_body_ratio":two.get("body_ratio",0),
         "2m_volume_ratio":two.get("volume_ratio",0),
-        "2m_volume_available":two.get("volume_available",False),
+        "2m_volume_available":volume_available,
+        "volume_mode":volume_mode,
         "5s":five_direction,
         "5s_warning":five_warning,
         "short_align":short_align,
         "short_opp":short_opp,
+        "short_required_align":required_align,
         "higher_align":align,
         "higher_opp":opp,
         "higher_directional":len(directional),
+        "higher_required_agreement":required_higher,
         "agreement":round(agreement,3),
     }
 
@@ -2302,15 +2326,20 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
             item=base.copy()
             item["strategy"]=str(variant.get("strategy") or base.get("strategy") or "").upper()
             item["direction"]=str(variant.get("direction") or base.get("direction") or "").upper()
-            item["confidence"]=int(variant.get("score") or base.get("confidence") or 0)
-            item["market_quality"]=float(variant.get("score") or base.get("market_quality") or 0)
+            raw_variant_score=int(variant.get("score") or base.get("confidence") or 0)
+            # Do not let strategy expansion discard the Brain's learned outcome
+            # calibration. Each variant is adapted independently from its own raw
+            # technical score before final ranking.
+            item["confidence"]=raw_variant_score
+            item["market_quality"]=float(raw_variant_score)
             item["strategy_variant"]=True
             item["strategy_variant_count"]=len(variants)
-            item["strategy_variant_score"]=item["confidence"]
+            item["strategy_variant_score"]=raw_variant_score
             item["strategy_margin"]=0.0
             item["self_strategy_version"]=str(
                 variant.get("self_strategy_version") or base.get("self_strategy_version") or ""
             )
+            item=BRAIN.adaptive_candidate(item)
             candidate_inputs.append(item)
             variant_count+=1
     log.info(
@@ -3481,64 +3510,85 @@ async def cycle_loop():
                                 closed_1m=_closed_candles(
                                     STATE["candles"].get(p,[]),final_reference
                                 )
-                                bars2=_aggregate_closed_minutes(closed_1m,2,final_reference)
-                                two=_candle_confirmation_2m(bars2,expected)
-                                one=_latest_closed_candle_direction(closed_1m)
                                 mtf=build_multi_timeframe_context(
                                     p,closed_1m,final_reference,expected
                                 )
-                                frames=mtf.get("frames") or {}
-                                higher=[
-                                    frames.get(f"{m}m",{})
-                                    for m in range(5,16)
-                                ]
-                                higher=[
-                                    x for x in higher
-                                    if x.get("status")=="READY"
-                                    and x.get("direction") in {"UP","DOWN"}
-                                ]
-                                higher_align=sum(
-                                    1 for x in higher if x.get("direction")==expected
+                                confirmed,confirmation=multi_timeframe_confirmation(
+                                    mtf,expected
                                 )
-                                higher_opp=sum(
-                                    1 for x in higher if x.get("direction")!=expected
+                                diag=dict(confirmation or {})
+                                diag["2m_bars"]=len(
+                                    _aggregate_closed_minutes(closed_1m,2,final_reference)
                                 )
-                                higher_agreement=higher_align/max(1,len(higher))
-                                diag={
-                                    "2m":two.get("candle_direction",two.get("direction","NEUTRAL")),
-                                    "2m_bars":len(bars2),
-                                    "2m_volume_ok":two.get("volume_ok",False),
-                                    "2m_volume_ratio":two.get("volume_ratio",0),
-                                    "2m_body_ratio":two.get("body_ratio",0),
-                                    "1m":one.get("direction","NEUTRAL"),
-                                    "higher_align":higher_align,
-                                    "higher_opp":higher_opp,
-                                    "higher_agreement":round(higher_agreement,3),
-                                }
-                                reason=None
-                                if two.get("status")!="READY":
-                                    reason="2m_candle_not_ready"
-                                elif two.get("candle_direction")!=expected:
-                                    reason="2m_candle_trend_conflict"
-                                elif not two.get("candle_ok"):
-                                    reason="2m_body_strength_failed"
-                                elif two.get("volume_available") and not two.get("volume_ok"):
-                                    reason="2m_volume_confirmation_failed"
-                                elif one.get("status")!="READY":
-                                    reason="1m_candle_not_ready"
-                                elif one.get("direction")!=expected:
-                                    reason="1m_candle_trend_conflict"
-                                elif len(higher)<1:
-                                    reason="higher_timeframe_not_ready"
-                                elif higher_agreement<0.60 or higher_opp>2:
-                                    reason="higher_timeframe_conflict"
+                                reason=None if confirmed else str(
+                                    confirmation.get("reason") or "multi_timeframe_rejected"
+                                )
+
                                 strategy_name=str(_item.get("strategy") or "").upper()
                                 trend_name=str(_item.get("trend_15m") or "").upper()
-                                if (
-                                    strategy_name in {"MOMENTUM","BREAKOUT"}
-                                    and trend_name=="SIDEWAYS"
-                                ):
-                                    reason="sideways_regime_for_continuation_strategy"
+                                direction_name=str(_item.get("direction") or "").upper()
+                                body_ratio=float(_item.get("body_ratio") or 0.0)
+                                momentum_norm=float(_item.get("momentum_norm") or 0.0)
+                                efficiency=float(_item.get("efficiency") or 0.0)
+                                structure_quality=float(_item.get("structure_quality") or 0.0)
+                                aligned_recent=int(
+                                    (_item.get("evidence") or {}).get(
+                                        "recent_aligned_candles",0
+                                    ) or 0
+                                )
+                                breakout_distance=float(
+                                    _item.get(
+                                        "breakout_distance_up"
+                                        if direction_name=="UP"
+                                        else "breakout_distance_down"
+                                    ) or 0.0
+                                )
+                                pattern_name=str(_item.get("pattern") or "").upper()
+                                rejection_ok=(
+                                    (direction_name=="UP" and pattern_name=="BULLISH_REJECTION")
+                                    or (direction_name=="DOWN" and pattern_name=="BEARISH_REJECTION")
+                                )
+                                near_level=(
+                                    (direction_name=="UP" and float(_item.get("price") or 0.0) <=
+                                     float(_item.get("support") or 0.0)+float(_item.get("atr") or 0.0)*0.35)
+                                    or
+                                    (direction_name=="DOWN" and float(_item.get("price") or 0.0) >=
+                                     float(_item.get("resistance") or 0.0)-float(_item.get("atr") or 0.0)*0.35)
+                                )
+
+                                # Final 1-minute breakout quality: reject marginal
+                                # breaks even when higher timeframes happen to agree.
+                                if not reason and strategy_name=="BREAKOUT":
+                                    if (
+                                        breakout_distance<0.20
+                                        or body_ratio<0.60
+                                        or momentum_norm<0.35
+                                        or efficiency<0.40
+                                        or trend_name not in {"UP","DOWN"}
+                                    ):
+                                        reason="breakout_quality_insufficient"
+                                        diag["breakout_distance"]=round(breakout_distance,4)
+                                        diag["body_ratio"]=round(body_ratio,3)
+                                        diag["momentum_norm"]=round(momentum_norm,3)
+                                        diag["efficiency"]=round(efficiency,3)
+
+                                # Final Price Action quality: a lone bullish/bearish
+                                # candle away from support/resistance is not enough for
+                                # a one-minute binary direction.
+                                if not reason and strategy_name=="PRICE_ACTION":
+                                    if (
+                                        structure_quality<0.50
+                                        or aligned_recent<2
+                                        or momentum_norm<0.10
+                                        or not (near_level or rejection_ok)
+                                    ):
+                                        reason="price_action_context_insufficient"
+                                        diag["structure_quality"]=round(structure_quality,3)
+                                        diag["aligned_recent"]=aligned_recent
+                                        diag["momentum_norm"]=round(momentum_norm,3)
+                                        diag["near_level"]=bool(near_level)
+                                        diag["rejection"]=bool(rejection_ok)
+
                                 _item["final_delivery_confirmed"]=not bool(reason)
                                 _item["final_delivery_confirmation_reason"]=reason or "confirmed"
                                 _item["final_delivery_diagnostic"]=diag
@@ -3842,8 +3892,9 @@ async def cycle_loop():
         boundary_pool=_boundary_unique
         log.info(
             "FINAL_BOUNDARY_POOL cycle=%s candidates=%d prepared_confirmed=%d total_deep=%d unique_assets=%d fresh_now=%d",
-            cycle_id,len(boundary_pool),len(boundary_pool),len(final_candidates),
-            len(boundary_pool),
+            cycle_id,len(boundary_pool),
+            sum(1 for x in boundary_pool if bool(x.get("final_delivery_confirmed"))),
+            len(final_candidates),len(boundary_pool),
             sum(1 for x in boundary_pool if has_fresh_live_price(
                 x.get("pair"),now_boundary,LIVE_TICK_MAX_AGE
             ))
