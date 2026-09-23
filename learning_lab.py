@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import logging
 import os
 import time
 from collections import defaultdict
@@ -20,6 +21,8 @@ from strategy_knowledge import (
     record_practice_result, record_strategy_council, save_error,
     promote_campaign_strategy,
 )
+
+log = logging.getLogger("candice.learning_lab")
 
 DB_URL = os.getenv("DATABASE_URL","").strip()
 UAE = ZoneInfo("Asia/Dubai")
