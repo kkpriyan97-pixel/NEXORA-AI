@@ -4893,119 +4893,104 @@ async def build_live_analysis_payload():
 
 
 async def account_setups_page():
-    """Mobile live view of all account-linked Candice setups.
-
-    This is read-only. It never places a broker order and never changes the
-    authenticated Demo account. The page mirrors the live analysis state that
-    Candice already receives from the broker.
-    """
+    """Read-only mobile view of the authenticated account's current Candice setups."""
     payload=json.dumps(await build_live_analysis_payload(),ensure_ascii=False,default=str)
-    html=f"""<!doctype html>
-<html><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+    html="""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>CANDICE • Account Setups</title>
 <style>
-*{{box-sizing:border-box}}body{{margin:0;background:#070b0f;color:#eef4f6;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif}}
-.wrap{{max-width:760px;margin:auto;padding:14px}}.top{{position:sticky;top:0;background:#070b0fee;backdrop-filter:blur(12px);z-index:5;padding:4px 0 12px}}
-h1{{font-size:22px;margin:8px 0 4px}}.sub{{opacity:.72;font-size:12px}}
-.grid{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:12px 0}}.card,.asset,.setup,.audit{{background:#10161c;border:1px solid #26323b;border-radius:14px;padding:12px}}
-.kpi{{font-size:20px;font-weight:800}}.label{{font-size:11px;opacity:.65;text-transform:uppercase}}
-.badge{{display:inline-block;padding:5px 8px;border-radius:999px;background:#17221a;color:#7dffad;font-size:11px;font-weight:700}}
-.setup{{margin:8px 0}}.row{{display:flex;justify-content:space-between;gap:10px;align-items:center}}
-.assetname{{font-size:16px;font-weight:800}}.dirup{{color:#45ef8a;font-weight:800}}.dirdown{{color:#ff6d7a;font-weight:800}}
-.meta{{font-size:11px;opacity:.75;line-height:1.5}}details{{margin-top:8px}}summary{{cursor:pointer;font-weight:700;font-size:12px}}
-pre{{white-space:pre-wrap;word-break:break-word;font-size:11px;opacity:.85}}.empty{{opacity:.65;text-align:center;padding:30px 10px}}
-.dot{{width:8px;height:8px;border-radius:50%;display:inline-block;background:#45ef8a;margin-right:6px}}
-.small{{font-size:11px;opacity:.75}}button{{background:#151e25;color:#fff;border:1px solid #2a3944;border-radius:10px;padding:8px 10px}}
-</style></head>
-<body><div class="wrap">
+*{box-sizing:border-box}
+body{margin:0;background:#070b0f;color:#eef4f6;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.wrap{max-width:760px;margin:auto;padding:14px}
+.top{position:sticky;top:0;background:#070b0fee;backdrop-filter:blur(12px);z-index:5;padding:4px 0 12px}
+h1{font-size:22px;margin:8px 0 4px}.sub{opacity:.72;font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin:12px 0}
+.card,.setup{background:#10161c;border:1px solid #26323b;border-radius:14px;padding:12px}
+.kpi{font-size:20px;font-weight:800}.label{font-size:11px;opacity:.65;text-transform:uppercase}
+.setup{margin:8px 0}.row{display:flex;justify-content:space-between;gap:10px;align-items:center}
+.assetname{font-size:16px;font-weight:800}.up{color:#45ef8a;font-weight:800}.down{color:#ff6d7a;font-weight:800}
+.meta{font-size:11px;opacity:.75;line-height:1.55}details{margin-top:8px}
+summary{cursor:pointer;font-weight:700;font-size:12px}
+pre{white-space:pre-wrap;word-break:break-word;font-size:11px;opacity:.85}
+.empty{opacity:.65;text-align:center;padding:30px 10px}.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:#45ef8a;margin-right:6px}
+.small{font-size:11px;opacity:.75}
+</style>
+</head>
+<body>
+<div class="wrap">
 <div class="top">
-  <h1>🧠 CANDICE • MY DEMO ACCOUNT SETUPS</h1>
-  <div class="sub"><span class="dot"></span>Authenticated live data • READ ONLY • Flex trade is manual</div>
-  <div id="status" class="small">Loading…</div>
+<h1>🧠 CANDICE • MY DEMO ACCOUNT SETUPS</h1>
+<div class="sub"><span class="dot"></span>Authenticated live data • READ ONLY • Flex trade is manual</div>
+<div id="status" class="small">Loading…</div>
 </div>
 <div class="grid">
-  <div class="card"><div class="label">Account Assets</div><div id="assets" class="kpi">—</div></div>
-  <div class="card"><div class="label">Detected Setups</div><div id="setupsN" class="kpi">—</div></div>
-  <div class="card"><div class="label">Strategies Checked</div><div class="kpi">8</div></div>
-  <div class="card"><div class="label">Signal Expiry</div><div class="kpi">1 MIN</div></div>
+<div class="card"><div class="label">Account Assets</div><div id="assets" class="kpi">—</div></div>
+<div class="card"><div class="label">Detected Setups</div><div id="setupsN" class="kpi">—</div></div>
+<div class="card"><div class="label">Strategies Checked</div><div class="kpi">8</div></div>
+<div class="card"><div class="label">Signal Expiry</div><div class="kpi">1 MIN</div></div>
 </div>
 <div class="card" id="cycle">5-scan cycle: loading…</div>
 <div id="list"></div>
 </div>
 <script>
-const initial={payload};
-const fmt=(x)=>Number.isFinite(Number(x))?Number(x).toFixed(4):'—';
-function ind(i) {{
- if(!i) return '';
- return '<pre>'+
-  'EMA 9/21: '+fmt(i.ema_fast)+' / '+fmt(i.ema_slow)+'\\n'+
-  'RSI 14: '+fmt(i.rsi)+'\\n'+
-  'Stoch 14/3/3: '+fmt(i.stochastic_k)+' / '+fmt(i.stochastic_d)+' / '+(i.stochastic_cross||'—')+'\\n'+
-  'Bollinger 30/2.2: '+(i.bollinger_signal||'—')+' • '+(i.bollinger_position||'—')+'\\n'+
-  'Donchian 30: '+(i.donchian_state||'—')+' • '+(i.donchian_expansion?'EXPANDING':'FLAT')+'\\n'+
-  'ATR 14: '+fmt(i.atr)+'\\n'+
-  'Momentum: '+fmt(i.momentum_norm_atr)+' ATR\\n'+
-  'Volatility: '+fmt(i.volatility_ratio)+'\\n'+
-  'Support / Resistance: '+fmt(i.support)+' / '+fmt(i.resistance)+
- '</pre>';
-}}
-function render(d) {{
- document.getElementById('assets').textContent=d.asset_count??0;
- const rows=d.assets||[];
+const initial=__INITIAL_PAYLOAD__;
+function nfmt(x){ const n=Number(x); return Number.isFinite(n)?n.toFixed(4):"—"; }
+function indicators(i){
+ if(!i) return "";
+ return "<pre>"+
+ "EMA 9/21: "+nfmt(i.ema_fast)+" / "+nfmt(i.ema_slow)+"\n"+
+ "RSI 14: "+nfmt(i.rsi)+"\n"+
+ "Stoch 14/3/3: "+nfmt(i.stochastic_k)+" / "+nfmt(i.stochastic_d)+" / "+(i.stochastic_cross||"—")+"\n"+
+ "Bollinger 30/2.2: "+(i.bollinger_signal||"—")+" • "+(i.bollinger_position||"—")+"\n"+
+ "Donchian 30: "+(i.donchian_state||"—")+" • "+(i.donchian_expansion?"EXPANDING":"FLAT")+"\n"+
+ "ATR 14: "+nfmt(i.atr)+"\n"+
+ "Momentum: "+nfmt(i.momentum_norm_atr)+" ATR\n"+
+ "Volatility: "+nfmt(i.volatility_ratio)+"\n"+
+ "Support / Resistance: "+nfmt(i.support)+" / "+nfmt(i.resistance)+
+ "</pre>";
+}
+function render(d){
+ document.getElementById("assets").textContent=d.asset_count||0;
  const setups=[];
- for(const a of rows) {{
-   const variants=a.strategy_candidates||[];
-   if(variants.length) for(const v of variants) {{
-     setups.push({{
-       asset:a, strategy:v.strategy||a.strategy||'—',
-       direction:v.direction||a.direction||'—',
-       confidence:v.score??a.confidence??0
-     }});
-   }} else if(a.strategy) setups.push({{
-       asset:a,strategy:a.strategy,direction:a.direction||'—',confidence:a.confidence||0
-   }});
- }}
- setups.sort((a,b)=>Number(b.confidence)-Number(a.confidence));
- document.getElementById('setupsN').textContent=setups.length;
+ for(const a of (d.assets||[])){
+   const vs=a.strategy_candidates||[];
+   if(vs.length){
+     for(const v of vs) setups.push({asset:a,strategy:v.strategy||a.strategy||"—",direction:v.direction||a.direction||"—",confidence:v.score??a.confidence??0});
+   } else if(a.strategy) setups.push({asset:a,strategy:a.strategy,direction:a.direction||"—",confidence:a.confidence||0});
+ }
+ setups.sort((x,y)=>Number(y.confidence)-Number(x.confidence));
+ document.getElementById("setupsN").textContent=setups.length;
  const c=d.five_scan_cycle||{};
- document.getElementById('cycle').innerHTML=
-   '<b>🔎 5-SCAN CYCLE</b><br>'+
-   'Cycle: '+(c.cycle_id??'—')+' • Pass: '+(c.completed_pass??0)+'/5<br>'+
-   'Protocol: <b>FLEX MANUAL</b> • Bot trade: <b>OFF</b>';
- document.getElementById('status').textContent=
-   'Updated '+new Date().toLocaleTimeString()+
-   ' • Live account feed '+(d.authenticated_account_feed?'OK':'NOT READY');
- const el=document.getElementById('list');
- if(!setups.length) {{ el.innerHTML='<div class="empty">Candice is scanning the account. No qualifying setup right now.</div>'; return; }}
- el.innerHTML=setups.map((x,n)=>{{
-   const a=x.asset, up=String(x.direction).toUpperCase()==='UP';
+ document.getElementById("cycle").innerHTML="<b>🔎 5-SCAN CYCLE</b><br>Cycle: "+(c.cycle_id??"—")+" • Pass: "+(c.completed_pass??0)+"/5<br>Protocol: <b>FLEX MANUAL</b> • Bot trade: <b>OFF</b>";
+ document.getElementById("status").textContent="Updated "+new Date().toLocaleTimeString()+" • Live account feed "+(d.authenticated_account_feed?"OK":"NOT READY");
+ const el=document.getElementById("list");
+ if(!setups.length){el.innerHTML='<div class="empty">Candice is scanning the account. No qualifying setup right now.</div>';return;}
+ el.innerHTML=setups.map((x,idx)=>{
+   const a=x.asset, up=String(x.direction).toUpperCase()==="UP";
    const audits=a.strategy_audit||[];
-   const auditText=audits.map(z=>
-      (z.strategy||'—')+' → UP '+z.up_score+' / DOWN '+z.down_score+
-      (z.up_qualified||z.down_qualified?' • QUALIFIED':'')
-   ).join('\\n');
+   const auditText=audits.map(z=>(z.strategy||"—")+" → UP "+z.up_score+" / DOWN "+z.down_score+(z.up_qualified||z.down_qualified?" • QUALIFIED":"")).join("\n");
    return '<div class="setup">'+
-    '<div class="row"><div><div class="assetname">'+(n+1)+'. '+(a.display_name||a.pair)+'</div>'+
-    '<div class="meta">'+a.pair+' • Live '+fmt(a.live_price)+' • '+(a.live_price_source||'—')+'</div></div>'+
-    '<div class="'+(up?'dirup':'dirdown')+'">'+(up?'⬆️ UP':'⬇️ DOWN')+'</div></div>'+
-    '<div class="meta">🎯 '+x.strategy+' • Confidence '+x.confidence+'% • 15m '+(a.trend_15m||'—')+' • 1m '+(a.structure_1m||'—')+'</div>'+
-    '<details><summary>📊 Full live indicators</summary>'+ind(a.indicators)+'</details>'+
-    '<details><summary>🧠 All 8 strategy checks</summary><pre>'+auditText+'</pre></details>'+
+    '<div class="row"><div><div class="assetname">'+(idx+1)+'. '+(a.display_name||a.pair)+'</div><div class="meta">'+a.pair+' • Live '+nfmt(a.live_price)+' • '+(a.live_price_source||"—")+'</div></div>'+
+    '<div class="'+(up?"up":"down")+'">'+(up?"⬆️ UP":"⬇️ DOWN")+'</div></div>'+
+    '<div class="meta">🎯 '+x.strategy+' • Confidence '+x.confidence+'% • 15m '+(a.trend_15m||"—")+' • 1m '+(a.structure_1m||"—")+'</div>'+
+    '<details><summary>📊 Full live indicators</summary>'+indicators(a.indicators)+'</details>'+
+    '<details><summary>🧠 All 8 strategy checks</summary><pre>'+auditText+"</pre></details>"+
    '</div>';
- }}).join('');
-}}
+ }).join("");
+}
 render(initial);
-async function tick() {{
- try {{
-   const r=await fetch('/live-analysis?ts='+Date.now(),{{cache:'no-store'}});
+async function tick(){
+ try{
+   const r=await fetch("/live-analysis?ts="+Date.now(),{cache:"no-store"});
    if(r.ok) render(await r.json());
- }} catch(e) {{
-   document.getElementById('status').textContent='Live refresh waiting…';
- }}
-}}
+ }catch(e){document.getElementById("status").textContent="Live refresh waiting…";}
+}
 setInterval(tick,2000);
-</script></body></html>"""
+</script>
+</body></html>""".replace("__INITIAL_PAYLOAD__", payload)
     return html.encode("utf-8")
 
 async def health(reader,writer):
