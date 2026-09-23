@@ -581,6 +581,27 @@ def analyze_asset(asset, candles, price=None, forced_strategy=None, learning_cam
     if not active_strategies:
         return None
 
+    # Full strategy audit: Candice evaluates every known strategy family and both
+    # directions with the SAME live indicator snapshot. Only live-eligible families
+    # may enter the delivery candidate pool; non-eligible families remain visible in
+    # the audit so the user can see exactly what Candice checked without changing the
+    # live promotion/qualification rules.
+    strategy_audit = []
+    for strategy_name in strategies:
+        strategy_active = strategy_name in active_strategies
+        up_score = score("UP", strategy_name)
+        down_score = score("DOWN", strategy_name)
+        strategy_audit.append({
+            "strategy": strategy_name,
+            "active_for_live": bool(strategy_active),
+            "up_score": round(up_score, 2),
+            "down_score": round(down_score, 2),
+            "up_direction_compatible": not (trend == "DOWN"),
+            "down_direction_compatible": not (trend == "UP"),
+            "up_qualified": bool(strategy_active and up_score >= 82 and trend != "DOWN"),
+            "down_qualified": bool(strategy_active and down_score >= 82 and trend != "UP"),
+        })
+
     candidates = []
     for strategy in active_strategies:
         for direction in ("UP", "DOWN"):
@@ -674,6 +695,9 @@ def analyze_asset(asset, candles, price=None, forced_strategy=None, learning_cam
         "confidence": confidence,
         "strategy": best["strategy"],
         "expiry_minutes": best["expiry_minutes"],
+        "strategy_audit": strategy_audit,
+        "strategy_audit_count": len(strategy_audit),
+        "indicator_audit_scope": "ALL_8_STRATEGIES_SAME_LIVE_INDICATORS",
         "strategy_candidates": [
             {
                 "strategy": str(v.get("strategy") or ""),
@@ -732,6 +756,7 @@ def analyze_asset(asset, candles, price=None, forced_strategy=None, learning_cam
             "volatility_ratio": round(volatility_ratio, 3),
             "support": round(support, 8),
             "resistance": round(resistance, 8),
+            "strategy_audit_count": len(strategy_audit),
             "bollinger_period": 30,
             "bollinger_stddev": 2.2,
             "bollinger_signal": bb["signal"],
