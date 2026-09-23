@@ -10,6 +10,7 @@ import copy
 import json
 import os
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -35,6 +36,9 @@ MIN_CONFIDENCE = max(75, min(96, int(os.getenv("LEARNING_PRACTICE_MIN_CONFIDENCE
 REQUEST_TTL = 45.0
 RESULT_WATCH_POLL_SECONDS = max(2, min(15, int(os.getenv("LEARNING_RESULT_WATCH_POLL_SECONDS","5"))))
 RESULT_WATCH_EXTRA_SECONDS = max(60, min(300, int(os.getenv("LEARNING_RESULT_WATCH_EXTRA_SECONDS","180"))))
+RESULT_WATCH_RESTART_GRACE_SECONDS = max(30, min(300, int(os.getenv("LEARNING_RESULT_WATCH_RESTART_GRACE_SECONDS","180"))))
+RESULT_DIRECT_FETCH_CACHE_SECONDS = max(2, min(20, int(os.getenv("LEARNING_RESULT_DIRECT_FETCH_CACHE_SECONDS","10"))))
+RESULT_DIRECT_FETCH_MAX_CONCURRENCY = max(1, min(8, int(os.getenv("LEARNING_RESULT_DIRECT_FETCH_MAX_CONCURRENCY","4"))))
 LEARNING_TRADE_RETENTION_HOURS = 48
 COUNCIL_REFRESH_SECONDS = max(300, min(1800, int(os.getenv("LEARNING_COUNCIL_REFRESH_SECONDS","900"))))
 COUNCIL_CALL_TIMEOUT_SECONDS = max(5, min(15, int(os.getenv("LEARNING_COUNCIL_CALL_TIMEOUT_SECONDS","8"))))
@@ -42,6 +46,9 @@ _council_cache = {"session_id":"", "created_at":0.0, "data":{}}
 _pending = {}
 _open = {}
 _finalized = set()
+_direct_candle_cache = {}
+_direct_candle_locks = defaultdict(asyncio.Lock)
+_direct_candle_semaphore = asyncio.Semaphore(RESULT_DIRECT_FETCH_MAX_CONCURRENCY)
 _cfg = {}
 _daily = {"day": None, "placed": 0, "win": 0, "loss": 0, "tie": 0, "blocked": 0, "strategies": set()}
 _last_report_day = None
