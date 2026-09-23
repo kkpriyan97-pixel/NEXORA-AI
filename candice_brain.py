@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from math import isfinite
 from self_strategy import discover as discover_self_strategy
+from strategy_knowledge import strategy_live_eligible
 
 EXPIRIES = (1, 2, 3, 4, 5, 10, 15)
 
@@ -542,7 +543,14 @@ def analyze_asset(asset, candles, price=None, forced_strategy=None):
     forced = str(forced_strategy or "").upper().strip()
     if forced and forced not in strategies:
         return None
-    active_strategies = (forced,) if forced else strategies
+    # Only a completed 100-trade DEMO failure at the explicit 85% gate can
+    # remove a strategy family from live Brain routing. Everything else stays.
+    if forced:
+        active_strategies = (forced,) if strategy_live_eligible(forced) else ()
+    else:
+        active_strategies = tuple(s for s in strategies if strategy_live_eligible(s))
+    if not active_strategies:
+        return None
 
     candidates = []
     for strategy in active_strategies:
