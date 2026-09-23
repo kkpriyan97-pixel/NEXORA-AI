@@ -52,6 +52,7 @@ _direct_candle_semaphore = asyncio.Semaphore(RESULT_DIRECT_FETCH_MAX_CONCURRENCY
 _cfg = {}
 _daily = {"day": None, "placed": 0, "win": 0, "loss": 0, "tie": 0, "blocked": 0, "strategies": set()}
 _last_report_day = None
+REPORT_CLAIM_STALE_SECONDS = 300.0
 _practice_cursor = 0
 CAMPAIGN_MIN_TRADES = 100
 CAMPAIGN_MIN_WIN_RATE = 0.85
@@ -286,6 +287,113 @@ async def ensure_campaign_table():
     except Exception as e:
         print(f"LEARNING_CAMPAIGN_TABLE_FAILED type={type(e).__name__} message={str(e)[:140]}")
         return False
+
+async def ensure_report_state_table():
+    """Create durable once-per-session report state so restarts/deploy overlap cannot resend old reports."""
+    if not DB_URL:
+        return False
+    try:
+        import psycopg
+        def init():
+            with psycopg.connect(DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS nexora_learning_report_state (
+                            session_day DATE PRIMARY KEY,
+                            status TEXT NOT NULL DEFAULT 'CLAIMED',
+                            claimed_at TIMESTAMPTZ,
+                            sent_at TIMESTAMPTZ
+                        )
+                    """)
+                db.commit()
+        await asyncio.to_thread(init)
+        return True
+    except Exception as e:
+        print(f"LEARNING_REPORT_STATE_INIT_FAILED type={type(e).__name__} message={str(e)[:140]}")
+        return False
+
+
+async def _claim_daily_report(day):
+    """Atomically claim one session report across all overlapping/restarted instances.
+    
+    Returns True when this process owns the send, False when it was already sent or
+    another live instance owns the claim, and None when the DB is unavailable.
+    """
+    if not DB_URL:
+        return None
+    try:
+        import psycopg
+        session_day=str(day)
+        def claim():
+            with psycopg.connect(DB_URL,connect_timeout=5) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO nexora_learning_report_state(
+                            session_day,status,claimed_at,sent_at
+                        )
+                        VALUES(%s,'CLAIMED',NOW(),NULL)
+                        ON CONFLICT(session_day) DO UPDATE SET
+                            status='CLAIMED',
+                            claimed_at=NOW(),
+                            sent_at=NULL
+                        WHERE nexora_learning_report_state.status <> 'SENT'
+                          AND (
+                              nexora_learning_report_state.claimed_at IS NULL
+                              OR nexora_learning_report_state.claimed_at
+                                 < NOW() - (%s * INTERVAL '1 second')
+                          )
+                        RETURNING session_day
+                    """,(session_day,REPORT_CLAIM_STALE_SECONDS))
+                    row=cur.fetchone()
+                db.commit()
+                return bool(row)
+        return await asyncio.to_thread(claim)
+    except Exception as e:
+        print(f"LEARNING_REPORT_STATE_CLAIM_FAILED day={day} type={type(e).__name__} message={str(e)[:140]}")
+        return None
+
+
+async def _mark_daily_report_sent(day):
+    if not DB_URL:
+        return False
+    try:
+        import psycopg
+        def mark():
+            with psycopg.connect(DB_URL,connect_timeout=5) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        UPDATE nexora_learning_report_state
+                        SET status='SENT',sent_at=NOW(),claimed_at=NULL
+                        WHERE session_day=%s
+                    """,(str(day),))
+                db.commit()
+        await asyncio.to_thread(mark)
+        return True
+    except Exception as e:
+        print(f"LEARNING_REPORT_STATE_MARK_FAILED day={day} type={type(e).__name__} message={str(e)[:140]}")
+        return False
+
+
+async def _release_daily_report_claim(day):
+    if not DB_URL:
+        return False
+    try:
+        import psycopg
+        def release():
+            with psycopg.connect(DB_URL,connect_timeout=5) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        UPDATE nexora_learning_report_state
+                        SET status='CLAIMED',claimed_at=NULL
+                        WHERE session_day=%s AND status='CLAIMED'
+                    """,(str(day),))
+                db.commit()
+        await asyncio.to_thread(release)
+        return True
+    except Exception as e:
+        print(f"LEARNING_REPORT_STATE_RELEASE_FAILED day={day} type={type(e).__name__} message={str(e)[:140]}")
+        return False
+
 
 async def _save_campaign():
     if not DB_URL or not CAMPAIGN_STATE.get("session_id") or not CAMPAIGN_STATE.get("strategy"):
@@ -1446,6 +1554,12 @@ async def _validated_strategy_ids():
         return []
 
 async def _send_daily_report(day):
+    claim=await _claim_daily_report(day)
+    if claim is False:
+        print(f"LEARNING_REPORT_SUPPRESSED day={day} reason=already_sent_or_claimed")
+        return True
+    if claim is None:
+        print(f"LEARNING_REPORT_STATE_UNAVAILABLE day={day} fallback=best_effort_send")
     persisted=await _load_session_report(day)
     if not persisted or (
         int(persisted.get("placed",0))==0 and int(persisted.get("win",0))==0 and
@@ -1475,7 +1589,112 @@ async def _send_daily_report(day):
         "🔴 06:00 → Learning Auto-Trade OFF\n"
         "🔐 ADMIN ONLY",
         chat_id=_cfg.get("admin_id") or None
+    )    if sent is False:
+        await _release_daily_report_claim(day)
+        print(f"LEARNING_REPORT_SEND_FAILED day={day} claim_released=True")
+        return False
+    marked=await _mark_daily_report_sent(day)
+    if not marked:
+        print(f"LEARNING_REPORT_STATE_MARK_SKIPPED day={day} reason=db_unavailable_after_send")
+    else:
+        print(f"LEARNING_REPORT_SENT_ONCE day={day}")
+    return True
+async def run_forever():
+    if os.getenv("LEARNING_PRACTICE_ENABLED","true").strip().lower()=="false":
+        return
+    # Startup recovery must never block the learning scheduler. The Render/Postgres
+    # connection can temporarily stall during a broker reconnect; DB state is recovery
+    # metadata only, so bound both operations and continue into the live learning loop.
+    try:
+        await asyncio.wait_for(ensure_learning_trade_state_table(), timeout=5.0)
+    except asyncio.TimeoutError:
+        print("LEARNING_TRADE_STATE_INIT_TIMEOUT seconds=5 fallback=memory_only")
+    except Exception as e:
+        print(f"LEARNING_TRADE_STATE_INIT_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]} fallback=memory_only")
+    try:
+        await asyncio.wait_for(restore_open_trades(), timeout=5.0)
+    except asyncio.TimeoutError:
+        print("LEARNING_TRADE_RESTORE_TIMEOUT seconds=5 fallback=memory_only")
+    except Exception as e:
+        print(f"LEARNING_TRADE_RESTORE_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]} fallback=memory_only")
+    try:
+        await asyncio.wait_for(ensure_session_stats_table(),timeout=5.0)
+    except Exception as e:
+        print(f"LEARNING_SESSION_STATS_INIT_STARTUP_FAILED type={type(e).__name__} message={str(e)[:120]}")
+    try:
+        await asyncio.wait_for(ensure_campaign_table(),timeout=5.0)
+    except Exception as e:
+        print(f"LEARNING_CAMPAIGN_INIT_FAILED type={type(e).__name__} message={str(e)[:120]}")
+    print(
+        "LEARNING_PRACTICE_LOOP_STARTED schedule=DAILY window=18:00-06:00 "
+        "timezone=Asia/Dubai demo_only=True ai_council=True "
+        "campaign=ONE_STRATEGY_AT_A_TIME target=100 min_win_rate=85% target=90%"
     )
+    last_heartbeat=0.0
+    last_scan=0.0
+    while True:
+        try:
+            now=_now_uae()
+            session_day=_learning_session_day(now)
+            day=session_day
+            if _daily["day"] != str(day):
+                _daily.update({"day":str(day),"placed":0,"win":0,"loss":0,"tie":0,"blocked":0,"strategies":set()})
+            global _last_report_day
+            window_end=_window_end(day)
+            if now >= window_end and _last_report_day != day:
+                report_ok=await _send_daily_report(day)
+                if report_ok:
+                    _last_report_day = day
+            if practice_active(now):
+                if time.time()-last_heartbeat >= 60:
+                    last_heartbeat=time.time()
+                    print(
+                        f"LEARNING_HEARTBEAT day={day} active=True pending={len(_pending)} "
+                        f"open={len(_open)} placed={_daily['placed']} win={_daily['win']} "
+                        f"loss={_daily['loss']} tie={_daily['tie']} blocked={_daily['blocked']} "
+                        f"campaign_strategy={CAMPAIGN_STATE.get('strategy') or 'INIT'} "
+                        f"campaign_progress={CAMPAIGN_STATE.get('sampled',0)}/100"
+                    )
+                if CAMPAIGN_STATE.get("session_id")!=str(day) or not CAMPAIGN_STATE.get("strategy"):
+                    await _initialize_campaign(str(day))
+                if CAMPAIGN_STATE.get("status")=="ACTIVE" and time.time()-last_scan >= LOOP_SECONDS:
+                    last_scan=time.time()
+                    strategy=str(CAMPAIGN_STATE.get("strategy") or "").upper()
+                    print(
+                        f"LEARNING_WINDOW_ACTIVE day={day} start=18:00 end=06:00 "
+                        f"timezone=Asia/Dubai ai_council=True fixed_strategy={strategy} "
+                        f"target=100 min_win_rate=85%"
+                    )
+                    try:
+                        candidates=await asyncio.wait_for(
+                            _build_candidate(strategy,return_all=True),
+                            timeout=LEARNING_SCAN_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        candidates=[]
+                        print(f"LEARNING_SCAN_TIMEOUT seconds={LEARNING_SCAN_TIMEOUT_SECONDS} fallback=next_scan")
+                    except Exception as e:
+                        candidates=[]
+                        print(f"LEARNING_SCAN_FAILED type={type(e).__name__} message={str(e)[:160]} fallback=next_scan")
+                    await _send_campaign_batch(candidates)
+            # While the 2h window is active, allow another candidate only after the
+            # previous order has completed. This prevents overlapping demo orders.
+            for tid,rec in list(_open.items()):
+                if not rec.get("_watch_started"):
+                    rec["_watch_started"]=True
+                    asyncio.create_task(_fallback_watch(rec))
+            # Expire stale execution requests.
+            for token,rec in list(_pending.items()):
+                if time.time()>float(rec.get("expires_at",0)):
+                    _pending.pop(token,None)
+                    await save_error(rec.get("strategy","UNKNOWN"),"DEMO_REQUEST_TIMEOUT",rec.get("technique") or {})
+            await asyncio.sleep(min(LOOP_SECONDS,30))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"LEARNING_PRACTICE_ERROR type={type(exc).__name__} message={str(exc)[:160]}")
+            await asyncio.sleep(LOOP_SECONDS)
+
 
 async def run_forever():
     if os.getenv("LEARNING_PRACTICE_ENABLED","true").strip().lower()=="false":
