@@ -890,6 +890,7 @@ async def _send_request(candidate, notify=True):
         _pending.pop(token, None)
         if not ok:
             _daily["blocked"] += 1
+            await _session_stat_update(_learning_session_day(_now_uae()),blocked=1)
             print(f"LEARNING_ORDER_BLOCKED pair={rec.get('pair')} strategy={rec.get('strategy')} reason={reason}")
             await _cfg["send_message"](
                 f"❌ DEMO AUTO-TRADE BLOCKED\n\nReason → {reason}",
@@ -900,6 +901,7 @@ async def _send_request(candidate, notify=True):
 
         _daily["placed"] += 1
         _daily["strategies"].add(str(rec.get("strategy") or "UNKNOWN"))
+        await _session_stat_update(rec.get("session_day") or _learning_session_day(_now_uae()),placed=1,strategy=rec.get("strategy",""))
         print(
             f"LEARNING_ORDER_ACCEPTED pair={placed['pair']} direction={placed['direction']} "
             f"strategy={placed['strategy']} trade_id={placed['trade_id']} "
@@ -1082,6 +1084,7 @@ async def _place_demo(rec, actor_id):
     now=time.time()
     rec=dict(rec)
     rec.update({
+        "session_day":str(_learning_session_day(_now_uae())),
         "status":"OPEN","trade_id":str(trade_id),"accepted_by":int(actor_id),
         "placed_at":now,"entry_ts":now,"entry_price":entry_price,
     })
