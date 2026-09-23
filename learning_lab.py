@@ -1408,12 +1408,17 @@ async def _place_demo(rec, actor_id):
     _open[str(trade_id)]=rec
     await persist_open_trade(rec)
     print(
-        f"LEARNING_ORDER_CONFIRMED pair={pair} mode=FIXED_TIME trade_id={trade_id} entry={entry_price} "
+        f"LEARNING_ORDER_CONFIRMED pair={pair} mode=FLEX trade_id={trade_id} entry={entry_price} "
         f"account_id={account_id} group=demo"
     )
+    rec["_watch_started"]=True
     asyncio.create_task(
         _verify_order_visibility(str(trade_id),int(account_id),pair),
         name=f"learning_visibility_{trade_id}",
+    )
+    asyncio.create_task(
+        _fallback_watch(rec),
+        name=f"learning_flex_result_{trade_id}",
     )
     return True,"PLACED",rec
 
