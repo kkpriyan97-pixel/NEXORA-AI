@@ -92,8 +92,13 @@ UAE_TZ=ZoneInfo("Asia/Dubai")
 
 SIGNAL_SESSION_START_HOUR=6
 SIGNAL_SESSION_END_HOUR=18
+# DEMO/testing override only. When enabled, the normal daytime signal scheduler
+# may run outside the UAE 06:00–18:00 window. It does NOT enable broker auto-trading.
+FORCE_SIGNAL_MODE=os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}
 
 def signal_session_active(ts=None):
+    if FORCE_SIGNAL_MODE:
+        return True
     now=datetime.fromtimestamp(float(ts if ts is not None else time.time()),tz=UAE_TZ)
     return SIGNAL_SESSION_START_HOUR <= now.hour < SIGNAL_SESSION_END_HOUR
 
@@ -3251,8 +3256,10 @@ async def cycle_loop():
     while True:
         now=time.time()
 
-        # Normal signal delivery is restricted to the UAE 06:00–18:00 session.
-        # Overnight hours belong exclusively to the DEMO learning/council lane.
+        # Normal signal delivery is restricted to the UAE 06:00–18:00 session
+        # unless the explicit DEMO/testing override is enabled.
+        # Overnight hours still keep automatic learning orders isolated from the
+        # Telegram signal path; the override only permits signal-cycle testing.
         if not signal_session_active(now):
             if target is not None:
                 log.info(
@@ -3262,8 +3269,8 @@ async def cycle_loop():
             target=None
             next_start=next_signal_session_start_epoch(now)
             log.info(
-                "SIGNAL_SESSION_WAIT next_start_utc=%s",
-                time.strftime("%H:%M:%S",time.gmtime(next_start))
+                "SIGNAL_SESSION_WAIT next_start_utc=%s force_signal_mode=%s",
+                time.strftime("%H:%M:%S",time.gmtime(next_start)),FORCE_SIGNAL_MODE
             )
             await asyncio.sleep(min(max(1.0,next_start-time.time()),60.0))
             continue
