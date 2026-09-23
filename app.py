@@ -3401,12 +3401,18 @@ async def cycle_loop():
                                 reverse=True
                             )
                             prep_items=[]
-                            _prep_seen_pairs=set()
+                            _prep_seen_identities=set()
                             for _item in _prep_ranked:
-                                _p=str(_item.get("pair") or "")
-                                if not _p or _p in _prep_seen_pairs:
+                                _candidate_identity=(
+                                    str(_item.get("pair") or ""),
+                                    str(_item.get("entry_candle_ts")),
+                                    str(_item.get("direction") or "").upper(),
+                                    str(_item.get("strategy") or "").upper(),
+                                    str(_item.get("self_strategy_version") or ""),
+                                )
+                                if not _candidate_identity[0] or _candidate_identity in _prep_seen_identities:
                                     continue
-                                _prep_seen_pairs.add(_p)
+                                _prep_seen_identities.add(_candidate_identity)
                                 prep_items.append(_item)
                                 if len(prep_items)>=ACCOUNT_TICK_PIN_SLOTS:
                                     break
@@ -3454,12 +3460,18 @@ async def cycle_loop():
                             # The complete deep-qualified candidate_pool remains intact
                             # for fallback/learning; this only bounds expensive prep.
                             final_items=[]
-                            _final_seen_pairs=set()
+                            _final_seen_identities=set()
                             for _item in _final_ranked:
-                                _p=str(_item.get("pair") or "")
-                                if not _p or _p in _final_seen_pairs:
+                                _candidate_identity=(
+                                    str(_item.get("pair") or ""),
+                                    str(_item.get("entry_candle_ts")),
+                                    str(_item.get("direction") or "").upper(),
+                                    str(_item.get("strategy") or "").upper(),
+                                    str(_item.get("self_strategy_version") or ""),
+                                )
+                                if not _candidate_identity[0] or _candidate_identity in _final_seen_identities:
                                     continue
-                                _final_seen_pairs.add(_p)
+                                _final_seen_identities.add(_candidate_identity)
                                 final_items.append(_item)
                                 if len(final_items)>=ACCOUNT_TICK_FINAL_PROBE_LIMIT:
                                     break
@@ -3796,15 +3808,18 @@ async def cycle_loop():
         # become conservative/stale while the live candidate remains valid;
         # filtering it here was able to suppress an entire cycle before the
         # authoritative gate had a chance to try the fallback candidate.
-        boundary_pool=[
-            x for x in final_candidates
-            if bool(x.get("final_delivery_confirmed"))
-        ]
+        # Keep every deep-qualified technique in the boundary fallback pool.
+        # Delivery itself remains authoritative: send_cycle_signal() rechecks the
+        # final confirmation, fresh authenticated tick, confidence and deadline.
+        # This prevents one late gate failure from deleting otherwise valid
+        # techniques that were already researched/qualified in the same cycle.
+        boundary_pool=list(final_candidates)
         _boundary_unique=[]
         _boundary_seen=set()
         for _x in sorted(
             boundary_pool,
             key=lambda x:(
+                1 if bool(x.get("final_delivery_confirmed")) else 0,
                 1 if has_fresh_live_price(x.get("pair"),now_boundary,LIVE_TICK_MAX_AGE) else 0,
                 int(x.get("confidence") or 0),
                 float(x.get("final_delivery_precheck") or -900.0),
@@ -3813,10 +3828,16 @@ async def cycle_loop():
             ),
             reverse=True
         ):
-            _p=str(_x.get("pair") or "")
-            if not _p or _p in _boundary_seen:
+            _candidate_identity=(
+                str(_x.get("pair") or ""),
+                str(_x.get("entry_candle_ts")),
+                str(_x.get("direction") or "").upper(),
+                str(_x.get("strategy") or "").upper(),
+                str(_x.get("self_strategy_version") or ""),
+            )
+            if not _candidate_identity[0] or _candidate_identity in _boundary_seen:
                 continue
-            _boundary_seen.add(_p)
+            _boundary_seen.add(_candidate_identity)
             _boundary_unique.append(_x)
         boundary_pool=_boundary_unique
         log.info(
