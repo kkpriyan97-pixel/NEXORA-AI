@@ -1,4 +1,4 @@
-git+https://github.com/kkpriyan97-pixel/OlympTradeAPI.git@944ae954a5e8be0a4b2610098ee54c12fafa844f
+git+https://github.com/kkpriyan97-pixel/OlympTradeAPI.git@2fb5b308adfaab73f2441ac2d80cc6cfd99a8ee0
 httpx>=0.28,<1
 python-telegram-bot>=22.8,<23
 
