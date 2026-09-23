@@ -4264,16 +4264,22 @@ async def health(reader,writer):
             log.info("PING_REQUEST status=200")
             return
         if path.startswith("/health"):
+            # Public health is intentionally non-sensitive. Keep account identifiers,
+            # feed internals and network/public-IP metadata out of the endpoint; the
+            # keepalive only needs a liveness/read-only status signal.
+            lp_status=learning_practice_status()
+            m1_status=m1_learning_status()
             body_out=json.dumps({
                 "service":"CANDICE-AI","status":STATE["status"],
                 "signal_read_only":True,
-                "learning_demo_execution":bool(learning_practice_status().get("enabled")),
+                "learning_demo_execution":bool(lp_status.get("enabled")),
+                "learning_active":bool(lp_status.get("active")),
                 "asset_count":len(STATE["assets"]),"qualified":len(STATE["analyses"]),
                 "cycle":STATE["cycle"],"active_results":len(BRAIN.active_signals),
-                "account_id":STATE.get("account_id"),"account_group":STATE.get("account_group"),
-                "feed_source":STATE.get("feed_source"),"network":STATE.get("network",{}),
-                "m1_world_learning":m1_learning_status(),
-                "learning_practice":learning_practice_status(),
+                "account_bound":bool(STATE.get("account_id")),
+                "demo_account":str(STATE.get("account_group") or "").lower()=="demo",
+                "authenticated_feed":str(STATE.get("feed_source") or "").startswith("authenticated_websocket:"),
+                "m1_world_learning_enabled":bool(m1_status.get("enabled")),
                 "live_external_ai":False
             }).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "+str(len(body_out)).encode()+b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
