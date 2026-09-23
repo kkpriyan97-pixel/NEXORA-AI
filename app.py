@@ -4361,13 +4361,17 @@ async def handle_telegram_command(msg):
         if ADMIN_LIFETIME_CODE and code and secrets.compare_digest(code,ADMIN_LIFETIME_CODE):
             snap=BRAIN.start_telegram_evaluation()
             await save_persistent_learning()
+            log.info(
+                "ADMIN_LIFETIME_VERIFIED evaluation_started=True telegram_eval_signals=%s",
+                snap.get("signals",0)
+            )
             await telegram(
-                "✅ LIFETIME ADMIN ACCESS VERIFIED.\\n\\n"
-                "📊 100-SIGNAL TELEGRAM EVALUATION STARTED\\n"
-                "🔢 Count starts from the next successfully delivered Telegram signal.\\n"
-                "🧹 All previous signals are excluded.\\n"
-                "📈 10-signal updates are OFF.\\n"
-                "🤖 DEMO learning, Brain, research and result watching continue normally.\\n\\n"
+                "✅ LIFETIME ADMIN ACCESS VERIFIED.\n\n"
+                "📊 100-SIGNAL TELEGRAM EVALUATION STARTED\n"
+                "🔢 Count starts from the next successfully delivered Telegram signal.\n"
+                "🧹 All previous signals are excluded.\n"
+                "📈 10-signal updates are OFF.\n"
+                "🤖 DEMO learning, Brain, research and result watching continue normally.\n\n"
                 "🎯 Progress → 0/100",
                 chat_id=chat_id
             )
