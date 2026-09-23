@@ -2828,14 +2828,42 @@ async def result_watch(key):
     review_id=f"{rec['cycle_id']}:{rec['pair']}:{rec['entry_ts']}"
     await enqueue_ai_review(review_id,rec)
     await save_persistent_learning()
-    batch_summary=BRAIN.consume_batch_summary()
-    if batch_summary:
-        rp=batch_summary.get("research_progress") or {}
-        log.info("LEARNING_10_SIGNAL_SUMMARY batch=%s wins=%s losses=%s ties=%s cooldown_seconds=%s account_id=%s research_day=%s/%s research_topic=%s",
-                 batch_summary.get("batch_no"),batch_summary.get("wins"),batch_summary.get("losses"),
-                 batch_summary.get("ties"),batch_summary.get("cooldown_seconds"),batch_summary.get("account_id"),
-                 rp.get("day",1),rp.get("target_days",15),rp.get("topic",""))
-        await send_learning_summary(batch_summary)
+    # 10-signal learning summaries are intentionally silent. Internal learning
+    # continues unchanged; only the post-admin 100-Telegram-signal evaluation
+    # produces a user-facing report.
+    BRAIN.consume_batch_summary()
+    telegram_eval_report=rec.get("telegram_eval_report")
+    if telegram_eval_report:
+        log.info(
+            "TELEGRAM_100_SIGNAL_EVALUATION_COMPLETE signals=%s wins=%s losses=%s ties=%s "
+            "continue_wins=%s continue_losses=%s win_rate=%s%%",
+            telegram_eval_report.get("signals"),telegram_eval_report.get("wins"),
+            telegram_eval_report.get("losses"),telegram_eval_report.get("ties"),
+            telegram_eval_report.get("continue_wins"),telegram_eval_report.get("continue_losses"),
+            telegram_eval_report.get("win_rate")
+        )
+        await telegram(
+            "🏁 TELEGRAM SIGNAL EVALUATION — 100 COMPLETE\\n\\n"
+            f"🔢 Signals → {telegram_eval_report.get('signals',0)}/100\\n"
+            f"✅ WIN → {telegram_eval_report.get('wins',0)}\\n"
+            f"❌ LOSS → {telegram_eval_report.get('losses',0)}\\n"
+            f"➡️ Continue WIN → {telegram_eval_report.get('continue_wins',0)}\\n"
+            f"➡️ Continue LOSS → {telegram_eval_report.get('continue_losses',0)}\\n"
+            f"🟡 TIE → {telegram_eval_report.get('ties',0)}\\n"
+            f"🎯 Win Rate → {telegram_eval_report.get('win_rate',0):.2f}%\\n\\n"
+            "📌 Count source → successfully delivered Telegram signals only\\n"
+            "🚫 DEMO trades / old signals / 10-signal updates are excluded.",
+            chat_id=STATE.get("telegram_chat_id") or None
+        )
+    else:
+        snap=BRAIN.telegram_eval_snapshot()
+        if snap.get("active") and rec.get("telegram_eval_counted"):
+            log.info(
+                "TELEGRAM_EVALUATION_PROGRESS signals=%s/100 wins=%s losses=%s ties=%s "
+                "continue_wins=%s continue_losses=%s win_rate=%s%%",
+                snap.get("signals"),snap.get("wins"),snap.get("losses"),snap.get("ties"),
+                snap.get("continue_wins"),snap.get("continue_losses"),snap.get("win_rate")
+            )
     label=rec["display_name"]
     direction_icon="⬆️" if rec["direction"]=="UP" else "⬇️"
     result_icon={"WIN":"✅","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
@@ -4331,7 +4359,18 @@ async def handle_telegram_command(msg):
         if str(uid)!=ADMIN_TELEGRAM_ID:
             await audit_access("UNAUTHORIZED_ADMIN_VERIFY_ATTEMPT",int(uid)); await telegram("❌ Admin only.",chat_id=chat_id); return
         if ADMIN_LIFETIME_CODE and code and secrets.compare_digest(code,ADMIN_LIFETIME_CODE):
-            await telegram("✅ LIFETIME ADMIN ACCESS VERIFIED.\\n\\nThis code does not expire. Keep it private like a master password.",chat_id=chat_id)
+            snap=BRAIN.start_telegram_evaluation()
+            await save_persistent_learning()
+            await telegram(
+                "✅ LIFETIME ADMIN ACCESS VERIFIED.\\n\\n"
+                "📊 100-SIGNAL TELEGRAM EVALUATION STARTED\\n"
+                "🔢 Count starts from the next successfully delivered Telegram signal.\\n"
+                "🧹 All previous signals are excluded.\\n"
+                "📈 10-signal updates are OFF.\\n"
+                "🤖 DEMO learning, Brain, research and result watching continue normally.\\n\\n"
+                "🎯 Progress → 0/100",
+                chat_id=chat_id
+            )
         else:
             await telegram("❌ Invalid lifetime admin code.",chat_id=chat_id)
         return
