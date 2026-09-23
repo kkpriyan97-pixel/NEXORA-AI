@@ -1264,24 +1264,40 @@ async def on_asset_update(message):
 
 
 async def scan_account_live_feed():
-    """Audit account-wide live coverage from the authenticated event-1 tick stream only."""
+    """Audit account-wide authenticated live quote coverage.
+
+    Event-1 ticks are preferred when available. The broker current-candle quote
+    stream is the authenticated fallback and is not confused with external data.
+    """
     assets=list(STATE["assets"])
     if not CLIENT or not assets:
         return
     now=time.time()
     total=len(assets)
-    fresh=sum(1 for a in assets if has_fresh_live_price(a["pair"],now,LIVE_TICK_MAX_AGE))
+    event1_fresh=sum(
+        1 for a in assets
+        if str(STATE["price_source"].get(a["pair"],""))=="tick"
+        and has_fresh_live_price(a["pair"],now,LIVE_TICK_MAX_AGE)
+    )
+    broker_fresh=sum(
+        1 for a in assets
+        if str(STATE["price_source"].get(a["pair"],""))=="authenticated_broker_live_candle"
+        and has_fresh_live_price(a["pair"],now,QUOTE_SNAPSHOT_MAX_AGE)
+    )
+    any_fresh=sum(
+        1 for a in assets
+        if has_fresh_live_price(a["pair"],now,max(LIVE_TICK_MAX_AGE,QUOTE_SNAPSHOT_MAX_AGE))
+    )
     recent_missing_pairs=[
         a["pair"] for a in assets
         if not has_fresh_live_price(a["pair"],now,LIVE_TICK_COVERAGE_MAX_AGE)
     ]
     recent=total-len(recent_missing_pairs)
     log.info(
-        "ACCOUNT_LIVE_FEED_SCAN source=authenticated_websocket:event_1 assets=%d fresh_tick=%d recent_tick=%d recent_missing=%d",
-        total,fresh,recent,len(recent_missing_pairs)
+        "ACCOUNT_LIVE_FEED_SCAN source=authenticated_session assets=%d "
+        "event1_fresh=%d broker_live_fresh=%d any_fresh=%d recent_any=%d recent_missing=%d",
+        total,event1_fresh,broker_fresh,any_fresh,recent,len(recent_missing_pairs)
     )
-    # Keep production logs compact; the aggregate coverage count above is
-    # sufficient for the 1-minute account-feed health audit.
 
 
 async def refresh_broker_live_quote(pair):
