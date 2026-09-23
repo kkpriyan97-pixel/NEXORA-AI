@@ -4743,6 +4743,67 @@ async def handle_telegram_command(msg):
 
 
 
+
+def format_live_indicator_check(indicators, price_source="authenticated_broker_live_candle"):
+    d=dict(indicators or {})
+    ef=float(d.get("ema_fast") or 0.0)
+    es=float(d.get("ema_slow") or 0.0)
+    rv=float(d.get("rsi") or 0.0)
+    sk=float(d.get("stochastic_k") or 0.0)
+    sd=float(d.get("stochastic_d") or 0.0)
+    sc=str(d.get("stochastic_cross") or "NEUTRAL")
+    bs=str(d.get("bollinger_signal") or "UNKNOWN")
+    bp=str(d.get("bollinger_position") or "UNKNOWN")
+    ds=str(d.get("donchian_state") or "UNKNOWN")
+    de="EXPANDING" if bool(d.get("donchian_expansion")) else "FLAT"
+    av=float(d.get("atr") or 0.0)
+    mn=float(d.get("momentum_norm_atr") or 0.0)
+    vr=float(d.get("volatility_ratio") or 0.0)
+    return (
+        "🔎 <b>LIVE INDICATOR CHECK</b>\n"
+        f"📡 Feed → {price_source}\n"
+        "🕯️ Data → closed M1 + completed 15M blocks\n"
+        f"📊 EMA 9/21 → {ef:.8f} / {es:.8f}\n"
+        f"📉 RSI 14 → {rv:.2f}\n"
+        f"📈 Stochastic 14/3/3 → K {sk:.2f} / D {sd:.2f} / {sc}\n"
+        f"〰️ Bollinger 30/2.2 → {bs} • {bp}\n"
+        f"📏 Donchian 30 → {ds} • {de}\n"
+        f"🌡️ ATR 14 → {av:.8f}\n"
+        f"⚡ Momentum → {mn:.3f} ATR\n"
+        f"🌊 Volatility → {vr:.3f}\n"
+    )
+
+async def build_live_analysis_payload():
+    rows=[]
+    for asset in list(STATE.get("assets") or []):
+        pair=str(asset.get("pair") or "")
+        an=STATE.get("analyses",{}).get(pair) or {}
+        pr=STATE.get("prices",{}).get(pair)
+        rows.append({
+            "pair":pair,
+            "display_name":str(asset.get("display_name") or asset.get("title") or pair),
+            "live_price":pr[0] if pr else an.get("price"),
+            "live_price_source":STATE.get("price_source",{}).get(pair,"none"),
+            "strategy":an.get("strategy"),
+            "direction":an.get("direction"),
+            "confidence":an.get("confidence"),
+            "trend_15m":an.get("trend_15m"),
+            "structure_1m":an.get("structure_1m"),
+            "pattern":an.get("pattern"),
+            "indicators":dict(an.get("indicators") or {}),
+        })
+    return {
+        "service":"CANDICE-AI",
+        "mode":"LIVE_SIGNAL",
+        "signal_read_only":True,
+        "demo_auto_trade":False,
+        "authenticated_account_feed":str(STATE.get("feed_source") or "").startswith("authenticated_websocket:"),
+        "asset_count":len(rows),
+        "qualified_count":len(STATE.get("analyses") or {}),
+        "updated_utc":datetime.now(timezone.utc).isoformat(),
+        "assets":rows,
+    }
+
 async def health(reader,writer):
     try:
         # Read HTTP headers first. reader.read() waits for client EOF, which can
@@ -4773,6 +4834,12 @@ async def health(reader,writer):
             await writer.drain()
             log.info("PING_REQUEST status=200")
             return
+        if path.startswith("/live-analysis"):
+            payload_out=json.dumps(await build_live_analysis_payload(),ensure_ascii=False,default=str).encode()
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: "+str(len(payload_out)).encode()+b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+payload_out)
+            await writer.drain()
+            return
+
         if path.startswith("/health"):
             # Public health is intentionally non-sensitive. Keep account identifiers,
             # feed internals and network/public-IP metadata out of the endpoint; the
