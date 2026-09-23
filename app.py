@@ -5018,7 +5018,7 @@ async def build_live_analysis_payload():
 
 
 async def account_setups_page():
-    """Read-only mobile view of the authenticated account's current Candice setups."""
+    """Read-only mobile view of the authenticated account's Candice setups and live orders."""
     payload=json.dumps(await build_live_analysis_payload(),ensure_ascii=False,default=str)
     html="""<!doctype html>
 <html>
@@ -5047,7 +5047,7 @@ pre{white-space:pre-wrap;word-break:break-word;font-size:11px;opacity:.85}
 <body>
 <div class="wrap">
 <div class="top">
-<h1>🧠 CANDICE • MY DEMO ACCOUNT SETUPS</h1>
+<h1>🧠 CANDICE • MY DEMO ACCOUNT</h1>
 <div class="sub"><span class="dot"></span>Authenticated live data • READ ONLY • Flex trade is manual</div>
 <div id="status" class="small">Loading…</div>
 </div>
@@ -5057,27 +5057,30 @@ pre{white-space:pre-wrap;word-break:break-word;font-size:11px;opacity:.85}
 <div class="card"><div class="label">Strategies Checked</div><div class="kpi">8</div></div>
 <div class="card"><div class="label">Signal Expiry</div><div class="kpi">1 MIN</div></div>
 </div>
-<div class="card" id="cycle">5-scan cycle: loading…</div>
-<div class="card" id="orders"><b>💼 LIVE ORDER / POSITION</b><div class="small">No manual order detected yet.</div></div>
+<div class="card" id="cycle">🔎 5-scan cycle: loading…</div>
+<div class="card" id="orders"><b>💼 LIVE ORDER / POSITION</b><div class="small">No broker-side manual position detected.</div></div>
 <div class="card" id="events"><b>🛰️ BROKER ORDER EVENTS</b><div class="small">Waiting for Event 21/22/26/31…</div></div>
 <div id="list"></div>
 </div>
 <script>
 const initial=__INITIAL_PAYLOAD__;
-function nfmt(x){ const n=Number(x); return Number.isFinite(n)?n.toFixed(4):"—"; }
-function indicators(i){
+function nfmt(x){
+ const n=Number(x);
+ return Number.isFinite(n)?n.toFixed(5):"—";
+}
+function indicatorText(i){
  if(!i) return "";
- return "<pre>"+
- "EMA 9/21: "+nfmt(i.ema_fast)+" / "+nfmt(i.ema_slow)+"\n"+
- "RSI 14: "+nfmt(i.rsi)+"\n"+
- "Stoch 14/3/3: "+nfmt(i.stochastic_k)+" / "+nfmt(i.stochastic_d)+" / "+(i.stochastic_cross||"—")+"\n"+
- "Bollinger 30/2.2: "+(i.bollinger_signal||"—")+" • "+(i.bollinger_position||"—")+"\n"+
- "Donchian 30: "+(i.donchian_state||"—")+" • "+(i.donchian_expansion?"EXPANDING":"FLAT")+"\n"+
- "ATR 14: "+nfmt(i.atr)+"\n"+
- "Momentum: "+nfmt(i.momentum_norm_atr)+" ATR\n"+
- "Volatility: "+nfmt(i.volatility_ratio)+"\n"+
- "Support / Resistance: "+nfmt(i.support)+" / "+nfmt(i.resistance)+
- "</pre>";
+ return [
+  "EMA 9/21: "+nfmt(i.ema_fast)+" / "+nfmt(i.ema_slow),
+  "RSI 14: "+nfmt(i.rsi),
+  "Stoch 14/3/3: "+nfmt(i.stochastic_k)+" / "+nfmt(i.stochastic_d)+" / "+(i.stochastic_cross||"—"),
+  "Bollinger 30/2.2: "+(i.bollinger_signal||"—")+" • "+(i.bollinger_position||"—"),
+  "Donchian 30: "+(i.donchian_state||"—")+" • "+(i.donchian_expansion?"EXPANDING":"FLAT"),
+  "ATR 14: "+nfmt(i.atr),
+  "Momentum: "+nfmt(i.momentum_norm_atr)+" ATR",
+  "Volatility: "+nfmt(i.volatility_ratio),
+  "Support / Resistance: "+nfmt(i.support)+" / "+nfmt(i.resistance)
+ ].join("\n");
 }
 function render(d){
  document.getElementById("assets").textContent=d.asset_count||0;
@@ -5085,40 +5088,82 @@ function render(d){
  for(const a of (d.assets||[])){
    const vs=a.strategy_candidates||[];
    if(vs.length){
-     for(const v of vs) setups.push({asset:a,strategy:v.strategy||a.strategy||"—",direction:v.direction||a.direction||"—",confidence:v.score??a.confidence??0});
-   } else if(a.strategy) setups.push({asset:a,strategy:a.strategy,direction:a.direction||"—",confidence:a.confidence||0});
+     for(const v of vs){
+       setups.push({asset:a,strategy:v.strategy||a.strategy||"—",direction:v.direction||a.direction||"—",confidence:v.score??a.confidence??0});
+     }
+   }else if(a.strategy){
+     setups.push({asset:a,strategy:a.strategy,direction:a.direction||"—",confidence:a.confidence||0});
+   }
  }
  setups.sort((x,y)=>Number(y.confidence)-Number(x.confidence));
  document.getElementById("setupsN").textContent=setups.length;
- const c=d.five_scan_cycle||{};
- document.getElementById("cycle").innerHTML="<b>🔎 5-SCAN CYCLE</b><br>Cycle: "+(c.cycle_id??"—")+" • Pass: "+(c.completed_pass??0)+"/5<br>Protocol: <b>FLEX MANUAL</b> • Bot trade: <b>OFF</b>";
- document.getElementById("status").textContent="Updated "+new Date().toLocaleTimeString()+" • Live account feed "+(d.authenticated_account_feed?"OK":"NOT READY");
 
- const liveOrders=(d.live_orders||[]).slice().sort((a,b)=>(Number(b._received_at||0)-Number(a._received_at||0)));
+ const c=d.five_scan_cycle||{};
+ document.getElementById("cycle").innerHTML=
+  "<b>🔎 5-SCAN CYCLE</b><br>"+
+  "Cycle: "+(c.cycle_id??"—")+" • Pass: "+(c.completed_pass??0)+"/5<br>"+
+  "Protocol: <b>FLEX MANUAL</b> • Bot order placement: <b>OFF</b>";
+
+ document.getElementById("status").textContent=
+  "Updated "+new Date().toLocaleTimeString()+
+  " • Authenticated account feed "+(d.authenticated_account_feed?"OK":"NOT READY")+
+  " • Order monitor "+((d.order_position_monitor||{}).connected?"CONNECTED":"WAITING");
+
+ const liveOrders=(d.live_orders||[]).slice().sort((a,b)=>Number(b._received_at||0)-Number(a._received_at||0));
  const oo=document.getElementById("orders");
  if(!liveOrders.length){
-   oo.innerHTML='<b>💼 LIVE ORDER / POSITION</b><div class="small">No broker-side open/manual position detected at this moment.</div>';
+   oo.innerHTML='<b>💼 LIVE ORDER / POSITION</b><div class="small">No broker-side manual position detected at this moment. Make the Flex trade manually in Demo and this panel will update.</div>';
  }else{
-   oo.innerHTML='<b>💼 LIVE ORDER / POSITION</b>'+liveOrders.slice(0,12).map(o=>{
+   oo.innerHTML='<b>💼 LIVE ORDER / POSITION</b>'+
+   liveOrders.slice(0,12).map(function(o){
      const dir=String(o.direction||o.dir||"").toUpperCase();
      const status=String(o.status||o.state||"OPEN").toUpperCase();
      const price=o.price??o.open_price??o.entry_price;
-     const exitp=o.expiry_price??o.close_price??o.exit_price;
+     const expiry=o.expiry_price??o.close_price??o.exit_price;
      const profit=o.profit??o.pnl;
-     return '<div class="setup" style="margin-top:8px">'+
-       '<div class="row"><div class="assetname">'+(o.pair||o.symbol||"Unknown")+'</div><b class="'+(dir==="UP"?"up":"down")+'">'+(dir||"—")+'</b></div>'+
-       '<div class="meta">ID '+(o._trade_id||o.id||"—")+' • '+status+' • '+(o.is_flex?"FLEX":"ORDER")+' • 
- if(!setups.length){el.innerHTML='<div class="empty">Candice is scanning the account. No qualifying setup right now.</div>';return;}
- el.innerHTML=setups.map((x,idx)=>{
-   const a=x.asset, up=String(x.direction).toUpperCase()==="UP";
+     return '<div class="setup">'+
+       '<div class="row"><div class="assetname">'+(o.pair||o.symbol||"Unknown")+'</div>'+
+       '<b class="'+(dir==="UP"?"up":"down")+'">'+(dir||"—")+'</b></div>'+
+       '<div class="meta">ID '+(o._trade_id||o.id||"—")+' • '+status+' • '+(o.is_flex?"FLEX":"ORDER")+' • $'+(o.amount??"—")+'</div>'+
+       '<div class="meta">Entry '+(price??"—")+' • Live/Expiry '+(expiry??"—")+' • P/L '+(profit??"—")+'</div>'+
+       '<div class="meta">Source '+(o._source||"broker")+'</div>'+
+     '</div>';
+   }).join("");
+ }
+
+ const ev=(d.live_order_events||[]).slice(-12).reverse();
+ const ee=document.getElementById("events");
+ if(!ev.length){
+   ee.innerHTML='<b>🛰️ BROKER ORDER EVENTS</b><div class="small">Waiting for Event 21 / 22 / 26 / 31…</div>';
+ }else{
+   ee.innerHTML='<b>🛰️ BROKER ORDER EVENTS</b><pre>'+
+     ev.map(function(e){
+       const t=new Date(Number(e.received_at||0)*1000).toLocaleTimeString();
+       return t+" • e:"+e.event+" • "+(e.pair||"—")+" • "+(e.direction||"—")+" • "+(e.status||"—")+" • P/L "+(e.profit??"—");
+     }).join("\n")+
+   "</pre>";
+ }
+
+ const el=document.getElementById("list");
+ if(!setups.length){
+   el.innerHTML='<div class="empty">Candice is scanning the account. No qualifying setup right now.</div>';
+   return;
+ }
+ el.innerHTML=setups.map(function(x,idx){
+   const a=x.asset;
+   const up=String(x.direction).toUpperCase()==="UP";
    const audits=a.strategy_audit||[];
-   const auditText=audits.map(z=>(z.strategy||"—")+" → UP "+z.up_score+" / DOWN "+z.down_score+(z.up_qualified||z.down_qualified?" • QUALIFIED":"")).join("\n");
+   const auditText=audits.map(function(z){
+     return (z.strategy||"—")+" → UP "+(z.up_score??"—")+" / DOWN "+(z.down_score??"—")+
+       ((z.up_qualified||z.down_qualified)?" • QUALIFIED":"");
+   }).join("\n");
    return '<div class="setup">'+
-    '<div class="row"><div><div class="assetname">'+(idx+1)+'. '+(a.display_name||a.pair)+'</div><div class="meta">'+a.pair+' • Live '+nfmt(a.live_price)+' • '+(a.live_price_source||"—")+'</div></div>'+
-    '<div class="'+(up?"up":"down")+'">'+(up?"⬆️ UP":"⬇️ DOWN")+'</div></div>'+
-    '<div class="meta">🎯 '+x.strategy+' • Confidence '+x.confidence+'% • 15m '+(a.trend_15m||"—")+' • 1m '+(a.structure_1m||"—")+'</div>'+
-    '<details><summary>📊 Full live indicators</summary>'+indicators(a.indicators)+'</details>'+
-    '<details><summary>🧠 All 8 strategy checks</summary><pre>'+auditText+"</pre></details>"+
+     '<div class="row"><div><div class="assetname">'+(idx+1)+'. '+(a.display_name||a.pair)+'</div>'+
+     '<div class="meta">'+a.pair+' • Live '+nfmt(a.live_price)+' • '+(a.live_price_source||"—")+'</div></div>'+
+     '<div class="'+(up?"up":"down")+'">'+(up?"⬆️ UP":"⬇️ DOWN")+'</div></div>'+
+     '<div class="meta">🎯 '+x.strategy+' • Confidence '+x.confidence+'% • 15m '+(a.trend_15m||"—")+' • 1m '+(a.structure_1m||"—")+'</div>'+
+     '<details><summary>📊 Full live indicators</summary><pre>'+indicatorText(a.indicators)+'</pre></details>'+
+     '<details><summary>🧠 All 8 strategy checks</summary><pre>'+auditText+'</pre></details>'+
    '</div>';
  }).join("");
 }
@@ -5127,12 +5172,15 @@ async function tick(){
  try{
    const r=await fetch("/live-analysis?ts="+Date.now(),{cache:"no-store"});
    if(r.ok) render(await r.json());
- }catch(e){document.getElementById("status").textContent="Live refresh waiting…";}
+ }catch(e){
+   document.getElementById("status").textContent="Live refresh waiting…";
+ }
 }
 setInterval(tick,2000);
 </script>
-</body></html>""".replace("__INITIAL_PAYLOAD__", payload)
-    return html.encode("utf-8")
+</body>
+</html>"""
+    return html.replace("__INITIAL_PAYLOAD__",payload).encode("utf-8")
 
 async def health(reader,writer):
     try:
