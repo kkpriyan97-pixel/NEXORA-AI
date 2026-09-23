@@ -1897,9 +1897,12 @@ async def refresh_candles(force=False):
 
     reference=time.time()
     analyzed_count=0
+    live_price_count=0
     for a in assets:
         p=a["pair"]
         price=STATE["prices"].get(p,(None,None))[0]
+        if price is not None:
+            live_price_count+=1
         closed=_closed_candles(STATE["candles"].get(p,[]),reference)
         if len(closed)<45:
             if a.get("signal_eligible",True):
@@ -1922,6 +1925,9 @@ async def refresh_candles(force=False):
         # represented separately by STATE["analyses"] for candidate ranking.
         analyzed_count+=1
         an=analyze_asset(a,closed,price)
+        if an:
+            an["live_price_source"]=STATE["price_source"].get(p,"none")
+            an["account_feed_source"]="authenticated_account:event_182+broker_current_candle"
         if an and a.get("signal_eligible",True):
             an["profitability"]=a["profitability"]
             STATE["analyses"][p]=an
@@ -1930,8 +1936,8 @@ async def refresh_candles(force=False):
 
     stale_count=sum(1 for a in assets if _candle_data_stale(a["pair"],reference))
     log.info(
-        "LIVE_ANALYSIS_REFRESH assets=%d analyzed=%d signal_eligible=%d fetched=%d stale=%d qualified=%d",
-        len(assets),analyzed_count,
+        "LIVE_ANALYSIS_REFRESH assets=%d analyzed=%d live_quote=%d signal_eligible=%d fetched=%d stale=%d qualified=%d",
+        len(assets),analyzed_count,live_price_count,
         sum(1 for a in assets if a.get("signal_eligible",True)),
         len(due),stale_count,len(STATE["analyses"])
     )
@@ -4322,6 +4328,7 @@ async def market_worker():
         # They exist only for automatic DEMO learning practice orders.
         client.register_callback(parameters.E_TRADE_ACCEPTED,on_learning_trade_update)
         client.register_callback(parameters.E_TRADE_CLOSED,on_learning_trade_update)
+        live_quote_task=None
         try:
             STATE["status"]="connecting"
             # Let the websocket/auth handshake settle before the first
@@ -4462,6 +4469,7 @@ async def market_worker():
             log.info("TICK_SUBSCRIPTION_MODE authenticated_event1 preferred; broker_current_candle_fallback=enabled; asset_inventory_source=user_pdf_104_assets; no asset-list API")
             await refresh_candles(force=True)
             live_quote_task=asyncio.create_task(account_live_quote_worker(),name="account_live_quote_worker")
+            log.info("ACCOUNT_BRAIN_FEED_READY source=authenticated_session asset_universe=account_event_182 live_quote=broker_current_candle tick_preferred=true")
             last_asset_sync=time.time()
             while True:
                 await asyncio.sleep(15)
@@ -4490,11 +4498,12 @@ async def market_worker():
             ) else 30
             await asyncio.sleep(retry_delay)
         finally:
-            try:
-                live_quote_task.cancel()
-                await live_quote_task
-            except (Exception, asyncio.CancelledError):
-                pass
+            if live_quote_task is not None:
+                try:
+                    live_quote_task.cancel()
+                    await live_quote_task
+                except (Exception, asyncio.CancelledError):
+                    pass
             try:await client.stop()
             except Exception:pass
             CLIENT=None
