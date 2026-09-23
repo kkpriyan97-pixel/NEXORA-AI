@@ -53,6 +53,7 @@ _cfg = {}
 _daily = {"day": None, "placed": 0, "win": 0, "loss": 0, "tie": 0, "blocked": 0, "strategies": set()}
 _last_report_day = None
 REPORT_CLAIM_STALE_SECONDS = 300.0
+REPORT_GRACE_SECONDS = 600.0
 _practice_cursor = 0
 CAMPAIGN_MIN_TRADES = 100
 CAMPAIGN_MIN_WIN_RATE = 0.85
@@ -1646,10 +1647,21 @@ async def run_forever():
                 _daily.update({"day":str(day),"placed":0,"win":0,"loss":0,"tie":0,"blocked":0,"strategies":set()})
             global _last_report_day
             window_end=_window_end(day)
-            if now >= window_end and _last_report_day != day:
+            # Daily learning reports belong to the 06:00 UAE session boundary.
+            # Never send a catch-up report hours later after a Render restart/deploy.
+            # A short 10-minute grace keeps normal delivery/recovery intact while
+            # preventing stale reports from appearing during daytime signal mode.
+            report_deadline=window_end+REPORT_GRACE_SECONDS
+            if window_end <= now < report_deadline and _last_report_day != day:
                 report_ok=await _send_daily_report(day)
                 if report_ok:
                     _last_report_day = day
+            elif now >= report_deadline and _last_report_day != day:
+                _last_report_day = day
+                print(
+                    f"LEARNING_REPORT_SUPPRESSED_LATE day={day} "
+                    f"reason=outside_report_grace_window"
+                )
             if practice_active(now):
                 if time.time()-last_heartbeat >= 60:
                     last_heartbeat=time.time()
