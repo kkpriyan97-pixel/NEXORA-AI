@@ -16,6 +16,7 @@ Targets:
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 import html
@@ -182,9 +183,19 @@ def clean_url(raw,base=None):
 def unwrap(href):
     p=urlparse(html.unescape(href or ""))
     q=parse_qs(p.query)
-    for k in ("uddg","url","target","q"):
+    for k in ("uddg","url","target","q","dest","destination","r"):
         v=q.get(k)
-        if v and urlparse(v[0]).scheme in {"http","https"}:return v[0]
+        if v and urlparse(v[0]).scheme in {"http","https"}:
+            return v[0]
+    for v in q.get("u",[]):
+        try:
+            raw=str(v)
+            pad="=" * ((4-len(raw)%4)%4)
+            decoded=base64.urlsafe_b64decode(raw+pad).decode("utf-8","ignore")
+            if urlparse(decoded).scheme in {"http","https"}:
+                return decoded
+        except Exception:
+            continue
     return href
 
 def domain(url):return (urlparse(url).hostname or "").lower().removeprefix("www.")
@@ -569,32 +580,61 @@ class M1WorldLab:
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(8,connect=3),headers={"User-Agent":USER_AGENT},follow_redirects=True) as h:
                     r=await h.get(ep)
-                if r.status_code>=400:return 0
-                p=Parser();p.feed(r.text);found=0
+                if r.status_code>=400:return {"found":0,"enqueued":0}
+                p=Parser();p.feed(r.text);found=0;enqueued=0;seen=set()
                 for href,label in p.links:
                     v=clean_url(unwrap(href))
-                    if not v or domain(v) in SEARCH_HOSTS:continue
-                    self.enqueue(v,lang,"search");found+=1
-                return found
+                    if not v or domain(v) in SEARCH_HOSTS or v in seen:
+                        continue
+                    seen.add(v);found+=1
+                    before=self.metrics["discovered"]
+                    self.enqueue(v,lang,"search")
+                    if self.metrics["discovered"]>before:
+                        enqueued+=1
+                for raw in re.findall(r"https?://[^\s\"'<>]+",r.text):
+                    v=clean_url(unwrap(html.unescape(raw)))
+                    if not v or domain(v) in SEARCH_HOSTS or v in seen:
+                        continue
+                    seen.add(v)
+                    before=self.metrics["discovered"]
+                    self.enqueue(v,lang,"search_fallback")
+                    if self.metrics["discovered"]>before:
+                        enqueued+=1
+                return {"found":found,"enqueued":enqueued}
             except Exception as exc:
                 self.metrics["errors"]+=1
                 log.debug("M1_SEARCH_ERROR query=%s error=%s",q,exc)
-                return 0
+                return {"found":0,"enqueued":0}
         results=await asyncio.gather(*(one(ep) for ep in endpoints),return_exceptions=False)
-        return sum(int(x or 0) for x in results)
+        return {
+            "found":sum(int(x.get("found",0)) for x in results),
+            "enqueued":sum(int(x.get("enqueued",0)) for x in results),
+        }
 
     async def discover(self):
         items=[]
         langs=list(LANGUAGE_QUERIES)
+        modifiers=(
+            "research paper","case study","backtest results","journal","pdf",
+            "forum discussion","implementation","statistical test","walk forward",
+            "microstructure study","next candle","one minute data"
+        )
         offset=(self.metrics["runs"]*7+self.day()*3)%len(langs)
         for i in range(DISCOVERY_QUERIES_PER_RUN):
             lang=langs[(offset+i)%len(langs)];qs=LANGUAGE_QUERIES[lang]
             q=qs[(self.metrics["runs"]+i+self.day())%len(qs)]
-            # Add one method/technology term to widen semantic coverage.
             method=list(METHODS)[(self.metrics["runs"]+i)%len(METHODS)]
-            items.append((f"{q} {method.replace('_',' ')}",lang))
+            modifier=modifiers[(self.metrics["runs"]+i+self.day())%len(modifiers)]
+            items.append((f"{q} {method.replace('_',' ')} {modifier}",lang))
             self.metrics["languages_queried"][lang]+=1
-        return await asyncio.gather(*(self.search(q,l) for q,l in items),return_exceptions=True)
+        results=await asyncio.gather(*(self.search(q,l) for q,l in items),return_exceptions=True)
+        found=sum(int(x.get("found",0)) for x in results if isinstance(x,dict))
+        enqueued=sum(int(x.get("enqueued",0)) for x in results if isinstance(x,dict))
+        log.info(
+            "M1_DISCOVERY_SUMMARY run=%s queries=%s found=%s newly_enqueued=%s domains=%s",
+            self.metrics["runs"],len(items),found,enqueued,self.db.count_domains()
+        )
+        return results
     def snapshot(self,pair,candles,timestamp=None):
         cs=[]
         for c in candles or []:
