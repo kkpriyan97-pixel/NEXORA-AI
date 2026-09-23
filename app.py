@@ -3851,8 +3851,12 @@ async def cycle_loop():
         ranked_pool=sorted(
             boundary_pool,
             key=lambda x:(
-                1 if bool(x.get("final_delivery_confirmed")) else 0,
+                # Fresh authenticated market data is more actionable at the exact
+                # boundary than a candidate whose cached quote has already gone stale.
+                # This is fallback ordering only; send_cycle_signal() keeps the
+                # authoritative freshness, confidence, deep-gate and delivery checks.
                 1 if has_fresh_live_price(x.get("pair"),now_boundary,LIVE_TICK_MAX_AGE) else 0,
+                1 if bool(x.get("final_delivery_confirmed")) else 0,
                 float(x.get("final_delivery_precheck") or -900.0),
                 int(x.get("confidence") or 0),
                 float(x.get("strategy_margin") or 0),

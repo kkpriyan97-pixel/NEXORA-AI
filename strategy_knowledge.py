@@ -38,8 +38,9 @@ def _status(samples: int, wins: int, losses: int, recent: str) -> str:
     # 85% is the minimum acceptance gate; 90% is the research target, not a guarantee.
     if samples < 100:
         return "CANDIDATE"
-    decided=max(1,wins+losses)
-    acc=wins/decided
+    # Keep status identical to the completed campaign gate: every
+    # sampled DEMO result counts, including TIE outcomes.
+    acc=wins/max(1,samples)
     return "VALIDATED" if acc >= 0.85 else "RESEARCH_REJECT"
 
 def strategy_live_eligible(strategy_id: str) -> bool:
@@ -57,9 +58,15 @@ def strategy_live_eligible(strategy_id: str) -> bool:
         return True
     try:
         samples = int(state.get("samples") or 0)
+        wins = int(state.get("wins") or 0)
     except (TypeError, ValueError):
         samples = 0
-    return not (samples >= 100 and str(state.get("status") or "").upper() == "RESEARCH_REJECT")
+        wins = 0
+    # Do not trust a stale persisted status for the live gate. Reuse the exact
+    # 100-sample / 85% rule that the DEMO campaign uses.
+    if samples < 100:
+        return True
+    return (wins / max(1, samples)) >= 0.85
 
 def _rebuild_cache(rows):
     global _CACHE, _CACHE_TS
@@ -74,7 +81,10 @@ def _rebuild_cache(rows):
         samples = int(row[1] or 0)
         wins = int(row[2] or 0)
         losses = int(row[3] or 0)
-        status = str(row[7] or _status(samples, wins, losses, recent))
+        stored_status = str(row[7] or "").upper()
+        # Recompute completed-campaign status so legacy rows cannot retain an
+        # incorrect gate after the denominator is corrected.
+        status = _status(samples, wins, losses, recent) if samples >= 100 else (stored_status or "CANDIDATE")
         cache[sid] = {
             "samples": samples,
             "wins": wins,
