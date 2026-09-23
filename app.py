@@ -3002,7 +3002,7 @@ async def result_watch(key):
     direction_icon="⬆️" if rec["direction"]=="UP" else "⬇️"
     result_icon={"WIN":"✅","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
     await telegram(
-        f"📊 TRADE RESULT\n"
+        f"🧪 SIGNAL TEST RESULT\n"
         f"\n"
         f"📈 {label}\n"
         f"\n"
@@ -3020,7 +3020,7 @@ async def result_watch(key):
         f"\n"
         f"{result_icon} {rec['result']}\n"
         f"\n"
-        f"⚠️ RESULT ONLY — AUTO TRADE OFF"
+        f"⚠️ SIGNAL TEST ONLY — DEMO AUTO-TRADE OFF"
     )
     await complete_result_watch(watch_id)
     log.info(
