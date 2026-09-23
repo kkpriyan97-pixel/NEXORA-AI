@@ -224,7 +224,7 @@ def _efficiency(v, n=8):
     return min(1.0, abs(window[-1] - window[0]) / total)
 
 
-def analyze_asset(asset, candles, price=None, forced_strategy=None):
+def analyze_asset(asset, candles, price=None, forced_strategy=None, learning_campaign=False):
     cs = [_norm(c) for c in candles if isinstance(c, dict)]
     if len(cs) < 45:
         return None
@@ -565,9 +565,17 @@ def analyze_asset(asset, candles, price=None, forced_strategy=None):
     if forced and forced not in strategies:
         return None
     # Only a completed 100-trade DEMO failure at the explicit 85% gate can
-    # remove a strategy family from live Brain routing. Everything else stays.
+    # remove a strategy family from live Brain routing. The isolated learning
+    # campaign must still be able to re-test its assigned strategy; otherwise
+    # a previously rejected family can deadlock its own 100-trade re-validation.
+    # learning_campaign=True is used only by the overnight DEMO lab and never by
+    # the daytime/manual signal path.
     if forced:
-        active_strategies = (forced,) if strategy_live_eligible(forced) else ()
+        active_strategies = (
+            (forced,)
+            if (learning_campaign or strategy_live_eligible(forced))
+            else ()
+        )
     else:
         active_strategies = tuple(s for s in strategies if strategy_live_eligible(s))
     if not active_strategies:
