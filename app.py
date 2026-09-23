@@ -3077,14 +3077,24 @@ async def cycle_loop():
         # start but before the signal, skip that partial boundary and start the
         # next complete cycle.
         cycle_start=target-SIGNAL_INTERVAL
-        if time.time()>cycle_start+5.0 and not recovered:
+        if time.time()>cycle_start+5.0:
             old_target=target
+            old_cycle_id=cycle_id
             target+=SIGNAL_INTERVAL
             cycle_id=int(target//SIGNAL_INTERVAL)
             cycle_sequence=(cycle_id % 20) or 20
             signal_lead=30.0
             signal_at=target-signal_lead
             cycle_start=target-SIGNAL_INTERVAL
+            if recovered:
+                log.info(
+                    "CYCLE_RECOVERY_DISCARDED cycle=%s old_cycle=%s reason=window_start_already_passed old_target_utc=%s",
+                    cycle_id,old_cycle_id,
+                    time.strftime("%H:%M:%S",time.gmtime(old_target))
+                )
+                recovered=None
+                resume_completed_pass=0
+                candidate_pool={}
             log.info(
                 "CYCLE_RESTART_ALIGNMENT cycle=%s old_target_utc=%s new_start_utc=%s signal_utc=%s target_utc=%s",
                 cycle_id,
