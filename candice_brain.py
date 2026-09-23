@@ -342,13 +342,19 @@ def analyze_asset(asset, candles, price=None, forced_strategy=None):
             # regime before allowing BREAKOUT into the live candidate pool.
             if trend not in {"UP","DOWN"}:
                 return -1.0
+            # Tighten the live 1-minute breakout definition. A 0.15 ATR / 0.55
+            # body break can fail immediately; require stronger displacement,
+            # continuation and oscillator agreement without changing direction.
             if (
                 not active
-                or distance < 0.15
-                or body_ratio < 0.55
+                or distance < 0.20
+                or body_ratio < 0.60
                 or not prior_inside
                 or not (dc_confirm or level_confirm)
-                or not continuation_confirm
+                or momentum_norm < 0.35
+                or _efficiency(v, 8) < 0.40
+                or not stoch_confirm
+                or trend_persistence < 2
             ):
                 return -1.0
             s = 62.0
@@ -418,13 +424,28 @@ def analyze_asset(asset, candles, price=None, forced_strategy=None):
             if not directional_pattern:
                 return -1.0
             location = near_support if direction == "UP" else near_resistance
+            rejection = bullish_rejection if direction == "UP" else bearish_rejection
+            # A single directional candle away from a level is not sufficient for
+            # a 1-minute expiry. Require structural agreement and a meaningful
+            # location/rejection so the raw confidence cannot be inflated by one bar.
+            if (
+                not trend_ok
+                or not structure_ok
+                or structure_quality[direction] < 0.50
+                or aligned_recent(direction) < 2
+                or momentum_norm < 0.10
+                or not (location or rejection)
+            ):
+                return -1.0
             s = 58.0
-            s += 12 if location else 5
+            s += 12 if location else 8
             s += 8 if structure_ok else 0
             s += 7 if trend_ok else 0
             s += 7 if body_ratio >= 0.60 else 2
             s += 5 if slope_ok else 0
-            return min(94.0, s)
+            s += 5 if aligned_recent(direction) >= 2 else 0
+            s += 3 if structure_quality[direction] >= 0.70 else 0
+            return min(96.0, s)
 
         if strategy == "MOMENTUM":
             # Momentum is a continuation technique in this 1m system. A SIDEWAYS
