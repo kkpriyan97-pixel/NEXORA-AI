@@ -810,12 +810,20 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,
     candidates=[]
     council_votes=dict(council_votes or {})
     now=time.time()
+    stats={
+        "selected":0,
+        "usable_candles":0,
+        "brain_ok":0,
+        "strategy_match":0,
+        "confidence_ok":0,
+    }
     # Practice is deliberately capped and rotated so the learning laboratory
     # cannot monopolize the CPU or starve the live signal scheduler.
     pool=list(assets)
     n=max(1,int(limit or 8))
     start=int(offset)%len(pool) if pool else 0
     selected=[pool[(start+i)%len(pool)] for i in range(min(n,len(pool)))] if pool else []
+    stats["selected"]=len(selected)
     for asset in selected:
         pair=str(asset.get("pair") or "")
         if not pair:
@@ -833,16 +841,24 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,
                 cs.append(c)
             except Exception:continue
         if len(cs)<45:continue
+        stats["usable_candles"]+=1
         try:
             price=(prices.get(pair) or [None,None])[0]
             brain=analyze_asset(asset,cs,price,forced_strategy=forced_strategy)
-        except Exception:
+        except Exception as e:
+            log.debug(
+                "LEARNING_BRAIN_ERROR pair=%s type=%s message=%s",
+                pair,type(e).__name__,str(e)[:120]
+            )
             continue
         if not brain:continue
+        stats["brain_ok"]+=1
         strategy=str(brain.get("strategy") or "").upper()
         if strategy not in preferred:continue
+        stats["strategy_match"]+=1
         conf=int(brain.get("confidence") or 0)
         if conf<MIN_CONFIDENCE:continue
+        stats["confidence_ok"]+=1
         source=next((sid for st,sid in hints if st==strategy),"CORE")
         technique={
             "trend_15m":brain.get("trend_15m"),
@@ -861,7 +877,17 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,
         }
         council_boost=3*int(council_votes.get(strategy,0) or 0)
         candidates.append((conf+council_boost,conf,float(brain.get("market_quality") or 0),brain,source,technique,council_boost))
-    if not candidates:return None
+    if not candidates:
+        log.warning(
+            "LEARNING_CANDIDATE_FILTER selected=%d usable_candles=%d brain_ok=%d "
+            "strategy_match=%d confidence_ok=%d preferred=%s forced_strategy=%s "
+            "min_confidence=%d",
+            stats["selected"],stats["usable_candles"],stats["brain_ok"],
+            stats["strategy_match"],stats["confidence_ok"],
+            ",".join(preferred[:12]) or "NONE",forced_strategy or "NONE",
+            MIN_CONFIDENCE,
+        )
+        return []
     candidates.sort(key=lambda x:(x[0],x[1],x[2]),reverse=True)
     if return_all:
         out=[]
@@ -898,21 +924,29 @@ def _analyze_snapshot_sync(assets,candles,prices,preferred,hints,limit,offset=0,
 async def _build_candidate(forced_strategy=None,return_all=False):
     provider=_cfg.get("snapshot_provider")
     if not provider:
-        return None
+        log.error("LEARNING_SNAPSHOT_PROVIDER_MISSING")
+        return []
     try:
         snap=await asyncio.wait_for(
             asyncio.to_thread(provider),
             timeout=LEARNING_SNAPSHOT_TIMEOUT_SECONDS,
         )
-        assets=list(snap.get("assets") or [])
-        candles=copy.deepcopy(snap.get("candles") or {})
-        prices=copy.deepcopy(snap.get("prices") or {})
+        assets=list((snap or {}).get("assets") or [])
+        candles=copy.deepcopy((snap or {}).get("candles") or {})
+        prices=copy.deepcopy((snap or {}).get("prices") or {})
+        log.info(
+            "LEARNING_SNAPSHOT_READY assets=%d candle_series=%d price_series=%d",
+            len(assets),len(candles),len(prices)
+        )
     except asyncio.TimeoutError:
-        print(f"LEARNING_SNAPSHOT_TIMEOUT seconds={LEARNING_SNAPSHOT_TIMEOUT_SECONDS}")
-        return None
+        log.error("LEARNING_SNAPSHOT_TIMEOUT seconds=%s",LEARNING_SNAPSHOT_TIMEOUT_SECONDS)
+        return []
     except Exception as e:
-        print(f"LEARNING_SNAPSHOT_FAILED type={type(e).__name__} message={str(e)[:120]}")
-        return None
+        log.error(
+            "LEARNING_SNAPSHOT_FAILED type=%s message=%s",
+            type(e).__name__,str(e)[:180]
+        )
+        return []
     try:
         hints=await asyncio.wait_for(
             _load_research_hints(),
@@ -1040,7 +1074,11 @@ async def _build_candidate(forced_strategy=None,return_all=False):
                 f"council_consensus={consensus or 'NONE'}"
             )
     if not candidate:
-        print(f"LEARNING_CANDIDATE_NONE batch={batch} cursor={offset} reason=no_qualified_candidate")
+        log.warning(
+            "LEARNING_CANDIDATE_NONE batch=%d cursor=%d reason=no_qualified_candidate",
+            batch,offset
+        )
+        return []
     return candidate
 
 async def _send_request(candidate, notify=True):
@@ -1788,6 +1826,7 @@ async def run_forever():
                                 "LEARNING_SCAN_FAILED type=%s message=%s fallback=next_scan",
                                 type(e).__name__,str(e)[:160],
                             )
+                    candidates=list(candidates or [])
                     accepted=await _send_campaign_batch(candidates)
                     if _lab_log:
                         _lab_log.info(
