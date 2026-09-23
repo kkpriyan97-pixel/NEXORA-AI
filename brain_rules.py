@@ -34,6 +34,7 @@ class ActiveSignal:
     self_strategy:str=""
     self_strategy_version:str=""
     indicator_context:dict[str,Any]=field(default_factory=dict)
+    telegram_eval_counted:bool=False
 
 @dataclass
 class BrainState:
@@ -70,6 +71,18 @@ class BrainState:
     research_day:int=1
     research_target_days:int=RESEARCH_TARGET_DAYS
     research_observations:int=0
+    # Post-admin Telegram signal evaluation. Reporting-only; never blocks signals.
+    telegram_eval_active:bool=False
+    telegram_eval_started_at:float|None=None
+    telegram_eval_signal_count:int=0
+    telegram_eval_wins:int=0
+    telegram_eval_losses:int=0
+    telegram_eval_ties:int=0
+    telegram_eval_continue_wins:int=0
+    telegram_eval_continue_losses:int=0
+    telegram_eval_previous_result:str=""
+    telegram_eval_completed:bool=False
+    telegram_eval_last_report:dict[str,Any]|None=None
 
     def bind_learning_account(self,account_id):
         try: account_id=int(account_id) if account_id is not None else None
@@ -89,6 +102,57 @@ class BrainState:
     def is_account_cooldown(self,now=None):
         now=utc_now() if now is None else float(now)
         return self.account_cooldown_until > now
+
+    def start_telegram_evaluation(self,start_ts=None):
+        self.telegram_eval_active=True
+        self.telegram_eval_started_at=utc_now() if start_ts is None else float(start_ts)
+        self.telegram_eval_signal_count=0
+        self.telegram_eval_wins=0
+        self.telegram_eval_losses=0
+        self.telegram_eval_ties=0
+        self.telegram_eval_continue_wins=0
+        self.telegram_eval_continue_losses=0
+        self.telegram_eval_previous_result=""
+        self.telegram_eval_completed=False
+        self.telegram_eval_last_report=None
+        return self.telegram_eval_snapshot()
+
+    def telegram_eval_snapshot(self):
+        decided=self.telegram_eval_wins+self.telegram_eval_losses
+        win_rate=(100.0*self.telegram_eval_wins/decided) if decided else 0.0
+        return {"active":bool(self.telegram_eval_active),"started_at":self.telegram_eval_started_at,
+                "signals":int(self.telegram_eval_signal_count),"wins":int(self.telegram_eval_wins),
+                "losses":int(self.telegram_eval_losses),"ties":int(self.telegram_eval_ties),
+                "continue_wins":int(self.telegram_eval_continue_wins),
+                "continue_losses":int(self.telegram_eval_continue_losses),
+                "win_rate":round(win_rate,2),"completed":bool(self.telegram_eval_completed),
+                "remaining":max(0,100-int(self.telegram_eval_signal_count)),
+                "last_report":self.telegram_eval_last_report}
+
+    def _record_telegram_evaluation_result(self,result):
+        if not self.telegram_eval_active or self.telegram_eval_completed:
+            return None
+        result=str(result or "").upper()
+        if result not in {"WIN","LOSS","TIE"}:
+            return None
+        self.telegram_eval_signal_count += 1
+        if result=="WIN":
+            self.telegram_eval_wins += 1
+            if self.telegram_eval_previous_result=="WIN":
+                self.telegram_eval_continue_wins += 1
+        elif result=="LOSS":
+            self.telegram_eval_losses += 1
+            if self.telegram_eval_previous_result=="LOSS":
+                self.telegram_eval_continue_losses += 1
+        else:
+            self.telegram_eval_ties += 1
+        self.telegram_eval_previous_result=result
+        if self.telegram_eval_signal_count>=100:
+            self.telegram_eval_active=False
+            self.telegram_eval_completed=True
+            self.telegram_eval_last_report=self.telegram_eval_snapshot()
+            return self.telegram_eval_last_report
+        return None
 
     def start_cycle(self,cycle_id):
         if cycle_id != self.cycle_id:
@@ -155,7 +219,8 @@ class BrainState:
             reason=str(kw.get("reason","")),confidence=int(kw.get("confidence",0)),
             pattern=str(kw.get("pattern","")),trend_15m=str(kw.get("trend_15m","")),
             structure_1m=str(kw.get("structure_1m","")),self_strategy=str(kw.get("self_strategy","")),self_strategy_version=str(kw.get("self_strategy_version","")),
-            indicator_context=dict(kw.get("indicator_context") or {}))
+            indicator_context=dict(kw.get("indicator_context") or {}),
+            telegram_eval_counted=bool(self.telegram_eval_active and not self.telegram_eval_completed))
         self.active_signals[f"{s.cycle_id}:{s.pair}:{s.entry_ts}"]=s
         return s
 
@@ -376,6 +441,9 @@ class BrainState:
             "indicator_context":s.indicator_context
         }
         self.learn(rec)
+        if s.telegram_eval_counted:
+            rec["telegram_eval_counted"]=True
+            rec["telegram_eval_report"]=self._record_telegram_evaluation_result(result)
         if result=="LOSS":
             cooldown_until=now+COOLDOWN_SECONDS
             self.cooldown_until[s.pair]=cooldown_until
@@ -639,6 +707,17 @@ class BrainState:
             "research_day": self.research_day,
             "research_target_days": self.research_target_days,
             "research_observations": self.research_observations,
+            "telegram_eval_active": self.telegram_eval_active,
+            "telegram_eval_started_at": self.telegram_eval_started_at,
+            "telegram_eval_signal_count": self.telegram_eval_signal_count,
+            "telegram_eval_wins": self.telegram_eval_wins,
+            "telegram_eval_losses": self.telegram_eval_losses,
+            "telegram_eval_ties": self.telegram_eval_ties,
+            "telegram_eval_continue_wins": self.telegram_eval_continue_wins,
+            "telegram_eval_continue_losses": self.telegram_eval_continue_losses,
+            "telegram_eval_previous_result": self.telegram_eval_previous_result,
+            "telegram_eval_completed": self.telegram_eval_completed,
+            "telegram_eval_last_report": self.telegram_eval_last_report,
         }
 
     def import_learning(self, data):
@@ -667,6 +746,17 @@ class BrainState:
         self.research_day=int(data.get("research_day",1) or 1)
         self.research_target_days=int(data.get("research_target_days",RESEARCH_TARGET_DAYS) or RESEARCH_TARGET_DAYS)
         self.research_observations=int(data.get("research_observations",0) or 0)
+        self.telegram_eval_active=bool(data.get("telegram_eval_active",False))
+        self.telegram_eval_started_at=data.get("telegram_eval_started_at")
+        self.telegram_eval_signal_count=int(data.get("telegram_eval_signal_count",0) or 0)
+        self.telegram_eval_wins=int(data.get("telegram_eval_wins",0) or 0)
+        self.telegram_eval_losses=int(data.get("telegram_eval_losses",0) or 0)
+        self.telegram_eval_ties=int(data.get("telegram_eval_ties",0) or 0)
+        self.telegram_eval_continue_wins=int(data.get("telegram_eval_continue_wins",0) or 0)
+        self.telegram_eval_continue_losses=int(data.get("telegram_eval_continue_losses",0) or 0)
+        self.telegram_eval_previous_result=str(data.get("telegram_eval_previous_result") or "")
+        self.telegram_eval_completed=bool(data.get("telegram_eval_completed",False))
+        self.telegram_eval_last_report=data.get("telegram_eval_last_report")
 
     def prune_expired_cooldowns(self,now=None):
         now=utc_now() if now is None else now
