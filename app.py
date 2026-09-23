@@ -92,6 +92,10 @@ UAE_TZ=ZoneInfo("Asia/Dubai")
 
 SIGNAL_SESSION_START_HOUR=6
 SIGNAL_SESSION_END_HOUR=18
+# Fixed five-pass Candice scan window inside every 3-minute cycle.
+# Offsets are measured backward from the 1-minute entry/expiry boundary.
+CYCLE_SCAN_OFFSETS=(150.0,120.0,90.0,75.0,60.0)
+CYCLE_SCAN_COUNT=len(CYCLE_SCAN_OFFSETS)
 # DEMO/testing override only. When enabled, the normal daytime signal scheduler
 # may run outside the UAE 06:00–18:00 window. It does NOT enable broker auto-trading.
 FORCE_SIGNAL_MODE=os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}
@@ -3015,7 +3019,8 @@ async def result_watch(key):
         f"\n"
         f"{result_icon} {rec['result']}\n"
         f"\n"
-        f"⚠️ LIVE SIGNAL — MANUAL • DEMO AUTO-TRADE OFF"
+        f"🟣 FLEX PROTOCOL — MANUAL TRADE\n"
+        f"⚠️ Bot does not place Flex orders"
     )
     await complete_result_watch(watch_id)
     log.info(
@@ -3042,7 +3047,7 @@ async def cycle_loop():
     # cycle start; the 1-minute DEMO entry/expiry boundary is +3m00s.
     SIGNAL_INTERVAL=180.0
     SIGNAL_LEADS=(30.0,30.0)
-    SCAN_OFFSETS=(150.0,120.0,90.0,75.0,60.0)
+    SCAN_OFFSETS=CYCLE_SCAN_OFFSETS
 
     async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
         if not signal_session_active(target):
@@ -3225,8 +3230,10 @@ async def cycle_loop():
              f"📈 15m Trend → {s.trend_15m or '—'}\n"
              f"🕯️ 1m Structure → {s.structure_1m or '—'}\n"
              f"🧠 Strategy → {s.strategy}\n\n"
-             f"🟢 LIVE SIGNAL • MANUAL\n"
-             f"🤖 CANDICE BRAIN")
+             f"🟣 FLEX PROTOCOL • MANUAL ENTRY\n"
+             f"🔎 Candice 5-Scan → {CYCLE_SCAN_COUNT}/{CYCLE_SCAN_COUNT} complete\n"
+             f"🧠 Strategies Checked → 8\n"
+             f"🤖 Candice Brain • LIVE")
 
         delivery_started=time.perf_counter()
         delivered=await telegram(msg,timeout_seconds=TELEGRAM_SIGNAL_TIMEOUT)
@@ -3439,6 +3446,18 @@ async def cycle_loop():
         # universe before Brain state for this cycle is created.
         BRAIN.start_cycle(cycle_id)
         STATE["cycle"]=cycle_id
+        STATE["cycle_scan_status"]={
+            "cycle_id":int(cycle_id),
+            "total_passes":CYCLE_SCAN_COUNT,
+            "completed_pass":int(resume_completed_pass or 0),
+            "scan_offsets_seconds":[int(x) for x in SCAN_OFFSETS],
+            "signal_lead_seconds":int(signal_lead),
+            "signal_epoch":float(signal_at),
+            "target_epoch":float(target),
+            "scans":[],
+            "protocol":"FLEX_MANUAL",
+            "signal_expiry_minutes":1,
+        }
         # Recovery metadata is best-effort; never block the signal scheduler on DB I/O.
         asyncio.create_task(save_cycle_state(
             cycle_id,target,signal_at,signal_lead,resume_completed_pass,
@@ -3913,6 +3932,53 @@ async def cycle_loop():
                 log.exception(
                     "SCAN_EVALUATION_FAILED cycle=%s scan=SCAN_%s pass=%s type=%s message=%s",
                     cycle_id,pass_no,type(e).__name__,str(e)[:160]
+                )
+
+            # Persist a compact visible audit of this pass. The Brain has already
+            # evaluated the strategy families using the same indicator snapshot; this
+            # state is read-only observability and cannot change ranking/direction.
+            try:
+                _strategy_scan_counts={}
+                _indicator_scoped_assets=0
+                for _an in STATE.get("analyses",{}).values():
+                    if not isinstance(_an,dict):
+                        continue
+                    if _an.get("strategy_audit"):
+                        _indicator_scoped_assets+=1
+                    for _av in (_an.get("strategy_audit") or []):
+                        _sid=str(_av.get("strategy") or "").upper()
+                        if _sid:
+                            _strategy_scan_counts.setdefault(_sid,0)
+                            if bool(_av.get("up_qualified")) or bool(_av.get("down_qualified")):
+                                _strategy_scan_counts[_sid]+=1
+                _scan_state=STATE.setdefault("cycle_scan_status",{})
+                _scan_state["completed_pass"]=pass_no
+                _scan_state["scans"]=list(_scan_state.get("scans") or [])
+                _scan_state["scans"].append({
+                    "pass":pass_no,
+                    "offset_seconds":int(offset),
+                    "scan_utc":datetime.fromtimestamp(scan_at,tz=timezone.utc).isoformat(),
+                    "executed_utc":datetime.now(timezone.utc).isoformat(),
+                    "assets":len(STATE.get("assets") or []),
+                    "analyzed":len(STATE.get("analyses") or {}),
+                    "indicator_scoped_assets":_indicator_scoped_assets,
+                    "qualified_by_strategy":_strategy_scan_counts,
+                    "candidate_pool_size":len(candidate_pool),
+                })
+                if len(_scan_state["scans"])>CYCLE_SCAN_COUNT:
+                    _scan_state["scans"]=_scan_state["scans"][-CYCLE_SCAN_COUNT:]
+                log.info(
+                    "CANDICE_5SCAN_AUDIT cycle=%s scan=%s/%s offset=%ss assets=%s analyzed=%s "
+                    "indicator_scoped=%s qualified_by_strategy=%s pool=%s",
+                    cycle_id,pass_no,CYCLE_SCAN_COUNT,int(offset),
+                    len(STATE.get("assets") or []),len(STATE.get("analyses") or {}),
+                    _indicator_scoped_assets,_strategy_scan_counts,len(candidate_pool)
+                )
+            except Exception as _scan_state_error:
+                log.warning(
+                    "CANDICE_5SCAN_AUDIT_FAILED cycle=%s scan=%s/%s type=%s message=%s",
+                    cycle_id,pass_no,CYCLE_SCAN_COUNT,
+                    type(_scan_state_error).__name__,str(_scan_state_error)[:120]
                 )
 
             # Warm candidate tick subscriptions during passes 1-3 so genuine
@@ -4801,6 +4867,10 @@ async def build_live_analysis_payload():
             "trend_15m":an.get("trend_15m"),
             "structure_1m":an.get("structure_1m"),
             "pattern":an.get("pattern"),
+            "strategy_candidates":list(an.get("strategy_candidates") or []),
+            "strategy_audit":list(an.get("strategy_audit") or []),
+            "strategy_audit_count":int(an.get("strategy_audit_count") or 0),
+            "indicator_audit_scope":an.get("indicator_audit_scope") or "ALL_8_STRATEGIES_SAME_LIVE_INDICATORS",
             "indicators":dict(an.get("indicators") or {}),
         })
     return {
@@ -4811,6 +4881,12 @@ async def build_live_analysis_payload():
         "authenticated_account_feed":str(STATE.get("feed_source") or "").startswith("authenticated_websocket:"),
         "asset_count":len(rows),
         "qualified_count":len(STATE.get("analyses") or {}),
+        "strategy_families_checked":8,
+        "strategy_families":list(("TREND_FOLLOWING","MOMENTUM","PULLBACK","BREAKOUT","REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY")),
+        "five_scan_cycle":dict(STATE.get("cycle_scan_status") or {}),
+        "protocol":"FLEX_MANUAL",
+        "signal_expiry_minutes":1,
+        "flex_auto_trade":False,
         "updated_utc":datetime.now(timezone.utc).isoformat(),
         "assets":rows,
     }
