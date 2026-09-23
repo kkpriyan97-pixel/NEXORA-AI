@@ -564,6 +564,7 @@ async def restore_open_trades():
                 rec=dict(record or {})
                 rec["trade_id"]=tid
                 rec["status"]="OPEN"
+                rec["_restored"]=True
                 _open[tid]=rec
                 restored+=1
                 print(f"LEARNING_TRADE_RESTORED trade_id={tid} pair={rec.get('pair')} entry={rec.get('entry_price')}")
@@ -1217,7 +1218,7 @@ async def _fallback_watch(rec):
     if not tid:
         return
     expiry_ts=float(rec.get("entry_ts") or rec.get("placed_at") or time.time()) + DURATION_SECONDS
-    deadline=expiry_ts + RESULT_WATCH_EXTRA_SECONDS
+    deadline=max(expiry_ts + RESULT_WATCH_EXTRA_SECONDS, time.time() + (RESULT_WATCH_RESTART_GRACE_SECONDS if rec.get("_restored") else 0.0))
     provider=_cfg.get("snapshot_provider")
     attempts=0
     pair=str(rec.get("pair") or "")
