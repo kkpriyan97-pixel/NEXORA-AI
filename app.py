@@ -2879,11 +2879,19 @@ async def cycle_loop():
         # previous ~200-300ms boundary race that caused valid setups to miss.
         prepared_at=candidate.get("final_delivery_prepared_at")
         prepared_ok=bool(candidate.get("final_delivery_confirmed"))
-        if prepared_at is None or time.time()-float(prepared_at)>20.0:
+        # Pass 5 is intentionally prepared at the configured signal lead
+        # (normally 30s before entry). The old 20s hard limit therefore rejected
+        # every normally-prepared candidate at the exact boundary. Fresh live
+        # price is still required below, so extending this cache-age bound does
+        # not permit stale market quotes to be sent.
+        prepared_max_age=max(20.0,float(signal_lead)+5.0)
+        prepared_age=(None if prepared_at is None else time.time()-float(prepared_at))
+        if prepared_at is None or prepared_age>prepared_max_age:
             log.info(
-                "FINAL_DELIVERY_PREP_EXPIRED cycle=%s pair=%s prepared_at=%s age=%s next_asset=TRUE",
+                "FINAL_DELIVERY_PREP_EXPIRED cycle=%s pair=%s prepared_at=%s age=%s max_age=%.1f next_asset=TRUE",
                 cycle_id,p,prepared_at,
-                ("NONE" if prepared_at is None else f"{time.time()-float(prepared_at):.3f}")
+                ("NONE" if prepared_age is None else f"{prepared_age:.3f}"),
+                prepared_max_age
             )
             return False
         if not prepared_ok:
