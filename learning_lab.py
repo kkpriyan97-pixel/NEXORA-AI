@@ -1083,7 +1083,18 @@ async def _send_campaign_batch(candidates):
         1 for rec in _pending.values()
         if str(rec.get("strategy") or "").upper()==strategy
     )
-    remaining=CAMPAIGN_MIN_TRADES-completed-active_reserved-pending_reserved
+    # The practice contract is one fixed strategy and one DEMO trade at a time.
+    # Do not launch another order while the previous result is still open/pending;
+    # this keeps each sample attributable to the same campaign strategy and
+    # matches the 60-second M1 practice cadence.
+    if active_reserved or pending_reserved:
+        print(
+            f"LEARNING_CAMPAIGN_WAITING_RESULTS strategy={strategy} "
+            f"completed={completed} open={active_reserved} pending={pending_reserved}"
+        )
+        return 0
+
+    remaining=CAMPAIGN_MIN_TRADES-completed
     if remaining<=0:
         print(
             f"LEARNING_CAMPAIGN_WAITING_RESULTS strategy={strategy} "
@@ -1103,23 +1114,27 @@ async def _send_campaign_batch(candidates):
             continue
         seen.add(pair)
         unique.append(item)
-        if len(unique)>=remaining:
+        # One DEMO order per practice slot; the next scan waits for this result.
+        if len(unique)>=1:
             break
     if not unique:
         print(f"LEARNING_CAMPAIGN_NO_ELIGIBLE_ASSETS strategy={strategy} reason=no_valid_fixed_strategy_setup")
         return 0
 
+    # Keep the execution path sequential. The semaphore is retained as a
+    # defensive guard for compatibility with existing callers.
     async def one(item):
         async with CAMPAIGN_ASSET_SEM:
-            # Every DEMO campaign order is now reported immediately to the
-            # admin Telegram chat. This keeps the learning lab observable:
-            # accepted trade ID, asset, direction, entry, duration and result
-            # are visible instead of only the aggregate batch count.
             return await _send_request(item,notify=True)
 
-    results=await asyncio.gather(*(one(item) for item in unique),return_exceptions=True)
-    accepted=sum(1 for r in results if r is True)
-    failed=sum(1 for r in results if r is not True)
+    accepted=0
+    failed=0
+    for item in unique:
+        result=await one(item)
+        if result is True:
+            accepted+=1
+        else:
+            failed+=1
     minute=int(time.time()//60)
     print(
         f"LEARNING_CAMPAIGN_BATCH strategy={strategy} minute={minute} "
