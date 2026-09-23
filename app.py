@@ -4012,6 +4012,124 @@ async def cycle_loop():
                                 item["final_delivery_precheck"]=_final_delivery_precheck(
                                     item,final_reference
                                 )
+
+                                # Recovery happens during pass 5, after the normal
+                                # final-preparation loop has already run. Prepare the
+                                # recovered candidate with the same authoritative
+                                # closed-candle + strategy quality gate so it cannot
+                                # arrive at the signal boundary with prepared_at=None.
+                                recovered_pair=str(item.get("pair") or "")
+                                recovered_expected=str(item.get("direction") or "").upper()
+                                recovered_closed=_closed_candles(
+                                    STATE["candles"].get(recovered_pair,[]),final_reference
+                                )
+                                recovery_reason=""
+                                recovery_diag={}
+                                try:
+                                    recovery_mtf=build_multi_timeframe_context(
+                                        recovered_pair,recovered_closed,final_reference,
+                                        recovered_expected
+                                    )
+                                    recovery_confirmed,recovery_confirmation=multi_timeframe_confirmation(
+                                        recovery_mtf,recovered_expected
+                                    )
+                                    recovery_diag=dict(recovery_confirmation or {})
+                                    recovery_diag["2m_bars"]=len(
+                                        _aggregate_closed_minutes(recovered_closed,2,final_reference)
+                                    )
+                                    if not recovery_confirmed:
+                                        recovery_reason=str(
+                                            recovery_confirmation.get("reason") or
+                                            "multi_timeframe_rejected"
+                                        )
+                                except Exception as e:
+                                    recovery_reason="multi_timeframe_preparation_error"
+                                    recovery_diag={
+                                        "type":type(e).__name__,
+                                        "message":str(e)[:160]
+                                    }
+
+                                strategy_name=str(item.get("strategy") or "").upper()
+                                body_ratio=float(item.get("body_ratio") or 0.0)
+                                momentum_norm=float(item.get("momentum_norm") or 0.0)
+                                efficiency=float(item.get("efficiency") or 0.0)
+                                trend_name=str(item.get("trend_15m") or "").upper()
+                                direction_name=str(item.get("direction") or "").upper()
+
+                                if not recovery_reason and strategy_name=="BREAKOUT":
+                                    breakout_distance=float(
+                                        item.get(
+                                            "breakout_distance_up"
+                                            if direction_name=="UP"
+                                            else "breakout_distance_down"
+                                        ) or 0.0
+                                    )
+                                    if (
+                                        breakout_distance<0.20
+                                        or body_ratio<0.60
+                                        or momentum_norm<0.35
+                                        or efficiency<0.40
+                                        or trend_name not in {"UP","DOWN"}
+                                    ):
+                                        recovery_reason="breakout_quality_insufficient"
+                                        recovery_diag.update({
+                                            "breakout_distance":round(breakout_distance,4),
+                                            "body_ratio":round(body_ratio,3),
+                                            "momentum_norm":round(momentum_norm,3),
+                                            "efficiency":round(efficiency,3),
+                                        })
+
+                                if not recovery_reason and strategy_name=="PRICE_ACTION":
+                                    structure_quality=float(item.get("structure_quality") or 0.0)
+                                    aligned_recent=int(
+                                        (item.get("evidence") or {}).get(
+                                            "recent_aligned_candles",0
+                                        ) or 0
+                                    )
+                                    pattern_name=str(item.get("pattern") or "").upper()
+                                    rejection_ok=(
+                                        (direction_name=="UP" and pattern_name=="BULLISH_REJECTION")
+                                        or (direction_name=="DOWN" and pattern_name=="BEARISH_REJECTION")
+                                    )
+                                    near_level=(
+                                        (direction_name=="UP" and float(item.get("price") or 0.0) <=
+                                         float(item.get("support") or 0.0)+float(item.get("atr") or 0.0)*0.35)
+                                        or
+                                        (direction_name=="DOWN" and float(item.get("price") or 0.0) >=
+                                         float(item.get("resistance") or 0.0)-float(item.get("atr") or 0.0)*0.35)
+                                    )
+                                    if (
+                                        structure_quality<0.50
+                                        or aligned_recent<2
+                                        or momentum_norm<0.10
+                                        or not (near_level or rejection_ok)
+                                    ):
+                                        recovery_reason="price_action_context_insufficient"
+                                        recovery_diag.update({
+                                            "structure_quality":round(structure_quality,3),
+                                            "aligned_recent":aligned_recent,
+                                            "momentum_norm":round(momentum_norm,3),
+                                            "near_level":bool(near_level),
+                                            "rejection":bool(rejection_ok),
+                                        })
+
+                                item["final_delivery_confirmed"]=not bool(recovery_reason)
+                                item["final_delivery_confirmation_reason"]=recovery_reason or "confirmed"
+                                item["final_delivery_diagnostic"]=recovery_diag
+                                item["final_delivery_prepared_at"]=final_reference
+
+                                if recovery_reason:
+                                    log.info(
+                                        "FINAL_RECOVERY_PREP_REJECTED cycle=%s pair=%s reason=%s diagnostic=%s",
+                                        cycle_id,recovered_pair,recovery_reason,recovery_diag
+                                    )
+                                else:
+                                    log.info(
+                                        "FINAL_RECOVERY_PREP_CONFIRMED cycle=%s pair=%s diagnostic=%s seconds_to_signal=%.2f",
+                                        cycle_id,recovered_pair,recovery_diag,
+                                        max(0.0,signal_at-time.time())
+                                    )
+
                                 # Preserve the recovered technique identity too.
                                 # Recovery is not allowed to overwrite another strategy
                                 # for the same pair/candle/direction.
