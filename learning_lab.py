@@ -1297,6 +1297,23 @@ async def _verify_order_visibility(trade_id, account_id, pair):
     )
     return True
 
+def _flex_category(pair):
+    """Map an authenticated account asset to the Flex order category.
+
+    Flex uses is_flex=True as the mode selector, while cat identifies the
+    underlying instrument family. This keeps FX, crypto and index/stock assets
+    on the category expected by the broker's trading envelope.
+    """
+    p=str(pair or "").upper().strip()
+    base=p[:-4] if p.endswith("_OTC") else p
+    crypto={"BTCUSD","ETHUSD","LTCUSD","XRPUSD","SOLUSD","BNBUSD","DOGUSD","PEPEUSD","SHIBUSD"}
+    if base in crypto:
+        return "digital"
+    fx_currencies={"AUD","CAD","CHF","EUR","GBP","JPY","MXN","NOK","NZD","SGD","USD"}
+    if len(base)==6 and base[:3] in fx_currencies and base[3:] in fx_currencies:
+        return "forex"
+    return "stocks"
+
 async def _place_demo(rec, actor_id):
     if not practice_active():
         return False,"LEARNING_WINDOW_CLOSED",None
@@ -1317,7 +1334,7 @@ async def _place_demo(rec, actor_id):
     if direction not in {"up","down"} or not pair:
         return False,"INVALID_DIRECTION_OR_PAIR",None
     try:
-        print(f"LEARNING_ORDER_ATTEMPT pair={pair} direction={direction.upper()} mode=FLEX group=demo amount={AMOUNT} duration={DURATION_SECONDS}")
+        print(f"LEARNING_ORDER_ATTEMPT pair={pair} direction={direction.upper()} mode=FLEX category={_flex_category(pair)} group=demo amount={AMOUNT} duration={DURATION_SECONDS}")
         # Use the canonical DEMO order signature supported by the OlympTrade
         # client: pair, amount, direction, duration, account_id, group.
         # Avoid optional payload flags that can cause a server-side Invalid request.
@@ -1325,7 +1342,7 @@ async def _place_demo(rec, actor_id):
             client.trade.place_flex_order(
                 pair=pair,amount=AMOUNT,direction=direction,
                 duration=DURATION_SECONDS,account_id=int(account_id),
-                group="demo"
+                group="demo",category=_flex_category(pair)
             ),
             timeout=5.0
         )
