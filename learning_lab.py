@@ -1717,7 +1717,7 @@ async def run_forever():
             # Never send a catch-up report hours later after a Render restart/deploy.
             # A short 10-minute grace keeps normal delivery/recovery intact while
             # preventing stale reports from appearing during daytime signal mode.
-            report_deadline=window_end+REPORT_GRACE_SECONDS
+            report_deadline=window_end+timedelta(seconds=REPORT_GRACE_SECONDS)
             if window_end <= now < report_deadline and _last_report_day != day:
                 report_ok=await _send_daily_report(day)
                 if report_ok:
