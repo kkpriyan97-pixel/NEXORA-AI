@@ -42,6 +42,25 @@ def _status(samples: int, wins: int, losses: int, recent: str) -> str:
     acc=wins/decided
     return "VALIDATED" if acc >= 0.85 else "RESEARCH_REJECT"
 
+def strategy_live_eligible(strategy_id: str) -> bool:
+    """Return whether a strategy family is still eligible for live Brain consideration.
+
+    A family is removed from the live strategy set only after a completed 100-trade
+    DEMO campaign has explicitly failed the 85% minimum gate. Candidate/validated
+    families remain available for normal routing and learning.
+    """
+    sid = str(strategy_id or "").upper().strip()
+    if not sid:
+        return False
+    state = _CACHE.get(sid)
+    if not state:
+        return True
+    try:
+        samples = int(state.get("samples") or 0)
+    except (TypeError, ValueError):
+        samples = 0
+    return not (samples >= 100 and str(state.get("status") or "").upper() == "RESEARCH_REJECT")
+
 def _rebuild_cache(rows):
     global _CACHE, _CACHE_TS
     cache = {}
