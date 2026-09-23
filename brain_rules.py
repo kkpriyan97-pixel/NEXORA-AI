@@ -513,6 +513,51 @@ class BrainState:
 
             candidates.append((score,e))
         return max(candidates,key=lambda z:z[0])[1]
+    def strategy_calibration_penalty(self,strategy):
+        """Bounded live calibration penalty from observed signal outcomes.
+
+        The technical Brain score remains primary. Once a strategy has enough
+        real result observations, persistent underperformance reduces its
+        effective confidence instead of allowing a raw 94-96 score to bypass
+        learned evidence. This is a calibration layer, not a promise of any
+        future win rate.
+        """
+        sid=str(strategy or "").upper().strip()
+        if not sid:
+            return 0.0,"UNAVAILABLE",0.0,0
+        bucket=self.strategy_stats.get(sid)
+        if not bucket:
+            return 0.0,"WARMUP",0.0,0
+        try:
+            n=float(bucket.get("n",0) or 0.0)
+            wins=float(bucket.get("win",0) or 0.0)
+            losses=float(bucket.get("loss",0) or 0.0)
+        except (TypeError,ValueError):
+            return 0.0,"WARMUP",0.0,0
+        if n<=0:
+            return 0.0,"WARMUP",0.0,0
+        # Laplace smoothing prevents tiny samples from becoming binary gates.
+        rate=(wins+1.0)/(n+2.0)
+        if n<8:
+            return 0.0,"WARMUP",rate,int(n)
+        if n>=30:
+            if rate<0.45:
+                return -8.0,"POOR",rate,int(n)
+            if rate<0.55:
+                return -5.0,"WEAK",rate,int(n)
+            if rate<0.65:
+                return -2.0,"MIXED",rate,int(n)
+            return 0.0,"STABLE",rate,int(n)
+        if n>=15:
+            if rate<0.45:
+                return -6.0,"POOR",rate,int(n)
+            if rate<0.55:
+                return -3.0,"WEAK",rate,int(n)
+            return 0.0,"STABLE",rate,int(n)
+        if rate<0.45:
+            return -3.0,"WATCH",rate,int(n)
+        return 0.0,"EARLY",rate,int(n)
+
     def adaptive_candidate(self,c):
         x=dict(c)
         pair=str(x.get("pair",""))
@@ -553,9 +598,16 @@ class BrainState:
             min(100.0,technical+x["learning_bonus"]+self_bonus+x["post_result_learning_bonus"])
         )
 
-        # Confidence is the resulting evidence quality; do not manufacture +8
-        # points on top of a borderline technical score.
-        x["confidence"]=max(0,min(99,int(round(x["market_quality"]))))
+        calibration_penalty,calibration_state,calibration_rate,calibration_samples=self.strategy_calibration_penalty(strategy)
+        x["calibration_penalty"]=round(calibration_penalty,2)
+        x["calibration_state"]=calibration_state
+        x["calibration_rate"]=round(calibration_rate,4)
+        x["calibration_samples"]=calibration_samples
+
+        # Confidence is the resulting evidence quality after bounded historical
+        # calibration. A 94-96 technical score must not masquerade as a 94-96%
+        # empirical win probability.
+        x["confidence"]=max(0,min(99,int(round(x["market_quality"]+calibration_penalty))))
 
         if pair and strategy:
             allow_5m=bool(x.get("five_minute_eligible")) and strategy=="TREND_FOLLOWING"
