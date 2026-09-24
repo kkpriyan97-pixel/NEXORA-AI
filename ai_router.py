@@ -8,7 +8,8 @@ log=logging.getLogger("candice")
 PROVIDER_COOLDOWN={}
 PROVIDER_COOLDOWN_SECONDS=120.0
 TRANSIENT_COOLDOWN_SECONDS=10.0
-DEFAULT_FALLBACKS=("GEMINI","GROQ","NVIDIA","OPENROUTER","MISTRAL")
+CREDIT_EXHAUSTION_COOLDOWN_SECONDS=21600.0
+DEFAULT_FALLBACKS=("GROQ","OPENROUTER","NVIDIA","MISTRAL","GEMINI","OPENAI")
 PROVIDER_LOCKS={}
 ANALYSIS_SEMAPHORE=asyncio.Semaphore(3)
 REVIEW_SEMAPHORE=asyncio.Semaphore(1)
@@ -24,7 +25,7 @@ _logged_ready=set()
 
 def _providers():
     names=[]
-    primary=os.getenv("AI_PROVIDER","OPENAI").strip().upper()
+    primary=os.getenv("AI_PROVIDER","GROQ").strip().upper()
     if primary:names.append(primary)
     for n in os.getenv("AI_FALLBACK_PROVIDERS",",".join(DEFAULT_FALLBACKS)).split(","):
         n=n.strip().upper()
@@ -174,14 +175,26 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                 except httpx.HTTPStatusError as e:
                     last=e
                     status=e.response.status_code
-                    detail=e.response.text[:160].replace("\n"," ")
+                    detail=e.response.text[:320].replace("\n"," ")
                     log.warning("AI_PROVIDER_FAILED provider=%s status=%s detail=%s",name,status,detail)
                     if status==429:
-                        PROVIDER_COOLDOWN[name]=time.time()+PROVIDER_COOLDOWN_SECONDS
+                        # A quota/billing exhaustion 429 is not a short rate-limit event.
+                        # Park that provider for several hours so the live chain immediately
+                        # reaches the next healthy provider instead of retrying the dead key.
+                        detail_l=detail.lower()
+                        credit_error=any(k in detail_l for k in (
+                            "no credits","insufficient_quota","quota exceeded","billing","credit balance"
+                        ))
+                        cooldown=CREDIT_EXHAUSTION_COOLDOWN_SECONDS if credit_error else PROVIDER_COOLDOWN_SECONDS
+                        PROVIDER_COOLDOWN[name]=time.time()+cooldown
+                        if credit_error:
+                            log.warning("AI_PROVIDER_QUOTA_DISABLED provider=%s cooldown=%.0fs",name,cooldown)
                     elif status in (408,425,500,502,503,504):
-                        # Do not hammer a transiently overloaded provider during the same
-                        # 40-second live window; immediately continue to the next provider.
-                        PROVIDER_COOLDOWN[name]=time.time()+TRANSIENT_COOLDOWN_SECONDS
+                        # Transient provider faults are skipped immediately. A slightly longer
+                        # cool-down than before prevents repeated 503 bursts while preserving
+                        # the live failover path.
+                        transient_cooldown=30.0 if status in (502,503,504) else TRANSIENT_COOLDOWN_SECONDS
+                        PROVIDER_COOLDOWN[name]=time.time()+transient_cooldown
                     elif status==413:
                         # Payload-size errors are deterministic for this provider/request.
                         # Short cooldown prevents repeated 413s from consuming the window.
