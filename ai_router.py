@@ -9,6 +9,7 @@ PROVIDER_COOLDOWN={}
 PROVIDER_COOLDOWN_SECONDS=120.0
 TRANSIENT_COOLDOWN_SECONDS=10.0
 CREDIT_EXHAUSTION_COOLDOWN_SECONDS=21600.0
+ACCESS_DENIED_COOLDOWN_SECONDS=3600.0
 DEFAULT_FALLBACKS=("GROQ","OPENROUTER","NVIDIA","MISTRAL","GEMINI","NARAROUTER","OPENAI")
 PROVIDER_LOCKS={}
 ANALYSIS_SEMAPHORE=asyncio.Semaphore(3)
@@ -117,8 +118,8 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                 "confidence 0-100, and reason. This is DEMO read-only; never trade.\n"+
                 json.dumps(request,ensure_ascii=False,separators=(",",":")))
     last=None
-    http_timeout=min(3.0,max(1.5,float(os.getenv("AI_HTTP_TIMEOUT","2.0"))))
-    connect_timeout=min(1.0,http_timeout)
+    http_timeout=min(2.0,max(0.9,float(os.getenv("AI_HTTP_TIMEOUT","1.2"))))
+    connect_timeout=min(0.8,http_timeout)
 
     async with ANALYSIS_SEMAPHORE:
         log.info("AI_FALLBACK_CHAIN providers=%s",",".join(_providers()))
@@ -195,6 +196,16 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                         # the live failover path.
                         transient_cooldown=30.0 if status in (502,503,504) else TRANSIENT_COOLDOWN_SECONDS
                         PROVIDER_COOLDOWN[name]=time.time()+transient_cooldown
+                    elif status in (401,403):
+                        # Authentication/access failures are deterministic for the current key
+                        # or provider account. Quarantine this provider for the session window
+                        # instead of retrying it for every candidate and consuming the live
+                        # signal qualification budget.
+                        PROVIDER_COOLDOWN[name]=time.time()+ACCESS_DENIED_COOLDOWN_SECONDS
+                        log.warning(
+                            "AI_PROVIDER_ACCESS_DISABLED provider=%s status=%s cooldown=%.0fs",
+                            name,status,ACCESS_DENIED_COOLDOWN_SECONDS
+                        )
                     elif status==413:
                         # Payload-size errors are deterministic for this provider/request.
                         # Short cooldown prevents repeated 413s from consuming the window.
