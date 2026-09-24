@@ -1283,13 +1283,10 @@ def build_assets(client=None,raw=None):
         verified=verified_by_pair[key]
         unavailable_reason=broker_unavailable_reason(x)
         closure_reason=known_broker_closure_reason(p)
-        if unavailable_reason or closure_reason:
+        if unavailable_reason:
             rejected.append({
                 "pair":p,
-                "reason":(
-                    f"broker_unavailable:{unavailable_reason}"
-                    if unavailable_reason else closure_reason
-                )
+                "reason":f"broker_unavailable:{unavailable_reason}"
             })
             continue
         api_blocked=False
@@ -1323,10 +1320,12 @@ def build_assets(client=None,raw=None):
             "locked_trading":False,
             "disabled":False,
             "api_blocked":False,
+            "broker_schedule_blocked":bool(closure_reason),
+            "broker_closed_reason":closure_reason,
             "mode":"OTC" if "_OTC" in p.upper() else "REAL",
             "trading_mode":"FLEX_TIME",
             "market_group":verified.get("market_group"),
-            "signal_eligible":not quickler
+            "signal_eligible":not quickler and not bool(closure_reason)
         })
 
     log.info(
