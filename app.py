@@ -4405,11 +4405,15 @@ async def cycle_loop():
                             recovery_remaining
                         )
                         try:
+                            log.info(
+                                "FINAL_RECOVERY_AI_RETRY cycle=%s seeds=%s timeout=%.2f",
+                                cycle_id,len(recovery_seeds),recovery_timeout
+                            )
                             recovered=await asyncio.wait_for(
                                 final_candidate(
                                     require_live_price=False,
                                     deep_analysis=True,
-                                    use_cached_only=True,
+                                    use_cached_only=False,
                                     seed_candidates=recovery_seeds,
                                     return_ranked=True,
                                 ),
