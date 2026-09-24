@@ -1872,7 +1872,7 @@ async def refresh_candles(force=False):
                         # Fetch extra closed history so the forming/current
                         # M1 bar cannot reduce the live Brain input to 59 bars.
                         # AVWAP+Volume Profile requires 60 completed M1 candles.
-                        client.market.get_candles(p,size=60,count=75),
+                        client.market.get_candles(p,size=60,count=120),
                         timeout=2.0
                     )
                     normalized=[]
@@ -2115,50 +2115,49 @@ def _latest_closed_30s_candle(pair,reference_ts=None):
             })
     return _latest_closed_candle_direction(candles)
 
-def _final_delivery_precheck(candidate, reference_ts=None):
-    """Rank already-qualified candidates by the same local evidence used at delivery.
+def _final_delivery_precheck(candidate,reference_ts=None):
+    """Score final delivery readiness using only the locked AVWAP + Volume Profile brain.
 
-    This is a zero-network scheduling aid only. It never changes Brain direction and
-    never bypasses the hard final gate; it simply makes the two broker tick slots more
-    likely to be occupied by candidates that can actually survive delivery checks.
+    This is a zero-network scheduling aid. It must never use the legacy 1m/2m/5s/
+    multi-timeframe confirmation stack for the production AVWAP+VP strategy.
     """
     try:
         pair=str((candidate or {}).get("pair") or "")
         expected=str((candidate or {}).get("direction") or "").upper()
-        if not pair or expected not in {"UP","DOWN"}:
+        strategy=str((candidate or {}).get("strategy") or "").upper()
+        if not pair or expected not in {"UP","DOWN"} or strategy!= "AVWAP_VOLUME_PROFILE":
             return -1000.0
-        reference=time.time() if reference_ts is None else float(reference_ts)
-        closed=_closed_candles(STATE["candles"].get(pair,[]),reference)
-        if len(closed)<45:
-            return -500.0
-        bars2=_aggregate_closed_minutes(closed,2,reference)
-        two=_candle_confirmation_2m(bars2,expected)
-        one=_latest_closed_candle_direction(closed)
-        # Stable 1m/2m candle direction is a deterministic prerequisite for the
-        # exact final send gate; do not spend scarce tick slots on a mismatch.
-        if one.get("direction")!=expected:
-            return -700.0
-        if two.get("candle_direction")!=expected or not two.get("candle_ok"):
-            return -650.0
-        final_mtf=build_multi_timeframe_context(pair,closed,reference,expected)
-        frames=final_mtf.get("frames") or {}
-        higher=[frames.get(f"{m}m",{}) for m in range(5,16)]
-        higher=[x for x in higher if x.get("status")=="READY" and x.get("direction") in {"UP","DOWN"}]
-        align=sum(1 for x in higher if x.get("direction")==expected)
-        opp=sum(1 for x in higher if x.get("direction")!=expected)
-        agreement=align/max(1,len(higher))
+
+        ind=dict((candidate or {}).get("indicators") or (candidate or {}).get("indicator_context") or {})
+        px=float((candidate or {}).get("price") or 0.0)
+        avwap=float(ind.get("anchored_vwap") or candidate.get("avwap") or 0.0)
+        poc=float(ind.get("volume_profile_poc") or candidate.get("poc") or 0.0)
+        vah=float(ind.get("volume_profile_vah") or candidate.get("vah") or 0.0)
+        val=float(ind.get("volume_profile_val") or candidate.get("val") or 0.0)
+        if px<=0 or avwap<=0 or poc<=0:
+            return -900.0
+
+        aligned=(px>avwap and px>poc) if expected=="UP" else (px<avwap and px<poc)
+        if not aligned:
+            return -800.0
+
         score=0.0
-        score += 100.0 if two.get("candle_direction")==expected else -160.0
-        score += 90.0 if one.get("direction")==expected else -140.0
-        if two.get("candle_ok"):
-            score += 30.0
-        else:
-            score -= 45.0
-        if two.get("volume_available"):
-            score += 20.0 if two.get("volume_ok") else -25.0
-        score += agreement*60.0
-        score -= opp*8.0
-        score += min(20.0,float(two.get("body_ratio") or 0.0)*25.0)
+        score+=100.0
+        if bool(ind.get("value_area_acceptance")):
+            score+=35.0
+        if bool(ind.get("level_reclaim")):
+            score+=15.0
+        if bool(ind.get("slope_persistent")):
+            score+=25.0
+        if bool(ind.get("poc_migration_aligned")):
+            score+=20.0
+        if not bool(ind.get("poc_migration_against")):
+            score+=8.0
+        coverage=float(ind.get("volume_coverage") or 0.0)
+        score += 12.0*min(1.0,max(0.0,coverage))
+        if str(ind.get("volume_quality") or "").upper()=="LOW":
+            score-=25.0
+        score+=min(20.0,float(candidate.get("confidence") or 0.0)*0.20)
         return round(score,3)
     except Exception:
         return -900.0
@@ -2569,10 +2568,9 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         # next ranked asset. This prevents one asset's late confirmation failure
         # from suppressing the whole cycle.
         cache_key=(x["pair"],str(x.get("entry_candle_ts")),x.get("direction"))
-        mtf=build_multi_timeframe_context(x["pair"],closed,time.time())
-        x["multi_timeframe"]=mtf
-        x["multi_timeframe_confirmed"]=False
-        x["multi_timeframe_diagnostic"]={"reason":"FINAL_ONLY"}
+        x["multi_timeframe"]={}
+        x["multi_timeframe_confirmed"]=True
+        x["multi_timeframe_diagnostic"]={"reason":"LOCKED_AVWAP_VOLUME_PROFILE_NO_LEGACY_GATE"}
         # The local Candice Brain remains the primary technical engine, but a
         # qualified candidate must now receive a real external AI verification
         # pass when time permits. The verifier gets the same closed-candle
@@ -3166,7 +3164,7 @@ async def cycle_loop():
         trend_name=str(candidate.get("trend_15m") or "").upper()
 
         log.info(
-            "FINAL_2M_VOLUME_BODY_1M_HIGHER_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
+            "FINAL_AVWAP_VOLUME_PROFILE_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
             cycle_id,p,expected,candidate.get("final_delivery_diagnostic") or {}
         )
         if confidence < 90:
@@ -3755,92 +3753,62 @@ async def cycle_loop():
                             for _item in final_items:
                                 p=_item.get("pair")
                                 expected=str(_item.get("direction") or "").upper()
+                                strategy_name=str(_item.get("strategy") or "").upper()
                                 closed_1m=_closed_candles(
                                     STATE["candles"].get(p,[]),final_reference
                                 )
-                                mtf=build_multi_timeframe_context(
-                                    p,closed_1m,final_reference,expected
-                                )
-                                confirmed,confirmation=multi_timeframe_confirmation(
-                                    mtf,expected
-                                )
-                                diag=dict(confirmation or {})
-                                diag["2m_bars"]=len(
-                                    _aggregate_closed_minutes(closed_1m,2,final_reference)
-                                )
-                                reason=None if confirmed else str(
-                                    confirmation.get("reason") or "multi_timeframe_rejected"
-                                )
 
-                                strategy_name=str(_item.get("strategy") or "").upper()
-                                trend_name=str(_item.get("trend_15m") or "").upper()
-                                direction_name=str(_item.get("direction") or "").upper()
-                                body_ratio=float(_item.get("body_ratio") or 0.0)
-                                momentum_norm=float(_item.get("momentum_norm") or 0.0)
-                                efficiency=float(_item.get("efficiency") or 0.0)
-                                structure_quality=float(_item.get("structure_quality") or 0.0)
-                                aligned_recent=int(
-                                    (_item.get("evidence") or {}).get(
-                                        "recent_aligned_candles",0
-                                    ) or 0
-                                )
-                                breakout_distance=float(
-                                    _item.get(
-                                        "breakout_distance_up"
-                                        if direction_name=="UP"
-                                        else "breakout_distance_down"
-                                    ) or 0.0
-                                )
-                                pattern_name=str(_item.get("pattern") or "").upper()
-                                rejection_ok=(
-                                    (direction_name=="UP" and pattern_name=="BULLISH_REJECTION")
-                                    or (direction_name=="DOWN" and pattern_name=="BEARISH_REJECTION")
-                                )
-                                near_level=(
-                                    (direction_name=="UP" and float(_item.get("price") or 0.0) <=
-                                     float(_item.get("support") or 0.0)+float(_item.get("atr") or 0.0)*0.35)
-                                    or
-                                    (direction_name=="DOWN" and float(_item.get("price") or 0.0) >=
-                                     float(_item.get("resistance") or 0.0)-float(_item.get("atr") or 0.0)*0.35)
-                                )
+                                reason=None
+                                diag={}
 
-                                # Final 1-minute breakout quality: reject marginal
-                                # breaks even when higher timeframes happen to agree.
-                                if not reason and strategy_name=="BREAKOUT":
-                                    if (
-                                        breakout_distance<0.20
-                                        or body_ratio<0.60
-                                        or momentum_norm<0.35
-                                        or efficiency<0.40
-                                        or trend_name not in {"UP","DOWN"}
-                                    ):
-                                        reason="breakout_quality_insufficient"
-                                        diag["breakout_distance"]=round(breakout_distance,4)
-                                        diag["body_ratio"]=round(body_ratio,3)
-                                        diag["momentum_norm"]=round(momentum_norm,3)
-                                        diag["efficiency"]=round(efficiency,3)
-
-                                # Final Price Action quality: a lone bullish/bearish
-                                # candle away from support/resistance is not enough for
-                                # a one-minute binary direction.
-                                if not reason and strategy_name=="PRICE_ACTION":
-                                    if (
-                                        structure_quality<0.50
-                                        or aligned_recent<2
-                                        or momentum_norm<0.10
-                                        or not (near_level or rejection_ok)
-                                    ):
-                                        reason="price_action_context_insufficient"
-                                        diag["structure_quality"]=round(structure_quality,3)
-                                        diag["aligned_recent"]=aligned_recent
-                                        diag["momentum_norm"]=round(momentum_norm,3)
-                                        diag["near_level"]=bool(near_level)
-                                        diag["rejection"]=bool(rejection_ok)
+                                if strategy_name=="AVWAP_VOLUME_PROFILE":
+                                    asset=next((a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),None)
+                                    refreshed=analyze_asset(
+                                        asset or {"pair":p,"display_name":p},
+                                        closed_1m,
+                                        STATE["prices"].get(p,(None,None))[0]
+                                    )
+                                    if not refreshed:
+                                        reason="avwap_volume_profile_recheck_failed"
+                                        diag={"closed_1m":len(closed_1m)}
+                                    elif str(refreshed.get("direction") or "").upper()!=expected:
+                                        reason="avwap_volume_profile_direction_changed"
+                                        diag={
+                                            "expected":expected,
+                                            "actual":refreshed.get("direction"),
+                                            "closed_1m":len(closed_1m),
+                                        }
+                                    else:
+                                        # Replace stale candidate features with the fresh
+                                        # closed-candle AVWAP+VP calculation before delivery.
+                                        _item.update(refreshed)
+                                        _item["expiry_minutes"]=1
+                                        _item["qualified_pass"]=pass_no
+                                        _item["deep_verified"]=True
+                                        _item["final_delivery_precheck"]=_final_delivery_precheck(
+                                            _item,final_reference
+                                        )
+                                        diag={
+                                            "engine":"AVWAP_VOLUME_PROFILE",
+                                            "direction":refreshed.get("direction"),
+                                            "confidence":refreshed.get("confidence"),
+                                            "value_area_acceptance":refreshed.get("value_area_acceptance"),
+                                            "level_reclaim":(refreshed.get("indicators") or {}).get("level_reclaim"),
+                                            "slope_persistent":(refreshed.get("indicators") or {}).get("slope_persistent"),
+                                            "poc_migration":(refreshed.get("indicators") or {}).get("profile_poc_migration_norm"),
+                                            "volume_quality":(refreshed.get("indicators") or {}).get("volume_quality"),
+                                            "volume_coverage":(refreshed.get("indicators") or {}).get("volume_coverage"),
+                                            "closed_1m":len(closed_1m),
+                                        }
+                                else:
+                                    reason="legacy_strategy_not_allowed"
+                                    diag={"strategy":strategy_name}
 
                                 _item["final_delivery_confirmed"]=not bool(reason)
-                                _item["final_delivery_confirmation_reason"]=reason or "confirmed"
+                                _item["final_delivery_confirmation_reason"]=reason or "avwap_volume_profile_confirmed"
                                 _item["final_delivery_diagnostic"]=diag
                                 _item["final_delivery_prepared_at"]=final_reference
+
                                 if reason:
                                     log.info(
                                         "FINAL_DELIVERY_PREP_REJECTED cycle=%s pair=%s reason=%s diagnostic=%s",
