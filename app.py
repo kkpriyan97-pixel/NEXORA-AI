@@ -3143,10 +3143,14 @@ async def cycle_loop():
                 prepared_max_age
             )
             return False
-        if not prepared_ok:
+        # AVWAP+Volume Profile is the locked live brain. Do not apply legacy
+        # multi-timeframe/volume/body delivery gates to this strategy.
+        # Fresh authenticated price + closed-candle decision + confidence remain
+        # mandatory.
+        if not prepared_ok and str(candidate.get("strategy") or "").upper()!="AVWAP_VOLUME_PROFILE":
             log.info(
-                "FINAL_2M_VOLUME_BODY_1M_HIGHER_REJECTED cycle=%s pair=%s direction=%s reason=%s diagnostic=%s next_asset=TRUE",
-                cycle_id,p,expected,
+                "FINAL_DELIVERY_CONFIRMATION_REJECTED cycle=%s pair=%s strategy=%s reason=%s diagnostic=%s next_asset=TRUE",
+                cycle_id,p,str(candidate.get("strategy") or ""),
                 candidate.get("final_delivery_confirmation_reason","unknown"),
                 candidate.get("final_delivery_diagnostic") or {}
             )
@@ -3176,7 +3180,13 @@ async def cycle_loop():
             return False
 
         # Only a candidate that survived pass 5 is eligible for final delivery.
-        if int(candidate.get("qualified_pass") or 0) < 4 or not bool(candidate.get("deep_verified")):
+        if (
+            str(candidate.get("strategy") or "").upper()!="AVWAP_VOLUME_PROFILE"
+            and (
+                int(candidate.get("qualified_pass") or 0) < 4
+                or not bool(candidate.get("deep_verified"))
+            )
+        ):
             log.info(
                 "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=not_deep_final_preparation_qualified",
                 cycle_id,p
@@ -4932,31 +4942,21 @@ async def handle_telegram_command(msg):
 
 def format_live_indicator_check(indicators, price_source="authenticated_broker_live_candle"):
     d=dict(indicators or {})
-    ef=float(d.get("ema_fast") or 0.0)
-    es=float(d.get("ema_slow") or 0.0)
-    rv=float(d.get("rsi") or 0.0)
-    sk=float(d.get("stochastic_k") or 0.0)
-    sd=float(d.get("stochastic_d") or 0.0)
-    sc=str(d.get("stochastic_cross") or "NEUTRAL")
-    bs=str(d.get("bollinger_signal") or "UNKNOWN")
-    bp=str(d.get("bollinger_position") or "UNKNOWN")
-    ds=str(d.get("donchian_state") or "UNKNOWN")
-    de="EXPANDING" if bool(d.get("donchian_expansion")) else "FLAT"
-    av=float(d.get("atr") or 0.0)
-    mn=float(d.get("momentum_norm_atr") or 0.0)
-    vr=float(d.get("volatility_ratio") or 0.0)
+    av=float(d.get("anchored_vwap") or 0.0)
+    poc=float(d.get("volume_profile_poc") or 0.0)
+    vah=float(d.get("volume_profile_vah") or 0.0)
+    val=float(d.get("volume_profile_val") or 0.0)
+    slope=float(d.get("avwap_slope") or 0.0)
+    acceptance=bool(d.get("value_area_acceptance"))
     return (
         "🔎 <b>LIVE INDICATOR CHECK</b>\n"
         f"📡 Feed → {price_source}\n"
-        "🕯️ Data → closed M1 + completed 15M blocks\n"
-        f"📊 EMA 9/21 → {ef:.8f} / {es:.8f}\n"
-        f"📉 RSI 14 → {rv:.2f}\n"
-        f"📈 Stochastic 14/3/3 → K {sk:.2f} / D {sd:.2f} / {sc}\n"
-        f"〰️ Bollinger 30/2.2 → {bs} • {bp}\n"
-        f"📏 Donchian 30 → {ds} • {de}\n"
-        f"🌡️ ATR 14 → {av:.8f}\n"
-        f"⚡ Momentum → {mn:.3f} ATR\n"
-        f"🌊 Volatility → {vr:.3f}\n"
+        "🕯️ Data → closed M1 + completed 15M anchor\n"
+        f"📊 Anchored VWAP → {av:.8f}\n"
+        f"📍 Volume Profile POC → {poc:.8f}\n"
+        f"🔺 VAH → {vah:.8f} • 🔻 VAL → {val:.8f}\n"
+        f"↗️ AVWAP Slope → {slope:.8f}\n"
+        f"✅ Value Area Acceptance → {'YES' if acceptance else 'NO'}\n"
     )
 
 def format_candice_signal_message(s, indicator_check, ts, target):
@@ -4977,7 +4977,7 @@ def format_candice_signal_message(s, indicator_check, ts, target):
         f"🧠 Strategy → {s.strategy}\n\n"
         f"🟣 FLEX PROTOCOL • MANUAL ENTRY\n"
         f"🔎 Candice 5-Scan → {CYCLE_SCAN_COUNT}/{CYCLE_SCAN_COUNT} complete\n"
-        f"🧠 Strategies Checked → 8\n"
+        f"🧠 Technical Brain → AVWAP + Volume Profile only\n"
         f"🤖 Candice Brain • LIVE"
     )
 
