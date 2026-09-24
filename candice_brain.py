@@ -10,6 +10,7 @@ Bollinger/Stochastic strategy families.
 """
 from __future__ import annotations
 
+import logging
 import time
 from math import isfinite
 
@@ -22,6 +23,18 @@ PROFILE_LOOKBACK=60
 PROFILE_BINS=24
 VALUE_AREA_FRACTION=0.70
 ALLOWED_STRATEGY="AVWAP_VOLUME_PROFILE"
+log=logging.getLogger("candice.brain")
+_DIAG_LAST={}
+
+def _diag(pair, reason, **fields):
+    now=time.time()
+    key=(str(pair),str(reason))
+    last=_DIAG_LAST.get(key,0.0)
+    if now-last<60.0:
+        return
+    _DIAG_LAST[key]=now
+    log.info("AVWAP_VP_DIAGNOSTIC pair=%s reason=%s fields=%s",pair,reason,fields)
+
 
 
 def _f(value, default=0.0):
@@ -188,12 +201,15 @@ def analyze_asset(
         return None
 
     now=time.time()
+    pair=str(asset.get("pair") or "")
     cs=_closed_1m(candles,now)
     if len(cs)<MIN_CLOSED_CANDLES:
+        _diag(pair,"history_short",closed=len(cs),required=MIN_CLOSED_CANDLES)
         return None
 
     blocks=_complete_15m_blocks(cs,now)
     if not blocks:
+        _diag(pair,"no_complete_15m_block",closed=len(cs),unique_minutes=len({int(x["time"]) for x in cs}))
         return None
 
     last=cs[-1]
@@ -202,6 +218,7 @@ def analyze_asset(
     previous_avwap,_=_anchored_vwap(cs[:-1],anchor_ts)
     profile=_volume_profile(cs)
     if avwap<=0 or not profile:
+        _diag(pair,"invalid_avwap_or_profile",avwap=avwap,profile=bool(profile))
         return None
 
     px=float(last["close"])
@@ -213,6 +230,7 @@ def analyze_asset(
     up=px>avwap and px>poc
     down=px<avwap and px<poc
     if not (up or down):
+        _diag(pair,"no_two_indicator_alignment",price=round(px,10),avwap=round(avwap,10),poc=round(poc,10),vah=round(vah,10),val=round(val,10))
         return None
 
     direction="UP" if up else "DOWN"
