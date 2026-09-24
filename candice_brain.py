@@ -417,6 +417,24 @@ def analyze_asset(
         "LOWER_VALUE" if px<poc else "AT_POC"
     )
 
+    # LIVE EXACT-SETUP FILTER:
+    # Only the exact point identified by the current result analysis enters the
+    # live selector: ABOVE_VALUE + no level reclaim + persistent AVWAP slope.
+    # This is an empirical qualification rule, not a promise of future wins.
+    exact_live_setup=(
+        direction=="UP"
+        and value_position=="ABOVE_VALUE"
+        and level_reclaim is False
+        and slope_persistent is True
+    )
+    if not exact_live_setup:
+        _diag(
+            pair,"exact_live_setup_rejected",
+            direction=direction,value_position=value_position,
+            level_reclaim=level_reclaim,slope_persistent=slope_persistent
+        )
+        return None
+
     coverage=float(profile.get("volume_coverage") or 0.0)
     # Real/tick volume is preferred. A sparse volume source remains visible to
     # the learner and costs score, but does not silently disappear.
@@ -487,6 +505,7 @@ def analyze_asset(
         "value_area_acceptance":value_acceptance,
         "level_reclaim":level_reclaim,
         "slope_persistent":slope_persistent,
+        "exact_live_setup":exact_live_setup,
         "poc_migration_aligned":migration_aligned,
         "poc_migration_against":migration_against,
         "anchor_15m_start_ts":anchor_ts,
