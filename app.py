@@ -3366,6 +3366,35 @@ async def cycle_loop():
                 )
                 return False
 
+            # The 1-minute continuation check is part of the exact setup. At the
+            # delivery boundary, the authenticated live quote must not have fallen
+            # below the closed candle that qualified the setup.
+            closed_setup_price=float(candidate.get("price") or 0.0)
+            continuation_ok=(
+                bool(ind.get("m1_continuation_ok"))
+                and expected=="UP"
+                and closed_setup_price>0.0
+                and entry>=closed_setup_price
+            )
+            if not continuation_ok:
+                log.info(
+                    "FINAL_LIVE_AVWAP_VP_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=m1_continuation_failed_or_reversed entry=%s closed_setup_price=%s "
+                    "continuation=%s next_asset=TRUE",
+                    cycle_id,p,expected,entry,closed_setup_price,
+                    ind.get("m1_continuation_ok")
+                )
+                return False
+
+            if ind.get("real_volume_verified") is not True:
+                log.info(
+                    "FINAL_LIVE_AVWAP_VP_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=real_volume_not_verified volume_quality=%s coverage=%s next_asset=TRUE",
+                    cycle_id,p,expected,ind.get("volume_quality"),
+                    ind.get("volume_coverage")
+                )
+                return False
+
         log.info(
             "FINAL_AVWAP_VOLUME_PROFILE_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
             cycle_id,p,expected,candidate.get("final_delivery_diagnostic") or {}

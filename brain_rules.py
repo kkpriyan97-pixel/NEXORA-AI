@@ -773,19 +773,19 @@ class BrainState:
         # empirical win probability.
         x["confidence"]=max(0,min(99,int(round(x["market_quality"]+calibration_penalty))))
 
-        # Exact-setup asset reliability is a bounded ranking aid. It uses only
-        # this asset + direction + strategy + 1-minute history and the exact
-        # indicator-context history, so unrelated setups cannot transfer wins.
-        pair_bucket=self.stats.get((pair,strategy,direction,1))
-        pair_n=float(pair_bucket.get("n",0) or 0) if pair_bucket else 0.0
-        pair_rate=self._rate(pair_bucket) if pair_bucket and pair_n>=5 else 0.5
+        # Exact-setup asset reliability is now context-only. Broad pair history
+        # is intentionally excluded because the same pair can alternate between
+        # very different AVWAP/Volume Profile states.
         ind_bucket=self.indicator_stats.get(self.vp_context_key(preview["indicator_context"]))
         ind_n=float(ind_bucket.get("n",0) or 0) if ind_bucket else 0.0
         ind_rate=self._rate(ind_bucket) if ind_bucket and ind_n>=8 else 0.5
-        exact_reliability=(0.70*pair_rate)+(0.30*ind_rate)
+        meta_bucket=self.meta_stats.get(self.meta_context_key(preview["indicator_context"]))
+        meta_n=float(meta_bucket.get("n",0) or 0) if meta_bucket else 0.0
+        meta_rate=self._rate(meta_bucket) if meta_bucket and meta_n>=8 else 0.5
+        exact_reliability=(0.55*ind_rate)+(0.45*meta_rate)
         reliability_bonus=max(-6.0,min(6.0,(exact_reliability-0.50)*24.0))
         x["exact_setup_reliability"]=round(exact_reliability,4)
-        x["exact_setup_reliability_samples"]=int(pair_n+ind_n)
+        x["exact_setup_reliability_samples"]=int(ind_n+meta_n)
         x["exact_setup_rank_score"]=round(
             float(x.get("confidence") or 0)+reliability_bonus,
             3

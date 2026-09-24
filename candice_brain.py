@@ -436,9 +436,40 @@ def analyze_asset(
         return None
 
     coverage=float(profile.get("volume_coverage") or 0.0)
-    # Real/tick volume is preferred. A sparse volume source remains visible to
-    # the learner and costs score, but does not silently disappear.
+    # The live AVWAP + Volume Profile signal must be backed by real/tick activity.
+    # When the broker provides no usable volume, the profile falls back to an
+    # equal-activity proxy; that proxy is learning-only and cannot qualify a live
+    # 1-minute signal.
     volume_quality="HIGH" if coverage>=0.80 else "MEDIUM" if coverage>=0.50 else "LOW"
+    if coverage<0.80:
+        _diag(
+            pair,"real_volume_required",
+            coverage=round(coverage,3),
+            volume_bars=int(profile.get("volume_bars") or 0),
+            volume_mode=profile.get("volume_mode"),
+        )
+        return None
+
+    # One-minute continuation guard: the exact setup must still have upward
+    # closed-M1 continuation at the decision candle. This is a zero-network
+    # price-action check on the same closed candles already used by the Brain.
+    last_open=float(last["open"])
+    last_close=float(last["close"])
+    previous_close=float(previous["close"])
+    m1_continuation_ok=(
+        direction=="UP"
+        and last_close>=last_open
+        and last_close>previous_close
+    )
+    if not m1_continuation_ok:
+        _diag(
+            pair,"m1_continuation_failed",
+            direction=direction,
+            last_open=round(last_open,10),
+            last_close=round(last_close,10),
+            previous_close=round(previous_close,10),
+        )
+        return None
 
     # A one-minute expiry benefits from directional acceptance or a genuine
     # reclaim of AVWAP/POC. A mere location above/below both levels while still
@@ -501,6 +532,8 @@ def analyze_asset(
         "volume_bars":int(profile.get("volume_bars") or 0),
         "volume_mode":profile.get("volume_mode"),
         "volume_quality":volume_quality,
+        "real_volume_verified":True,
+        "m1_continuation_ok":m1_continuation_ok,
         "value_position":value_position,
         "value_area_acceptance":value_acceptance,
         "level_reclaim":level_reclaim,
