@@ -10,6 +10,11 @@ PROVIDER_COOLDOWN_SECONDS=120.0
 TRANSIENT_COOLDOWN_SECONDS=10.0
 CREDIT_EXHAUSTION_COOLDOWN_SECONDS=21600.0
 ACCESS_DENIED_COOLDOWN_SECONDS=3600.0
+# When every configured AI provider is already cooling down or has just failed,
+# short-circuit subsequent verifier calls so the live 3-minute scheduler does not
+# spend its qualification budget retrying a dead provider chain.
+GLOBAL_CHAIN_COOLDOWN_UNTIL=0.0
+GLOBAL_CHAIN_COOLDOWN_SECONDS=15.0
 DEFAULT_FALLBACKS=("GROQ","NARAROUTER","OPENROUTER","NVIDIA","MISTRAL","GEMINI","OPENAI")
 PROVIDER_LOCKS={}
 try:
@@ -90,7 +95,14 @@ def _content_json(content:Any)->dict[str,Any]:
         raise
 
 async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
+    global GLOBAL_CHAIN_COOLDOWN_UNTIL
     # External LLM verification runs here when enabled, but is never authoritative.
+    # A recent all-provider failure opens a very short circuit; local Candice
+    # qualification remains available and the strict proxy-volume fallback gate
+    # still requires the existing local threshold.
+    if time.time() < GLOBAL_CHAIN_COOLDOWN_UNTIL:
+        log.info("AI_GLOBAL_CHAIN_COOLDOWN remaining=%.2fs",max(0.0,GLOBAL_CHAIN_COOLDOWN_UNTIL-time.time()))
+        return None
     # Tight timeouts, cooldowns and fail-open fallback preserve deterministic delivery.
     if not LIVE_EXTERNAL_AI_ENABLED:
         log.info("AI_LIVE_EXTERNAL_DISABLED reason=signal_cycle_isolation")
@@ -226,6 +238,8 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                         PROVIDER_COOLDOWN[name]=time.time()+TRANSIENT_COOLDOWN_SECONDS
                     continue
     if last:
+        GLOBAL_CHAIN_COOLDOWN_UNTIL=time.time()+GLOBAL_CHAIN_COOLDOWN_SECONDS
+        log.warning("AI_GLOBAL_CHAIN_COOLDOWN_OPEN seconds=%.1f reason=all_configured_providers_failed",GLOBAL_CHAIN_COOLDOWN_SECONDS)
         raise RuntimeError(f"All configured AI providers failed: {type(last).__name__}")
     log.warning("AI_NO_CONFIGURED_PROVIDER providers=%s",",".join(_providers()))
     return None
