@@ -9,7 +9,8 @@ from research_brain import research_status, TARGET_DAYS as RESEARCH_TARGET_DAYS
 COOLDOWN_SECONDS = 600
 MIN_CONFIDENCE = 90
 CYCLE_SECONDS = 180
-EXPIRIES = (1, 2, 3, 4, 5, 10, 15)
+EXPIRIES = (1,)
+ALLOWED_STRATEGY = "AVWAP_VOLUME_PROFILE"
 
 def utc_now():
     return datetime.now(timezone.utc).timestamp()
@@ -511,8 +512,11 @@ class BrainState:
         return max(-8.0,min(8.0,base_bonus+strategy_bonus+pattern_bonus+context_bonus+indicator_bonus))
 
     def choose_expiry(self,pair,strategy,direction,live_quality=0,allow_5m=False):
-        """Choose expiry from strategy-local evidence; 5m is a locked/rare path."""
-        strategy=str(strategy)
+        """Choose expiry from strategy-local evidence."""
+        strategy=str(strategy).upper().strip()
+        # Live signal expiry is fixed at 1 minute for the two-indicator brain.
+        if strategy==ALLOWED_STRATEGY:
+            return 1
         direction=str(direction).upper()
         base={
             "BREAKOUT":1,"PULLBACK":2,"REVERSAL":3,"MEAN_REVERSION":3,
@@ -629,7 +633,11 @@ class BrainState:
     def adaptive_candidate(self,c):
         x=dict(c)
         pair=str(x.get("pair",""))
-        strategy=str(x.get("strategy",""))
+        strategy=str(x.get("strategy","")).upper().strip()
+        if strategy!=ALLOWED_STRATEGY:
+            return {}
+        x["strategy"]=ALLOWED_STRATEGY
+        x["expiry_minutes"]=1
         direction=str(x.get("direction","")).upper()
         self_strategy=str(x.get("self_strategy") or strategy)
 
@@ -764,11 +772,10 @@ class BrainState:
             if float(u)<=now:self.cooldown_until.pop(p,None)
 
 def rank_signal_candidates(candidates):
-    # Do not hard-block on a momentary tick-direction disagreement here.
-    # The independent pre-signal AI verifier is responsible for checking
-    # that exact live direction conflict, while this ranking layer remains
-    # permissive so a transient tick refresh cannot erase the cycle.
-    q=[x for x in candidates if int(x.get("confidence") or 0)>=MIN_CONFIDENCE
+    # Only the production two-indicator brain can enter delivery.
+    q=[x for x in candidates
+       if str(x.get("strategy","")).upper()==ALLOWED_STRATEGY
+       and int(x.get("confidence") or 0)>=MIN_CONFIDENCE
        and str(x.get("direction","")).upper() in {"UP","DOWN"}
        and not bool(x.get("ai_learning_blocked"))]
     return sorted(q,key=lambda x:(
