@@ -4983,14 +4983,15 @@ def format_candice_signal_message(s, indicator_check, ts, target):
     # Telegram HTML has no font-size control, so use Unicode bold glyphs
     # and isolated lines to make the direction and entry time visually dominant.
     direction_focus = "🟢 𝗨𝗣" if direction == "UP" else "🔴 𝗗𝗢𝗪𝗡"
-    entry_focus = f"🎯 𝗘𝗡𝗧𝗥𝗬  𝟭𝟲:𝟮𝟰:𝟬𝟬" if False else f"🎯 𝗘𝗡𝗧𝗥𝗬  {uae_time(target)} UAE"
+    bold_digits = str.maketrans("0123456789", "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵")
+    entry_time = uae_time(target).translate(bold_digits)
     return (
         "🚨 <b>CANDICE AI</b>\n"
         "💎 <b>PRO SIGNAL</b>\n\n"
         f"📊 <b>{s.display_name}</b>\n\n"
         f"<b>{direction_focus}</b>\n"
         "⏱️ <b>𝟭 𝗠𝗜𝗡</b>\n\n"
-        f"<b>{entry_focus}</b>\n\n"
+        f"🎯 <b>𝗘𝗡𝗧𝗥𝗬</b>\n"\n        f"<b>{entry_time} UAE</b>\n\n"
         f"💰 Reference → <code>{s.entry_price}</code>\n"
         f"⚡ Confidence → <b>{s.confidence}%</b>\n\n"
         f"📈 15M Bias → <b>{trend_label}</b>\n"
