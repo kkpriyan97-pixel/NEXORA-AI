@@ -438,19 +438,19 @@ def analyze_asset(
         return None
 
     coverage=float(profile.get("volume_coverage") or 0.0)
-    # The live AVWAP + Volume Profile signal must be backed by real/tick activity.
-    # When the broker provides no usable volume, the profile falls back to an
-    # equal-activity proxy; that proxy is learning-only and cannot qualify a live
-    # 1-minute signal.
+    # Broker candle feeds may expose no usable volume (coverage=0). In that case
+    # Volume Profile is computed from equal-activity bars as a clearly labelled
+    # proxy. The proxy is NEVER treated as real volume: live delivery requires
+    # strict external-AI verification later in app.py.
     volume_quality="HIGH" if coverage>=0.80 else "MEDIUM" if coverage>=0.50 else "LOW"
-    if coverage<0.80:
+    volume_proxy_mode=coverage<0.80
+    if volume_proxy_mode:
         _diag(
-            pair,"real_volume_required",
+            pair,"volume_proxy_candidate",
             coverage=round(coverage,3),
             volume_bars=int(profile.get("volume_bars") or 0),
             volume_mode=profile.get("volume_mode"),
         )
-        return None
 
     # One-minute continuation guard: the exact setup must still have upward
     # closed-M1 continuation at the decision candle. This is a zero-network
@@ -504,8 +504,11 @@ def analyze_asset(
         score+=2
     if coverage>=0.80:
         score+=1
-    if coverage<0.50:
-        score-=2
+    elif volume_proxy_mode:
+        # Proxy-volume candidates need independent verification and therefore
+        # start below true-volume candidates in ranking.
+        score-=3
+
     confidence=min(99,max(0,int(score)))
 
     trend="AVWAP_BULLISH" if up else "AVWAP_BEARISH"
@@ -535,7 +538,8 @@ def analyze_asset(
         "volume_bars":int(profile.get("volume_bars") or 0),
         "volume_mode":profile.get("volume_mode"),
         "volume_quality":volume_quality,
-        "real_volume_verified":True,
+        "real_volume_verified":not volume_proxy_mode,
+        "volume_proxy_mode":volume_proxy_mode,
         "m1_continuation_ok":m1_continuation_ok,
         "value_position":value_position,
         "value_area_acceptance":value_acceptance,

@@ -2819,6 +2819,40 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         trend_name=str(x.get("trend_15m") or "").upper()
         evidence=x.get("evidence") or {}
 
+        # Strict proxy-volume fallback for brokers that expose zero candle volume.
+        # Preliminary scans may carry the candidate, but a proxy-volume setup is
+        # live-eligible only after deep external-AI direction verification. The AI
+        # never changes the Candice Brain direction; disagreement vetoes the setup.
+        if strategy_name=="AVWAP_VOLUME_PROFILE":
+            ind_ctx=dict(x.get("indicators") or x.get("indicator_context") or {})
+            proxy_volume=(ind_ctx.get("real_volume_verified") is not True)
+            local["volume_proxy_mode"]=bool(proxy_volume)
+            local["volume_proxy_ai_verified"]=False
+            if proxy_volume and deep_analysis:
+                ai_verified=(
+                    isinstance(d,dict)
+                    and str(d.get("direction") or "").upper()==str(x.get("direction") or "").upper()
+                    and int(float(d.get("confidence") or 0))>=80
+                )
+                if not ai_verified:
+                    log.info(
+                        "AI_PROXY_VOLUME_VETO pair=%s local_direction=%s "
+                        "reason=no_strict_same_direction_verification provider=%s ai_direction=%s ai_confidence=%s",
+                        x.get("pair"),x.get("direction"),
+                        d.get("provider") if isinstance(d,dict) else "NONE",
+                        d.get("direction") if isinstance(d,dict) else "NONE",
+                        d.get("confidence") if isinstance(d,dict) else 0
+                    )
+                    CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
+                    return None
+                local["volume_proxy_ai_verified"]=True
+                local["volume_proxy_ai_confidence"]=int(float(d.get("confidence") or 0))
+                log.info(
+                    "AI_PROXY_VOLUME_VERIFIED pair=%s direction=%s ai_confidence=%s provider=%s",
+                    x.get("pair"),x.get("direction"),
+                    local["volume_proxy_ai_confidence"],d.get("provider")
+                )
+
         # Weak momentum inside a SIDEWAYS 15m regime produced two of the
         # consecutive losses. Keep this as a local zero-latency qualification
         # gate; it does not alter cycle scheduling or add a network request.
@@ -3395,12 +3429,19 @@ async def cycle_loop():
                 )
                 return False
 
-            if ind.get("real_volume_verified") is not True:
+            real_volume_ok=(ind.get("real_volume_verified") is True)
+            proxy_volume_ok=(
+                str(ind.get("volume_mode") or "").upper()=="M1_EQUAL_ACTIVITY_PROXY"
+                and candidate.get("volume_proxy_ai_verified") is True
+                and int(candidate.get("volume_proxy_ai_confidence") or 0)>=80
+            )
+            if not real_volume_ok and not proxy_volume_ok:
                 log.info(
                     "FINAL_LIVE_AVWAP_VP_REJECTED cycle=%s pair=%s direction=%s "
-                    "reason=real_volume_not_verified volume_quality=%s coverage=%s next_asset=TRUE",
+                    "reason=volume_verification_failed volume_quality=%s coverage=%s proxy_ai_verified=%s next_asset=TRUE",
                     cycle_id,p,expected,ind.get("volume_quality"),
-                    ind.get("volume_coverage")
+                    ind.get("volume_coverage"),
+                    candidate.get("volume_proxy_ai_verified",False)
                 )
                 return False
 
