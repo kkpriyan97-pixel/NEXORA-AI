@@ -145,7 +145,7 @@ async def check_broker_asset_tradeability(pair, cycle_id=None, force=False):
             asset["broker_tradeable"]=result
             asset["broker_tradeability_checked_at"]=float(cached.get("checked_at") or now)
             asset["broker_tradeability_source"]="cache"
-            asset["signal_eligible"]=bool(asset.get("signal_eligible",True)) and result
+            asset["broker_tradeable"]=result
         if not result:
             STATE.get("analyses",{}).pop(p,None)
         return result
@@ -174,7 +174,7 @@ async def check_broker_asset_tradeability(pair, cycle_id=None, force=False):
             asset["broker_tradeable"]=tradeable
             asset["broker_tradeability_checked_at"]=checked_at
             asset["broker_tradeability_source"]="event95+event80"
-            asset["signal_eligible"]=bool(asset.get("signal_eligible",True)) and tradeable
+            asset["broker_tradeable"]=tradeable
         if not tradeable:
             STATE.get("analyses",{}).pop(p,None)
         log.info(
