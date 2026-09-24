@@ -99,6 +99,121 @@ CYCLE_SCAN_COUNT=len(CYCLE_SCAN_OFFSETS)
 # DEMO/testing override only. When enabled, the normal daytime signal scheduler
 # may run outside the UAE 06:00–18:00 window. It does NOT enable broker auto-trading.
 FORCE_SIGNAL_MODE=os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}
+ASSET_TRADEABILITY_PROBE_TIMEOUT=1.5
+ASSET_TRADEABILITY_CACHE_TTL=45.0
+ASSET_TRADEABILITY_HARD_MAX_AGE=50.0
+ASSET_TRADEABILITY_CACHE={}
+
+def broker_unavailable_reason(item):
+    """Return a broker-provided temporary/unavailable reason, or empty string."""
+    if not isinstance(item,dict):
+        return "invalid_asset_record"
+    if item.get("disabled") is True:
+        return "disabled"
+    if item.get("locked") is True:
+        return "locked"
+    if item.get("locked_trading") is True:
+        return "locked_trading"
+    for key in ("active","available","tradable","is_active","is_available","is_tradable"):
+        if key in item and item.get(key) is False:
+            return f"{key}=false"
+    status=str(item.get("status") or item.get("state") or "").strip().lower()
+    if status in {"disabled","locked","inactive","unavailable","closed","off"}:
+        return status
+    return ""
+
+async def check_broker_asset_tradeability(pair, cycle_id=None, force=False):
+    """Fresh authenticated broker check used as the final tradability safety gate."""
+    p=str(pair or "").strip()
+    now=time.time()
+    if not p or not CLIENT or not getattr(CLIENT,"account_id",None):
+        return False
+    cached=ASSET_TRADEABILITY_CACHE.get(p)
+    if (
+        not force
+        and isinstance(cached,dict)
+        and now-float(cached.get("checked_at") or 0.0) <= ASSET_TRADEABILITY_CACHE_TTL
+    ):
+        result=bool(cached.get("tradeable"))
+        log.info(
+            "BROKER_TRADEABILITY_CHECK cycle=%s pair=%s tradeable=%s source=cache age=%.2f reason=%s",
+            cycle_id,p,result,max(0.0,now-float(cached.get("checked_at") or now)),
+            cached.get("reason") or "cached"
+        )
+        asset=next((a for a in STATE.get("assets") or [] if str(a.get("pair"))==p),None)
+        if asset is not None:
+            asset["broker_tradeable"]=result
+            asset["broker_tradeability_checked_at"]=float(cached.get("checked_at") or now)
+            asset["broker_tradeability_source"]="cache"
+            asset["signal_eligible"]=bool(asset.get("signal_eligible",True)) and result
+        if not result:
+            STATE.get("analyses",{}).pop(p,None)
+        return result
+
+    method=getattr(getattr(CLIENT,"market",None),"probe_asset_tradeability",None)
+    if not callable(method):
+        log.warning(
+            "BROKER_TRADEABILITY_CHECK pair=%s tradeable=False source=unavailable reason=probe_method_missing",
+            p
+        )
+        return False
+    try:
+        strike=await asyncio.wait_for(
+            method(p,category="digital",timeout=ASSET_TRADEABILITY_PROBE_TIMEOUT),
+            timeout=ASSET_TRADEABILITY_PROBE_TIMEOUT+1.0,
+        )
+        tradeable=isinstance(strike,dict)
+        checked_at=time.time()
+        reason="" if tradeable else "event95_or_event80_rejected"
+        ASSET_TRADEABILITY_CACHE[p]={
+            "tradeable":tradeable,"checked_at":checked_at,
+            "reason":reason,"source":"event95+event80"
+        }
+        asset=next((a for a in STATE.get("assets") or [] if str(a.get("pair"))==p),None)
+        if asset is not None:
+            asset["broker_tradeable"]=tradeable
+            asset["broker_tradeability_checked_at"]=checked_at
+            asset["broker_tradeability_source"]="event95+event80"
+            asset["signal_eligible"]=bool(asset.get("signal_eligible",True)) and tradeable
+        if not tradeable:
+            STATE.get("analyses",{}).pop(p,None)
+        log.info(
+            "BROKER_TRADEABILITY_CHECK cycle=%s pair=%s tradeable=%s source=event95+event80 reason=%s",
+            cycle_id,p,tradeable,reason or "fresh_strike_confirmed"
+        )
+        return tradeable
+    except Exception as e:
+        checked_at=time.time()
+        reason=f"{type(e).__name__}:{str(e)[:100]}"
+        ASSET_TRADEABILITY_CACHE[p]={
+            "tradeable":False,"checked_at":checked_at,
+            "reason":reason,"source":"event95+event80"
+        }
+        asset=next((a for a in STATE.get("assets") or [] if str(a.get("pair"))==p),None)
+        if asset is not None:
+            asset["broker_tradeable"]=False
+            asset["broker_tradeability_checked_at"]=checked_at
+            asset["broker_tradeability_source"]="event95+event80"
+            asset["signal_eligible"]=False
+        STATE.get("analyses",{}).pop(p,None)
+        log.info(
+            "BROKER_TRADEABILITY_CHECK cycle=%s pair=%s tradeable=False source=event95+event80 reason=%s",
+            cycle_id,p,reason
+        )
+        return False
+
+def broker_tradeability_fresh(pair, reference_ts=None):
+    p=str(pair or "").strip()
+    rec=ASSET_TRADEABILITY_CACHE.get(p)
+    if not isinstance(rec,dict) or not bool(rec.get("tradeable")):
+        return False
+    ref=time.time() if reference_ts is None else float(reference_ts)
+    try:
+        age=ref-float(rec.get("checked_at") or 0.0)
+    except (TypeError,ValueError):
+        return False
+    return 0.0<=age<=ASSET_TRADEABILITY_HARD_MAX_AGE
+
 
 def signal_session_active(ts=None):
     if FORCE_SIGNAL_MODE:
@@ -1128,18 +1243,14 @@ def build_assets(client=None,raw=None):
 
         seen.add(key)
         verified=verified_by_pair[key]
-        api_blocked=bool(
-            x.get("disabled") is True
-            or x.get("locked") is True
-            or x.get("locked_trading") is True
-            or any(
-                x.get(k) is False for k in
-                ("active","available","tradable","is_active","is_available","is_tradable")
-                if k in x
-            )
-            or str(x.get("status") or x.get("state") or "").strip().lower()
-                in {"disabled","locked","inactive","unavailable","closed","off"}
-        )
+        unavailable_reason=broker_unavailable_reason(x)
+        if unavailable_reason:
+            rejected.append({
+                "pair":p,
+                "reason":f"broker_unavailable:{unavailable_reason}"
+            })
+            continue
+        api_blocked=False
 
         # The verified account catalog controls the user-facing asset identity;
         # Event-182 supplies the current broker-side profitability/availability
@@ -1166,14 +1277,14 @@ def build_assets(client=None,raw=None):
             "title":title,
             "signal_asset_label":title,
             "profitability":profitability,
-            "locked":bool(x.get("locked") is True),
-            "locked_trading":bool(x.get("locked_trading") is True),
-            "disabled":bool(x.get("disabled") is True),
-            "api_blocked":api_blocked,
+            "locked":False,
+            "locked_trading":False,
+            "disabled":False,
+            "api_blocked":False,
             "mode":"OTC" if "_OTC" in p.upper() else "REAL",
             "trading_mode":"FLEX_TIME",
             "market_group":verified.get("market_group"),
-            "signal_eligible":not quickler and not api_blocked
+            "signal_eligible":not quickler
         })
 
     log.info(
@@ -1194,7 +1305,7 @@ def build_assets(client=None,raw=None):
 async def sync_account_assets(client, reason="periodic"):
     if not client or not client.account_id: return False
     try:
-        raw=await asyncio.wait_for(client.market.get_profitability(client.account_id),timeout=10.0)
+        raw=await asyncio.wait_for(client.market.get_available_assets(client.account_id),timeout=10.0)
     except Exception as e:
         log.warning("ACCOUNT_ASSET_SYNC_FAILED account_id=%s reason=%s type=%s message=%s",
                     client.account_id,reason,type(e).__name__,str(e)[:160]); return False
@@ -1253,10 +1364,20 @@ async def on_asset_update(message):
             merged["display_name"]=title
             merged["title"]=title
             merged["signal_asset_label"]=title
-        for key in ("profitability","locked","locked_trading","disabled"):
+        for key in (
+            "profitability","locked","locked_trading","disabled",
+            "active","available","tradable","is_active","is_available",
+            "is_tradable","status","state"
+        ):
             if key in x:
                 merged[key]=x.get(key)
+        blocked_reason=broker_unavailable_reason(merged)
+        merged["api_blocked"]=bool(blocked_reason)
+        merged["signal_eligible"]=not bool(blocked_reason)
         current[p]=merged
+        if blocked_reason:
+            STATE.get("analyses",{}).pop(p,None)
+            ASSET_TRADEABILITY_CACHE.pop(p,None)
         updated+=1
     if updated:
         # Asset event updates are intentionally ignored as a universe change.
@@ -3071,6 +3192,13 @@ async def cycle_loop():
 
         p=candidate["pair"]
         expected=str(candidate.get("direction") or "").upper()
+        if not broker_tradeability_fresh(p,time.time()):
+            log.info(
+                "SIGNAL_DELIVERY_BLOCKED_BROKER_NOT_TRADABLE cycle=%s pair=%s "
+                "reason=missing_stale_or_negative_probe next_asset=TRUE",
+                cycle_id,p
+            )
+            return False
         now=time.time()
 
         # Delivery boundary must be zero-network and bounded. Pass 5 is
@@ -3800,6 +3928,31 @@ async def cycle_loop():
                                 p=_item.get("pair")
                                 expected=str(_item.get("direction") or "").upper()
                                 strategy_name=str(_item.get("strategy") or "").upper()
+
+                                if not await check_broker_asset_tradeability(
+                                    p,cycle_id=cycle_id,force=True
+                                ):
+                                    _item["broker_tradeable"]=False
+                                    _item["broker_tradeability_checked_at"]=time.time()
+                                    _item["broker_tradeability_source"]="event95+event80"
+                                    _item["final_delivery_confirmed"]=False
+                                    _item["final_delivery_confirmation_reason"]="broker_asset_not_tradeable"
+                                    _item["final_delivery_diagnostic"]={
+                                        "broker_tradeable":False,
+                                        "source":"event95+event80",
+                                    }
+                                    _item["final_delivery_prepared_at"]=final_reference
+                                    log.info(
+                                        "FINAL_TRADEABILITY_REJECTED cycle=%s pair=%s "
+                                        "reason=broker_asset_not_tradeable source=event95+event80",
+                                        cycle_id,p
+                                    )
+                                    continue
+
+                                _item["broker_tradeable"]=True
+                                _item["broker_tradeability_checked_at"]=time.time()
+                                _item["broker_tradeability_source"]="event95+event80"
+
                                 closed_1m=_closed_candles(
                                     STATE["candles"].get(p,[]),final_reference
                                 )
