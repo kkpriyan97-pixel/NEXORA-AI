@@ -3000,30 +3000,32 @@ async def result_watch(key):
                 snap.get("continue_wins"),snap.get("continue_losses"),snap.get("win_rate")
             )
     label=rec["display_name"]
-    direction_icon="⬆️" if rec["direction"]=="UP" else "⬇️"
-    result_icon={"WIN":"✅","LOSS":"🔴","TIE":"🟡"}[rec["result"]]
+    direction_icon="🟢" if rec["direction"]=="UP" else "🔴"
+    result_icon={"WIN":"✅","LOSS":"❌","TIE":"🟡"}[rec["result"]]
+    trend=str(rec.get("trend_15m") or "").upper()
+    trend_label="BULLISH" if "BULL" in trend else "BEARISH" if "BEAR" in trend else "—"
+    structure=str(rec.get("structure_1m") or "").upper()
+    structure_label=(
+        "ABOVE AVWAP + POC" if "ABOVE_AVWAP_POC" in structure
+        else "BELOW AVWAP + POC" if "BELOW_AVWAP_POC" in structure
+        else "—"
+    )
     await telegram(
-        f"📊 LIVE SIGNAL RESULT\n"
-        f"\n"
-        f"📈 {label}\n"
-        f"\n"
-        f"{direction_icon} {rec['direction']}\n"
-        f"\n"
-        f"💰 Entry: {rec['entry_price']}\n"
-        f"🏁 Expiry: {rec['exit_price']}\n"
-        f"⏱️ Duration: {rec['expiry_minutes']} MIN\n"
-        f"{format_live_indicator_check(rec.get("indicator_context") or {}, "authenticated_broker_live_candle / event1-preferred")}\n"
-        f"🧠 Brain Strategy: {rec['strategy'] or '—'}\n"
-        f"🧬 Self Strategy: {rec.get('self_strategy') or '—'} ({rec.get('self_strategy_version') or '—'})\n"
-        f"🎯 Brain Confidence: {rec['confidence']}%\n"
-        f"📈 15m Trend: {rec['trend_15m'] or '—'}\n"
-        f"🕯️ 1m Structure: {rec['structure_1m'] or '—'}\n"
-        f"🔎 Verification: candle-closed\n"
-        f"\n"
-        f"{result_icon} {rec['result']}\n"
-        f"\n"
-        f"🟣 FLEX PROTOCOL — MANUAL TRADE\n"
-        f"⚠️ Bot does not place Flex orders"
+        "📊 <b>CANDICE RESULT</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📈 <b>{label}</b>\n"
+        f"{direction_icon} <b>{rec['direction']}</b>  •  <b>{rec['expiry_minutes']} MIN</b>\n"
+        f"💰 Entry → <code>{rec['entry_price']}</code>\n"
+        f"🏁 Exit → <code>{rec['exit_price']}</code>\n"
+        f"{result_icon} <b>{rec['result']}</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📈 15M Bias → <b>{trend_label}</b>\n"
+        f"🕯️ 1M Close → <b>{structure_label}</b>\n"
+        "📐 Engine → <b>AVWAP + VOLUME PROFILE</b>\n"
+        f"🎯 Confidence → <b>{rec['confidence']}%</b>\n"
+        f"🔎 Verification → <b>candle-closed</b>\n\n"
+        "🟣 <b>DEMO • MANUAL ENTRY</b>\n"
+        "🤖 <b>CANDICE BRAIN • LIVE</b>"
     )
     await complete_result_watch(watch_id)
     log.info(
@@ -4963,26 +4965,38 @@ def format_live_indicator_check(indicators, price_source="authenticated_broker_l
     )
 
 def format_candice_signal_message(s, indicator_check, ts, target):
-    """Single canonical Telegram signal format. Do not compact/alternate this template."""
-    return (
-        f"🚨 CANDICE AI SIGNAL\n\n"
-        f"👋 Market setup detected!\n\n"
-        f"📊 {s.display_name}\n\n"
-        f"<b>{'🔻 DOWN' if s.direction.upper() == 'DOWN' else '🟢 UP'}</b>\n"
-        f"<b>⏱️ {s.expiry_minutes} MIN EXPIRY</b>\n\n"
-        f"🕒 {uae_time(ts)} UAE\n"
-        f"🎯 Entry → {uae_time(target)}\n\n"
-        f"💰 Reference → {s.entry_price}\n"
-        f"🎯 Confidence → {s.confidence}%\n\n"
-        f"{indicator_check}\n"
-        f"📈 15m Trend → {s.trend_15m or '—'}\n"
-        f"🕯️ 1m Structure → {s.structure_1m or '—'}\n"
-        f"🧠 Strategy → {s.strategy}\n\n"
-        f"🟣 FLEX PROTOCOL • MANUAL ENTRY\n"
-        f"🔎 Candice 5-Scan → {CYCLE_SCAN_COUNT}/{CYCLE_SCAN_COUNT} complete\n"
-        f"🧠 Technical Brain → AVWAP + Volume Profile only\n"
-        f"🤖 Candice Brain • LIVE"
+    """Canonical Telegram signal template.
+
+    The live engine is locked to AVWAP + Volume Profile. The formatter therefore
+    uses a fixed engine label and never prints a legacy strategy name.
+    """
+    direction = str(s.direction or "").upper()
+    arrow = "🟢 UP" if direction == "UP" else "🔴 DOWN"
+    trend = str(s.trend_15m or "").upper()
+    trend_label = "BULLISH" if "BULL" in trend else "BEARISH" if "BEAR" in trend else "—"
+    structure = str(s.structure_1m or "").upper()
+    structure_label = (
+        "ABOVE AVWAP + POC" if "ABOVE_AVWAP_POC" in structure
+        else "BELOW AVWAP + POC" if "BELOW_AVWAP_POC" in structure
+        else "—"
     )
+    return (
+        "🚨 <b>CANDICE AI • PRO SIGNAL</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>{s.display_name}</b>\n\n"
+        f"<b>{arrow}</b>  •  <b>1 MIN</b>\n"
+        f"🎯 <b>ENTRY → {uae_time(target)} UAE</b>\n"
+        f"💰 Reference → <code>{s.entry_price}</code>\n"
+        f"🎯 Confidence → <b>{s.confidence}%</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📈 15M Bias → <b>{trend_label}</b>\n"
+        f"🕯️ 1M Close → <b>{structure_label}</b>\n"
+        "📐 Engine → <b>AVWAP + VOLUME PROFILE</b>\n"
+        "🔗 Confluence → <b>AVWAP + POC ALIGNED</b>\n\n"
+        "🟣 <b>DEMO • MANUAL ENTRY</b>\n"
+        "🤖 <b>CANDICE BRAIN • LIVE</b>"
+    )
+
 
 
 async def build_live_analysis_payload():
