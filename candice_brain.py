@@ -684,7 +684,7 @@ def analyze_asset(
             f"slope_persistence={slope_aligned_steps}/3; value={value_position}; "
             f"reclaim={level_reclaim}; POC_migration={migration_norm:.4f}; "
             f"volume_quality={volume_quality}; AVWAP+POC aligned; "
-            f"BB(18,2)={bb.get("bb_confirmation","UNAVAILABLE")}."
+            f"BB(18,2)={bb.get('bb_confirmation','UNAVAILABLE')}."
         ),
         "indicator_features":features,
         "indicators":features,
