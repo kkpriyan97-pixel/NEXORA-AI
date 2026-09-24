@@ -1282,10 +1282,14 @@ def build_assets(client=None,raw=None):
         seen.add(key)
         verified=verified_by_pair[key]
         unavailable_reason=broker_unavailable_reason(x)
-        if unavailable_reason:
+        closure_reason=known_broker_closure_reason(p)
+        if unavailable_reason or closure_reason:
             rejected.append({
                 "pair":p,
-                "reason":f"broker_unavailable:{unavailable_reason}"
+                "reason":(
+                    f"broker_unavailable:{unavailable_reason}"
+                    if unavailable_reason else closure_reason
+                )
             })
             continue
         api_blocked=False
@@ -3230,6 +3234,13 @@ async def cycle_loop():
 
         p=candidate["pair"]
         expected=str(candidate.get("direction") or "").upper()
+        closure_reason=known_broker_closure_reason(p)
+        if closure_reason:
+            log.info(
+                "SIGNAL_DELIVERY_BLOCKED_BROKER_CLOSED cycle=%s pair=%s reason=%s",
+                cycle_id,p,closure_reason
+            )
+            return False
         if not broker_tradeability_fresh(p,time.time()):
             log.info(
                 "SIGNAL_DELIVERY_BLOCKED_BROKER_NOT_TRADABLE cycle=%s pair=%s "
