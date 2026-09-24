@@ -102,6 +102,9 @@ FORCE_SIGNAL_MODE=os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","tr
 ASSET_TRADEABILITY_PROBE_TIMEOUT=0.6
 ASSET_TRADEABILITY_CACHE_TTL=45.0
 ASSET_TRADEABILITY_HARD_MAX_AGE=50.0
+# Final tick preparation is only an optimization for boundary delivery. It must
+# never be allowed to block the 3-minute scheduler when broker event-12 probes stall.
+FINAL_TICK_PREP_TIMEOUT=7.0
 ASSET_TRADEABILITY_CACHE={}
 
 KNOWN_BROKER_CLOSURES_UAE={
@@ -4196,11 +4199,23 @@ async def cycle_loop():
                                     # keeps only four assets active, skips unusable broker
                                     # subscriptions, and requires a real fresh event-1 tick.
                                     pin_ttl=max(45.0,target-time.time()+20.0)
-                                    active_prep=await pin_account_tick_pairs(
-                                        [x.get("pair") for x in _pin_items],
-                                        ttl=pin_ttl,
-                                        require_fresh=True,
-                                        fresh_wait=ACCOUNT_TICK_FRESH_WAIT
+                                    # Broker Event-12 capability/freshness probing is bounded here.
+                                    # A stalled subscription must never hold cycle_loop past the
+                                    # exact signal boundary. Delivery still performs its authoritative
+                                    # fresh-tick checks and can fall through to the next candidate.
+                                    remaining_to_boundary=max(0.0,signal_at-time.time())
+                                    pin_timeout=min(
+                                        FINAL_TICK_PREP_TIMEOUT,
+                                        max(1.0,remaining_to_boundary-3.0)
+                                    )
+                                    active_prep=await asyncio.wait_for(
+                                        pin_account_tick_pairs(
+                                            [x.get("pair") for x in _pin_items],
+                                            ttl=pin_ttl,
+                                            require_fresh=True,
+                                            fresh_wait=ACCOUNT_TICK_FRESH_WAIT
+                                        ),
+                                        timeout=pin_timeout
                                     )
                                     log.info(
                                         "FINAL_CANDIDATE_TICKS_FINAL_PREPARED cycle=%s probe=%s active=%s pass=%s ttl=%.1f seconds_to_signal=%.2f",
