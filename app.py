@@ -4980,19 +4980,23 @@ def format_candice_signal_message(s, indicator_check, ts, target):
         else "BELOW AVWAP + POC" if "BELOW_AVWAP_POC" in structure
         else "—"
     )
+    # Telegram HTML has no font-size control, so use Unicode bold glyphs
+    # and isolated lines to make the direction and entry time visually dominant.
+    direction_focus = "🟢 𝗨𝗣" if direction == "UP" else "🔴 𝗗𝗢𝗪𝗡"
+    entry_focus = f"🎯 𝗘𝗡𝗧𝗥𝗬  𝟭𝟲:𝟮𝟰:𝟬𝟬" if False else f"🎯 𝗘𝗡𝗧𝗥𝗬  {uae_time(target)} UAE"
     return (
-        "🚨 <b>CANDICE AI • PRO SIGNAL</b>\n"
-        "\n"
+        "🚨 <b>CANDICE AI</b>\n"
+        "💎 <b>PRO SIGNAL</b>\n\n"
         f"📊 <b>{s.display_name}</b>\n\n"
-        f"<b>{arrow}</b>  •  <b>1 MIN</b>\n"
-        f"🎯 <b>ENTRY → {uae_time(target)} UAE</b>\n"
+        f"<b>{direction_focus}</b>\n"
+        "⏱️ <b>𝟭 𝗠𝗜𝗡</b>\n\n"
+        f"<b>{entry_focus}</b>\n\n"
         f"💰 Reference → <code>{s.entry_price}</code>\n"
-        f"🎯 Confidence → <b>{s.confidence}%</b>\n"
-        "\n"
+        f"⚡ Confidence → <b>{s.confidence}%</b>\n\n"
         f"📈 15M Bias → <b>{trend_label}</b>\n"
         f"🕯️ 1M Close → <b>{structure_label}</b>\n"
-        "📐 Engine → <b>AVWAP + VOLUME PROFILE</b>\n"
-        "🔗 Confluence → <b>AVWAP + POC ALIGNED</b>\n\n"
+        "🧠 Engine → <b>AVWAP + VOLUME PROFILE</b>\n"
+        "✓ Confluence → <b>AVWAP + POC ALIGNED</b>\n\n"
         "🟣 <b>DEMO • MANUAL ENTRY</b>\n"
         "🤖 <b>CANDICE BRAIN • LIVE</b>"
     )
