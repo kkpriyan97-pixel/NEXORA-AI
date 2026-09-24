@@ -96,7 +96,6 @@ SIGNAL_SESSION_END_HOUR=24
 # Offsets are measured backward from the 1-minute entry/expiry boundary.
 CYCLE_SCAN_OFFSETS=(150.0,120.0,90.0,75.0,60.0)
 CYCLE_SCAN_COUNT=len(CYCLE_SCAN_OFFSETS)
-# DEMO/testing override only. When enabled, the normal daytime signal scheduler
 # The signal scheduler runs continuously across the full UAE day. It does NOT enable broker auto-trading.
 FORCE_SIGNAL_MODE=os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}
 ASSET_TRADEABILITY_PROBE_TIMEOUT=0.6
@@ -3614,10 +3613,8 @@ async def cycle_loop():
     while True:
         now=time.time()
 
-        # Normal signal delivery is restricted to the UAE 06:00–18:00 session
-        # unless the explicit DEMO/testing override is enabled.
-        # Overnight hours still keep automatic learning orders isolated from the
-        # Telegram signal path; the override only permits signal-cycle testing.
+        # Signal delivery is enabled across the full UAE day. This changes only
+        # the signal schedule; broker auto-trading remains isolated/off.
         if not signal_session_active(now):
             if target is not None:
                 log.info(
