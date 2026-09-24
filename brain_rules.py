@@ -772,7 +772,26 @@ class BrainState:
         # calibration. A 94-96 technical score must not masquerade as a 94-96%
         # empirical win probability.
         x["confidence"]=max(0,min(99,int(round(x["market_quality"]+calibration_penalty))))
-        # Ranking-only lift; confidence/threshold remain unchanged.
+
+        # Exact-setup asset reliability is a bounded ranking aid. It uses only
+        # this asset + direction + strategy + 1-minute history and the exact
+        # indicator-context history, so unrelated setups cannot transfer wins.
+        pair_bucket=self.stats.get((pair,strategy,direction,1))
+        pair_n=float(pair_bucket.get("n",0) or 0) if pair_bucket else 0.0
+        pair_rate=self._rate(pair_bucket) if pair_bucket and pair_n>=5 else 0.5
+        ind_bucket=self.indicator_stats.get(self.vp_context_key(preview["indicator_context"]))
+        ind_n=float(ind_bucket.get("n",0) or 0) if ind_bucket else 0.0
+        ind_rate=self._rate(ind_bucket) if ind_bucket and ind_n>=8 else 0.5
+        exact_reliability=(0.70*pair_rate)+(0.30*ind_rate)
+        reliability_bonus=max(-6.0,min(6.0,(exact_reliability-0.50)*24.0))
+        x["exact_setup_reliability"]=round(exact_reliability,4)
+        x["exact_setup_reliability_samples"]=int(pair_n+ind_n)
+        x["exact_setup_rank_score"]=round(
+            float(x.get("confidence") or 0)+reliability_bonus,
+            3
+        )
+
+        # Ranking-only lift retained for compatibility with the existing selector.
         x["meta_rank_score"]=round(
             float(x.get("confidence") or 0)+float(x.get("meta_rank_bonus") or 0.0),
             3
@@ -873,16 +892,36 @@ class BrainState:
             if float(u)<=now:self.cooldown_until.pop(p,None)
 
 def rank_signal_candidates(candidates):
-    # Only the production two-indicator brain can enter delivery.
-    q=[x for x in candidates
-       if str(x.get("strategy","")).upper()==ALLOWED_STRATEGY
-       and int(x.get("confidence") or 0)>=MIN_CONFIDENCE
-       and str(x.get("direction","")).upper() in {"UP","DOWN"}
-       and not bool(x.get("ai_learning_blocked"))]
+    # LIVE EXACT-SETUP FILTER: only the empirically identified point can enter
+    # the production selector. Other indicator contexts remain available to the
+    # learning/research layers but cannot become live Telegram signals.
+    q=[]
+    for x in candidates:
+        if str(x.get("strategy","")).upper()!=ALLOWED_STRATEGY:
+            continue
+        if int(x.get("confidence") or 0)<MIN_CONFIDENCE:
+            continue
+        if str(x.get("direction","")).upper()!="UP":
+            continue
+        if bool(x.get("ai_learning_blocked")):
+            continue
+        ind=dict(x.get("indicators") or x.get("indicator_context") or {})
+        if str(ind.get("value_position") or "").upper()!="ABOVE_VALUE":
+            continue
+        if ind.get("level_reclaim") is not False:
+            continue
+        if ind.get("slope_persistent") is not True:
+            continue
+        if ind.get("exact_live_setup") is not True:
+            continue
+        q.append(x)
+
+    # Among exact-setups, prefer the asset with the strongest current evidence
+    # plus bounded historical reliability from the same asset/setup context.
     return sorted(q,key=lambda x:(
-        float(x.get("meta_rank_score") or x.get("confidence") or 0),
+        float(x.get("exact_setup_rank_score") or x.get("meta_rank_score") or x.get("confidence") or 0),
+        float(x.get("exact_setup_reliability") or 0.5),
         int(x.get("confidence") or 0),
-        float(x.get("strategy_margin") or 0),
         float(x.get("direction_agreement") or 0),
         float(x.get("market_quality") or 0),
         float(x.get("learning_bonus") or 0),
