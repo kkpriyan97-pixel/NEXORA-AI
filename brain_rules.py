@@ -244,6 +244,18 @@ class BrainState:
         # WIN is positive, LOSS negative, TIE neutral; recency is encoded by weight.
         b["weighted"] += {"WIN":weight,"LOSS":-weight,"TIE":0.0}.get(result,0.0)
 
+    @staticmethod
+    def vp_context_key(indicators):
+        ind=dict(indicators or {})
+        return "|".join([
+            f"V:{str(ind.get('volume_quality') or 'UNKNOWN').upper()}",
+            f"A:{'Y' if ind.get('value_area_acceptance') else 'N'}",
+            f"R:{'Y' if ind.get('level_reclaim') else 'N'}",
+            f"S:{'Y' if ind.get('slope_persistent') else 'N'}",
+            f"M:{'ALIGNED' if ind.get('poc_migration_aligned') else 'AGAINST' if ind.get('poc_migration_against') else 'FLAT'}",
+            f"P:{str(ind.get('value_position') or 'UNKNOWN').upper()}",
+        ])
+
     def learn(self,rec):
         result=str(rec.get("result","")).upper()
         pair=str(rec.get("pair",""))
@@ -275,12 +287,7 @@ class BrainState:
         self._record_bucket(self._bucket(self.pattern_stats,pattern),result,weight)
         self._record_bucket(self._bucket(self.context_stats,f"{trend}|{structure}"),result,weight)
         ind=dict(rec.get("indicator_context") or {})
-        dc_state=str(ind.get("donchian_state") or "UNKNOWN")
-        dc_exp="EXPANDING" if bool(ind.get("donchian_expansion")) else "FLAT"
-        st_cross=str(ind.get("stochastic_cross") or "NEUTRAL")
-        st_zone=("OVERSOLD" if bool(ind.get("stochastic_oversold")) else
-                 "OVERBOUGHT" if bool(ind.get("stochastic_overbought")) else "MID")
-        indicator_key=f"DC:{dc_state}:{dc_exp}|ST:{st_zone}:{st_cross}"
+        indicator_key=self.vp_context_key(ind)
         self._record_bucket(self._bucket(self.indicator_stats,indicator_key),result,weight)
         self.total_results+=1
         self.research_observations+=1
@@ -347,18 +354,15 @@ class BrainState:
     @staticmethod
     def lesson_key(rec):
         ind=dict(rec.get("indicator_context") or {})
-        bb=str(ind.get("bollinger_signal") or "UNKNOWN").upper()
-        bb_pos=str(ind.get("bollinger_position") or "UNKNOWN").upper()
-        dc=str(ind.get("donchian_state") or "UNKNOWN").upper()
-        st=str(ind.get("stochastic_cross") or "UNKNOWN").upper()
         return "|".join([
             str(rec.get("pair") or ""),
             str(rec.get("direction") or "").upper(),
             str(rec.get("strategy") or "UNKNOWN"),
             str(rec.get("trend_15m") or "UNKNOWN").upper(),
             str(rec.get("structure_1m") or "UNKNOWN").upper(),
-            f"BB:{bb}:{bb_pos}", f"DC:{dc}", f"ST:{st}"
+            BrainState.vp_context_key(ind),
         ])
+
 
     def apply_ai_review(self,rec,review):
         """Apply an external AI lesson once; queue retries are idempotent."""
@@ -499,11 +503,7 @@ class BrainState:
         # successful setup blindly to unrelated indicator states.
         ind=dict(indicator_context or {})
         if ind:
-            key="DC:{}:{}|ST:{}:{}".format(
-                ind.get("donchian_state","UNKNOWN"),
-                "EXPANDING" if ind.get("donchian_expansion") else "FLAT",
-                "OVERSOLD" if ind.get("stochastic_oversold") else ("OVERBOUGHT" if ind.get("stochastic_overbought") else "MID"),
-                ind.get("stochastic_cross","NEUTRAL"))
+            key=self.vp_context_key(ind)
             b=self.indicator_stats.get(key)
             n=float(b.get("n",0) or 0) if b else 0.0
             if b and n>=10:
