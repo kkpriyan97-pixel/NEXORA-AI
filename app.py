@@ -2859,7 +2859,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                     # may use this fallback; an actual contradictory AI response above
                     # remains a hard veto. This keeps the local Brain authoritative.
                     strict_local_fallback=(
-                        int(local_confidence)>=94
+                        int(local_confidence)>=90
                         and ind_ctx.get("value_area_acceptance") is True
                         and ind_ctx.get("m1_continuation_ok") is True
                         and ind_ctx.get("slope_persistent") is True
@@ -3467,7 +3467,7 @@ async def cycle_loop():
                     )
                     or (
                         candidate.get("volume_proxy_local_fallback") is True
-                        and int(candidate.get("volume_proxy_local_fallback_confidence") or 0)>=94
+                        and int(candidate.get("volume_proxy_local_fallback_confidence") or 0)>=90
                     )
                 )
             )
