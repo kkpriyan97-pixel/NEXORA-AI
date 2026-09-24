@@ -99,7 +99,7 @@ CYCLE_SCAN_COUNT=len(CYCLE_SCAN_OFFSETS)
 # DEMO/testing override only. When enabled, the normal daytime signal scheduler
 # may run outside the UAE 06:00–18:00 window. It does NOT enable broker auto-trading.
 FORCE_SIGNAL_MODE=os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}
-ASSET_TRADEABILITY_PROBE_TIMEOUT=1.5
+ASSET_TRADEABILITY_PROBE_TIMEOUT=0.6
 ASSET_TRADEABILITY_CACHE_TTL=45.0
 ASSET_TRADEABILITY_HARD_MAX_AGE=50.0
 ASSET_TRADEABILITY_CACHE={}
@@ -205,7 +205,12 @@ async def check_broker_asset_tradeability(pair, cycle_id=None, force=False):
 def broker_tradeability_fresh(pair, reference_ts=None):
     p=str(pair or "").strip()
     rec=ASSET_TRADEABILITY_CACHE.get(p)
-    if not isinstance(rec,dict) or not bool(rec.get("tradeable")):
+    if not isinstance(rec,dict):
+        return False
+    state=str(rec.get("state") or "UNKNOWN").upper()
+    if state=="CLOSED":
+        return False
+    if state not in {"OPEN","UNKNOWN"}:
         return False
     ref=time.time() if reference_ts is None else float(reference_ts)
     try:
@@ -213,8 +218,6 @@ def broker_tradeability_fresh(pair, reference_ts=None):
     except (TypeError,ValueError):
         return False
     return 0.0<=age<=ASSET_TRADEABILITY_HARD_MAX_AGE
-
-
 def signal_session_active(ts=None):
     if FORCE_SIGNAL_MODE:
         return True
