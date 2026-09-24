@@ -235,107 +235,185 @@ def _median(xs):
 
 
 def _pro_price_action(cs, direction):
-    """Indicator-independent M1 price-action confluence gate.
+    """Strict indicator-independent price-action sequence for live M1 selection.
 
-    Uses only completed OHLC candles. It looks for either:
-      continuation: structure shift -> displacement -> retest/hold -> confirmation
-      reversal: liquidity sweep -> structure shift -> displacement -> retest/confirm
-    The gate is deliberately strict; it is a selector, not a claim of any fixed
-    future win rate.
+    The live gate is:
+      reversal path: liquidity sweep -> MSS -> displacement -> retest -> confirmation
+      continuation path: structure break -> displacement -> retest -> hold -> confirmation
+
+    All observations are derived from completed OHLC candles only. Indicators are
+    deliberately excluded from this gate. A 5/5 result is confluence quality, not
+    a claimed 98% future win probability.
     """
-    if len(cs) < 20:
+    if len(cs) < 24:
         return {"qualified":False,"type":"INSUFFICIENT","score":0,"checks":{}}
 
-    recent=cs[-20:]
-    prior=cs[-12:-1]
-    highs=[c["high"] for c in prior]
-    lows=[c["low"] for c in prior]
-    if not highs or not lows:
-        return {"qualified":False,"type":"INSUFFICIENT","score":0,"checks":{}}
+    def rng(c):
+        return max(c["high"]-c["low"],1e-12)
 
-    last=cs[-1]
-    prev=cs[-2]
-    avg_ranges=[max(c["high"]-c["low"],0.0) for c in cs[-8:-1]]
-    med_range=max(_median(avg_ranges),1e-12)
-    last_range=max(last["high"]-last["low"],1e-12)
-    last_body=abs(last["close"]-last["open"])
-    body_ratio=min(1.0,last_body/last_range)
-    close_edge_up=(last["high"]-last["close"])/last_range <= 0.25
-    close_edge_down=(last["close"]-last["low"])/last_range <= 0.25
+    def body_ratio(c):
+        return min(1.0,abs(c["close"]-c["open"])/rng(c))
 
-    swing_high=max(highs[-6:])
-    swing_low=min(lows[-6:])
-    earlier_high=max(highs[:6])
-    earlier_low=min(lows[:6])
+    def bullish(c):
+        return c["close"]>c["open"]
 
-    if direction=="UP":
-        structure_shift=last["close"]>swing_high and prev["close"]<=swing_high
-        displacement=body_ratio>=0.62 and last_range>=med_range*1.15 and last["close"]>last["open"] and close_edge_up
-        broken_level=swing_high
-        retest_window=cs[-5:-1]
-        retest=min(abs(c["low"]-broken_level) for c in retest_window) if retest_window else 1e99
-        retest_hold=retest <= max(med_range*0.75,1e-12) and last["low"]>=broken_level-max(med_range*0.85,1e-12)
-        confirmation=last["close"]>prev["close"] and last["close"]>=last["open"]
-        sweep=(last["low"]<earlier_low and last["close"]>earlier_low)
-        clean_space=(max(c["high"] for c in recent[-5:])-last["close"]) >= -max(med_range*0.5,1e-12)
-    else:
-        structure_shift=last["close"]<swing_low and prev["close"]>=swing_low
-        displacement=body_ratio>=0.62 and last_range>=med_range*1.15 and last["close"]<last["open"] and close_edge_down
-        broken_level=swing_low
-        retest_window=cs[-5:-1]
-        retest=min(abs(c["high"]-broken_level) for c in retest_window) if retest_window else 1e99
-        retest_hold=retest <= max(med_range*0.75,1e-12) and last["high"]<=broken_level+max(med_range*0.85,1e-12)
-        confirmation=last["close"]<prev["close"] and last["close"]<=last["open"]
-        sweep=(last["high"]>earlier_high and last["close"]<earlier_high)
-        clean_space=(last["close"]-min(c["low"] for c in recent[-5:])) >= -max(med_range*0.5,1e-12)
+    def bearish(c):
+        return c["close"]<c["open"]
 
-    # Continuation is deliberately stricter than a single breakout:
-    continuation_checks={
-        "structure_shift":bool(structure_shift),
-        "displacement":bool(displacement),
-        "retest_hold":bool(retest_hold),
-        "confirmation":bool(confirmation),
-        "clean_space":bool(clean_space),
-    }
-    continuation_score=sum(1 for x in continuation_checks.values() if x)
+    def displacement(c, direction, baseline):
+        edge=((c["high"]-c["close"])/rng(c) <= 0.25) if direction=="UP" else ((c["close"]-c["low"])/rng(c) <= 0.25)
+        return (
+            (bullish(c) if direction=="UP" else bearish(c))
+            and body_ratio(c)>=0.62
+            and rng(c)>=max(baseline*1.15,1e-12)
+            and edge
+        )
 
-    # Reversal requires a genuine sweep before the same structure/displacement
-    # sequence. This prevents a generic overbought/oversold reading from becoming
-    # a reversal signal.
-    reversal_checks={
-        "liquidity_sweep":bool(sweep),
-        "structure_shift":bool(structure_shift),
-        "displacement":bool(displacement),
-        "retest_hold":bool(retest_hold),
-        "confirmation":bool(confirmation),
-    }
-    reversal_score=sum(1 for x in reversal_checks.values() if x)
+    ranges=[rng(c) for c in cs[-12:-1]]
+    baseline=max(_median(ranges),1e-12)
+    scan_start=max(4,len(cs)-11)
+    scan_end=len(cs)-1
+    current=cs[-1]
 
-    if continuation_score>=5:
-        kind="CONTINUATION"
-        selected=continuation_checks
-        score=100
-    elif reversal_score>=5:
-        kind="REVERSAL"
-        selected=reversal_checks
-        score=100
-    else:
-        # A 4/5 setup is tracked for learning/audit, but cannot reach the live signal pool.
-        kind="WATCH"
-        selected=continuation_checks if continuation_score>=reversal_score else reversal_checks
-        score=max(continuation_score,reversal_score)*20
+    # --- continuation path ---
+    continuation=None
+    for break_idx in range(scan_start+1,scan_end-1):
+        before=cs[max(0,break_idx-6):break_idx]
+        if len(before)<4:
+            continue
+        prior_high=max(c["high"] for c in before)
+        prior_low=min(c["low"] for c in before)
+        br=cs[break_idx]
+        if direction=="UP":
+            structure_break=br["close"]>prior_high and bullish(br)
+            level=prior_high
+        else:
+            structure_break=br["close"]<prior_low and bearish(br)
+            level=prior_low
+        if not structure_break or not displacement(br,direction,baseline):
+            continue
 
+        retest_idx=None
+        for j in range(break_idx+1,scan_end):
+            c=cs[j]
+            if direction=="UP":
+                touched=c["low"]<=level+baseline*0.80 and c["low"]>=level-baseline*0.85
+                held=c["close"]>=level
+            else:
+                touched=c["high"]>=level-baseline*0.80 and c["high"]<=level+baseline*0.85
+                held=c["close"]<=level
+            if touched and held:
+                retest_idx=j
+                break
+        if retest_idx is None or retest_idx>=scan_end:
+            continue
+
+        confirm=current
+        confirm_ok=(bullish(confirm) and confirm["close"]>cs[retest_idx]["close"]) if direction=="UP" else (bearish(confirm) and confirm["close"]<cs[retest_idx]["close"])
+        hold_ok=(confirm["low"]>=level-baseline*0.55) if direction=="UP" else (confirm["high"]<=level+baseline*0.55)
+        if confirm_ok and hold_ok:
+            continuation={
+                "type":"CONTINUATION",
+                "score":5,
+                "checks":{
+                    "structure_break":True,
+                    "displacement":True,
+                    "retest_hold":True,
+                    "follow_through":True,
+                    "confirmation":True,
+                },
+                "break_index":break_idx,
+                "retest_index":retest_idx,
+                "level":float(level),
+            }
+            break
+
+    # --- reversal path ---
+    reversal=None
+    for sweep_idx in range(scan_start,scan_end-3):
+        before=cs[max(0,sweep_idx-7):sweep_idx]
+        if len(before)<4:
+            continue
+        sweep=cs[sweep_idx]
+        prior_high=max(c["high"] for c in before)
+        prior_low=min(c["low"] for c in before)
+        if direction=="UP":
+            sweep_ok=sweep["low"]<prior_low and sweep["close"]>prior_low
+            swept_level=prior_low
+        else:
+            sweep_ok=sweep["high"]>prior_high and sweep["close"]<prior_high
+            swept_level=prior_high
+        if not sweep_ok:
+            continue
+
+        # MSS must occur AFTER the sweep and break the pre-sweep internal extreme.
+        internal=cs[sweep_idx+1:min(scan_end,sweep_idx+6)]
+        if len(internal)<1:
+            continue
+        internal_high=max(c["high"] for c in before[-4:])
+        internal_low=min(c["low"] for c in before[-4:])
+        mss_idx=None
+        mss_level=None
+        for j in range(sweep_idx+1,scan_end):
+            c=cs[j]
+            if direction=="UP" and c["close"]>internal_high and bullish(c):
+                mss_idx=j; mss_level=internal_high; break
+            if direction=="DOWN" and c["close"]<internal_low and bearish(c):
+                mss_idx=j; mss_level=internal_low; break
+        if mss_idx is None or not displacement(cs[mss_idx],direction,baseline):
+            continue
+
+        retest_idx=None
+        for j in range(mss_idx+1,scan_end):
+            c=cs[j]
+            if direction=="UP":
+                touched=c["low"]<=mss_level+baseline*0.80 and c["low"]>=mss_level-baseline*0.85
+                held=c["close"]>=mss_level
+            else:
+                touched=c["high"]>=mss_level-baseline*0.80 and c["high"]<=mss_level+baseline*0.85
+                held=c["close"]<=mss_level
+            if touched and held:
+                retest_idx=j
+                break
+        if retest_idx is None:
+            continue
+
+        confirm_ok=(bullish(current) and current["close"]>cs[retest_idx]["close"]) if direction=="UP" else (bearish(current) and current["close"]<cs[retest_idx]["close"])
+        hold_ok=(current["low"]>=mss_level-baseline*0.55) if direction=="UP" else (current["high"]<=mss_level+baseline*0.55)
+        if confirm_ok and hold_ok:
+            reversal={
+                "type":"REVERSAL",
+                "score":5,
+                "checks":{
+                    "liquidity_sweep":True,
+                    "structure_shift":True,
+                    "displacement":True,
+                    "retest_hold":True,
+                    "confirmation":True,
+                },
+                "sweep_index":sweep_idx,
+                "mss_index":mss_idx,
+                "retest_index":retest_idx,
+                "level":float(mss_level),
+                "swept_level":float(swept_level),
+            }
+            break
+
+    selected=reversal or continuation
+    if selected:
+        selected=dict(selected)
+        selected["qualified"]=True
+        selected["score"]=5
+        return selected
+
+    # Audit-only near misses; never enter live delivery.
     return {
-        "qualified":bool(score>=100),
-        "type":kind,
-        "score":int(score),
-        "checks":selected,
-        "continuation_score":int(continuation_score),
-        "reversal_score":int(reversal_score),
-        "body_ratio":round(body_ratio,3),
-        "range_vs_median":round(last_range/max(med_range,1e-12),3),
-        "broken_level":float(broken_level),
+        "qualified":False,
+        "type":"WATCH",
+        "score":4 if continuation is not None else 0,
+        "checks":(continuation or reversal or {}).get("checks",{}),
     }
+
 
 
 def analyze_asset(asset, candles, price=None, forced_strategy=None, learning_campaign=False):
