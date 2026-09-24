@@ -1055,7 +1055,7 @@ QUOTE_SNAPSHOT_SEM=asyncio.Semaphore(48)
 QUOTE_SNAPSHOT_LAST={}
 AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=90.0
-AI_REVIEW_FAIL_TTL=20.0
+AI_REVIEW_FAIL_TTL=90.0
 # Preserve a fully reviewed candidate for the short exact-boundary window.
 # This prevents a transient provider/cache refresh from erasing a valid setup
 # after it has already passed the Brain + live-price gates.
@@ -1067,7 +1067,7 @@ CANDIDATE_CACHE_TTL=75.0
 # when a new closed candle forms.
 CANDIDATE_CACHE_HARD_REJECTED={}
 AI_PROVIDER_COOLDOWN={}
-AI_REVIEW_TIMEOUT=5.5
+AI_REVIEW_TIMEOUT=3.2
 # Rotating account-wide live quote scan. It does not touch Brain timing; it only
 # keeps current account prices warm for analysis/candidate selection.
 ACCOUNT_LIVE_SCAN_BATCH=32
