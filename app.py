@@ -5023,6 +5023,21 @@ async def market_worker():
             )
             STATE["status"]="live_read_only"
             assets=list(STATE["assets"])
+            known_closed=0
+            for asset in assets:
+                pair=str(asset.get("pair") or "").strip()
+                closure_reason=known_broker_closure_reason(pair)
+                if closure_reason:
+                    asset["broker_schedule_blocked"]=True
+                    asset["broker_closed_reason"]=closure_reason
+                    asset["signal_eligible"]=False
+                    asset["broker_tradeable"]=False
+                    known_closed+=1
+                    STATE.get("analyses",{}).pop(pair,None)
+            log.info(
+                "KNOWN_BROKER_CLOSURE_APPLIED source=terminal_observation blocked=%d assets=%d",
+                known_closed,len(assets)
+            )
             real_n=sum(a["mode"]=="REAL" for a in assets); otc_n=sum(a["mode"]=="OTC" for a in assets)
             log.info("STATIC_ACCOUNT_ASSET_SOURCE account_id=%s catalog_count=%d static_real=%d static_otc=%d static_total=%d",
                      client.account_id,len(assets),real_n,otc_n,len(assets))
