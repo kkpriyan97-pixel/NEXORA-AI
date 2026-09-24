@@ -58,6 +58,12 @@ class BrainState:
     pattern_stats:dict[str,dict[str,float]]=field(default_factory=dict)
     context_stats:dict[str,dict[str,float]]=field(default_factory=dict)
     indicator_stats:dict[str,dict[str,float]]=field(default_factory=dict)
+    # Additive prediction-learning memory. These stores never hard-block delivery;
+    # they only improve candidate ranking/calibration using completed outcomes.
+    sequence_stats:dict[str,dict[str,float]]=field(default_factory=dict)
+    regime_stats:dict[str,dict[str,float]]=field(default_factory=dict)
+    time_stats:dict[str,dict[str,float]]=field(default_factory=dict)
+    meta_stats:dict[str,dict[str,float]]=field(default_factory=dict)
     total_results:int=0
     learning_account_id:int|None=None
     batch_results:list[dict[str,Any]]=field(default_factory=list)
@@ -256,6 +262,25 @@ class BrainState:
             f"P:{str(ind.get('value_position') or 'UNKNOWN').upper()}",
         ])
 
+    @staticmethod
+    def meta_context_key(indicators):
+        ind=dict(indicators or {})
+        migration=(
+            "ALIGNED" if ind.get("poc_migration_aligned")
+            else "AGAINST" if ind.get("poc_migration_against")
+            else "FLAT"
+        )
+        return "|".join([
+            f"SEQ:{str(ind.get('m1_sequence_signature') or 'UNKNOWN').upper()}",
+            f"REG:{str(ind.get('market_regime') or 'UNKNOWN').upper()}",
+            f"TB:{str(ind.get('decision_time_bucket') or 'UNKNOWN').upper()}",
+            f"V:{str(ind.get('volume_quality') or 'UNKNOWN').upper()}",
+            f"A:{'Y' if ind.get('value_area_acceptance') else 'N'}",
+            f"R:{'Y' if ind.get('level_reclaim') else 'N'}",
+            f"S:{'Y' if ind.get('slope_persistent') else 'N'}",
+            f"M:{migration}",
+        ])
+
     def learn(self,rec):
         result=str(rec.get("result","")).upper()
         pair=str(rec.get("pair",""))
@@ -289,6 +314,14 @@ class BrainState:
         ind=dict(rec.get("indicator_context") or {})
         indicator_key=self.vp_context_key(ind)
         self._record_bucket(self._bucket(self.indicator_stats,indicator_key),result,weight)
+        sequence_key=str(ind.get("m1_sequence_signature") or "UNKNOWN").upper()
+        regime_key=str(ind.get("market_regime") or "UNKNOWN").upper()
+        time_key=str(ind.get("decision_time_bucket") or "UNKNOWN").upper()
+        meta_key=self.meta_context_key(ind)
+        self._record_bucket(self._bucket(self.sequence_stats,sequence_key),result,weight)
+        self._record_bucket(self._bucket(self.regime_stats,regime_key),result,weight)
+        self._record_bucket(self._bucket(self.time_stats,time_key),result,weight)
+        self._record_bucket(self._bucket(self.meta_stats,meta_key),result,weight)
         self.total_results+=1
         self.research_observations+=1
         research_progress=self.research_progress()
@@ -626,6 +659,55 @@ class BrainState:
             return -3.0,"WATCH",rate,int(n)
         return 0.0,"EARLY",rate,int(n)
 
+    def meta_prediction(self,pair,strategy,expiry,direction="",indicator_context=None):
+        """Bounded empirical meta-prediction for ranking; never a delivery gate."""
+        ind=dict(indicator_context or {})
+        direction=str(direction or "").upper()
+        strategy=str(strategy or "").upper()
+        expiry=int(expiry or 0)
+
+        def shrunk(bucket,strength):
+            if not bucket:
+                return 0.5,0
+            try:
+                n=float(bucket.get("n",0) or 0.0)
+                if n<=0:
+                    return 0.5,0
+                raw=self._rate(bucket)
+                return 0.5+(n/(n+float(strength)))*(raw-0.5),int(n)
+            except (TypeError,ValueError):
+                return 0.5,0
+
+        sources=[]
+        r,n=shrunk(self.strategy_stats.get(strategy),18.0)
+        sources.append(("strategy",0.30,r,n))
+        r,n=shrunk(self.stats.get((str(pair),strategy,direction,expiry)),10.0)
+        sources.append(("pair",0.22,r,n))
+        r,n=shrunk(self.sequence_stats.get(str(ind.get("m1_sequence_signature") or "UNKNOWN").upper()),12.0)
+        sources.append(("sequence",0.12,r,n))
+        r,n=shrunk(self.regime_stats.get(str(ind.get("market_regime") or "UNKNOWN").upper()),12.0)
+        sources.append(("regime",0.10,r,n))
+        r,n=shrunk(self.time_stats.get(str(ind.get("decision_time_bucket") or "UNKNOWN").upper()),16.0)
+        sources.append(("time",0.06,r,n))
+        r,n=shrunk(self.indicator_stats.get(self.vp_context_key(ind)),12.0)
+        sources.append(("indicator",0.08,r,n))
+        r,n=shrunk(self.meta_stats.get(self.meta_context_key(ind)),16.0)
+        sources.append(("meta",0.12,r,n))
+
+        total=sum(w for _,w,_,_ in sources)
+        probability=sum(w*r for _,w,r,_ in sources)/max(total,1e-9)
+        probability=max(0.35,min(0.70,probability))
+        rank_bonus=max(-7.0,min(7.0,(probability-0.50)*20.0))
+        evidence={name:int(n) for name,_,_,n in sources if n>0}
+        strongest=max(sources,key=lambda item:(item[3],item[1]))
+        return {
+            "calibrated_probability":round(probability,4),
+            "meta_rank_bonus":round(rank_bonus,3),
+            "evidence_samples":evidence,
+            "strongest_evidence_source":strongest[0],
+            "strongest_evidence_samples":int(strongest[3]),
+        }
+
     def adaptive_candidate(self,c):
         x=dict(c)
         pair=str(x.get("pair",""))
@@ -664,6 +746,16 @@ class BrainState:
         x["ai_learning_blocked"]=self.post_result_context_blocked(lesson_rec)
         x["post_result_learning_bonus"]=round(self.post_result_learning_bonus(lesson_rec),2)
 
+        meta=self.meta_prediction(
+            pair,strategy,int(x.get("expiry_minutes") or 0),direction,
+            dict(preview.get("indicator_context") or {})
+        )
+        x["meta_calibrated_probability"]=float(meta.get("calibrated_probability") or 0.5)
+        x["meta_rank_bonus"]=float(meta.get("meta_rank_bonus") or 0.0)
+        x["meta_evidence_samples"]=dict(meta.get("evidence_samples") or {})
+        x["meta_strongest_evidence_source"]=str(meta.get("strongest_evidence_source") or "")
+        x["meta_strongest_evidence_samples"]=int(meta.get("strongest_evidence_samples") or 0)
+
         technical=float(x.get("market_quality") or x.get("confidence") or 0)
         x["market_quality"]=max(
             0.0,
@@ -680,6 +772,11 @@ class BrainState:
         # calibration. A 94-96 technical score must not masquerade as a 94-96%
         # empirical win probability.
         x["confidence"]=max(0,min(99,int(round(x["market_quality"]+calibration_penalty))))
+        # Ranking-only lift; confidence/threshold remain unchanged.
+        x["meta_rank_score"]=round(
+            float(x.get("confidence") or 0)+float(x.get("meta_rank_bonus") or 0.0),
+            3
+        )
 
         if pair and strategy:
             allow_5m=bool(x.get("five_minute_eligible")) and strategy=="TREND_FOLLOWING"
@@ -705,6 +802,10 @@ class BrainState:
             "pattern_stats": self.pattern_stats,
             "context_stats": self.context_stats,
             "indicator_stats": self.indicator_stats,
+            "sequence_stats": self.sequence_stats,
+            "regime_stats": self.regime_stats,
+            "time_stats": self.time_stats,
+            "meta_stats": self.meta_stats,
             "post_result_lessons": self.post_result_lessons,
             "last_ai_review": self.last_ai_review,
             "research_start_ts": self.research_start_ts,
@@ -744,6 +845,10 @@ class BrainState:
         self.pattern_stats=dict(data.get("pattern_stats") or {})
         self.context_stats=dict(data.get("context_stats") or {})
         self.indicator_stats=dict(data.get("indicator_stats") or {})
+        self.sequence_stats=dict(data.get("sequence_stats") or {})
+        self.regime_stats=dict(data.get("regime_stats") or {})
+        self.time_stats=dict(data.get("time_stats") or {})
+        self.meta_stats=dict(data.get("meta_stats") or {})
         self.post_result_lessons=dict(data.get("post_result_lessons") or {})
         self.last_ai_review=dict(data.get("last_ai_review") or {}) if data.get("last_ai_review") else None
         self.research_start_ts=float(data.get("research_start_ts")) if data.get("research_start_ts") is not None else None
@@ -775,6 +880,7 @@ def rank_signal_candidates(candidates):
        and str(x.get("direction","")).upper() in {"UP","DOWN"}
        and not bool(x.get("ai_learning_blocked"))]
     return sorted(q,key=lambda x:(
+        float(x.get("meta_rank_score") or x.get("confidence") or 0),
         int(x.get("confidence") or 0),
         float(x.get("strategy_margin") or 0),
         float(x.get("direction_agreement") or 0),
