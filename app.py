@@ -3397,37 +3397,54 @@ async def cycle_loop():
             target=None
             continue
 
-        # Restart guard: a fresh Candice cycle must never begin in the middle
-        # of its 150-second analysis window. If restart happens after the ideal
-        # start but before the signal, skip that partial boundary and start the
-        # next complete cycle.
+        # Restart guard: an ordinary restart must not throw away a still-viable
+        # recovered cycle. When a persisted cycle is active, its target/signaling
+        # boundary stays authoritative and completed passes are resumed in place.
+        # Only discard the recovered cycle when too little time remains to safely
+        # finish the pending passes and perform the final delivery checks.
         cycle_start=target-SIGNAL_INTERVAL
         if time.time()>cycle_start+5.0:
-            old_target=target
-            old_cycle_id=cycle_id
-            target+=SIGNAL_INTERVAL
-            cycle_id=int(target//SIGNAL_INTERVAL)
-            cycle_sequence=(cycle_id % 20) or 20
-            signal_lead=30.0
-            signal_at=target-signal_lead
-            cycle_start=target-SIGNAL_INTERVAL
-            if recovered:
-                log.info(
-                    "CYCLE_RECOVERY_DISCARDED cycle=%s old_cycle=%s reason=window_start_already_passed old_target_utc=%s",
-                    cycle_id,old_cycle_id,
-                    time.strftime("%H:%M:%S",time.gmtime(old_target))
-                )
-                recovered=None
-                resume_completed_pass=0
-                candidate_pool={}
-            log.info(
-                "CYCLE_RESTART_ALIGNMENT cycle=%s old_target_utc=%s new_start_utc=%s signal_utc=%s target_utc=%s",
-                cycle_id,
-                time.strftime("%H:%M:%S",time.gmtime(old_target)),
-                time.strftime("%H:%M:%S",time.gmtime(cycle_start)),
-                time.strftime("%H:%M:%S",time.gmtime(signal_at)),
-                time.strftime("%H:%M:%S",time.gmtime(target))
+            recovery_signal_in=max(0.0,signal_at-time.time())
+            can_resume_recovered=bool(
+                recovered
+                and resume_completed_pass < len(SCAN_OFFSETS)
+                and recovery_signal_in >= 20.0
             )
+            if can_resume_recovered:
+                log.info(
+                    "CYCLE_RECOVERY_KEEP_PARTIAL cycle=%s completed_pass=%s "
+                    "signal_utc=%s signal_in=%.2f reason=resumable_window",
+                    cycle_id,resume_completed_pass,
+                    time.strftime("%H:%M:%S",time.gmtime(signal_at)),
+                    recovery_signal_in
+                )
+            else:
+                old_target=target
+                old_cycle_id=cycle_id
+                target+=SIGNAL_INTERVAL
+                cycle_id=int(target//SIGNAL_INTERVAL)
+                cycle_sequence=(cycle_id % 20) or 20
+                signal_lead=30.0
+                signal_at=target-signal_lead
+                cycle_start=target-SIGNAL_INTERVAL
+                if recovered:
+                    log.info(
+                        "CYCLE_RECOVERY_DISCARDED cycle=%s old_cycle=%s reason=window_not_resumable "
+                        "signal_in=%.2f old_target_utc=%s",
+                        cycle_id,old_cycle_id,recovery_signal_in,
+                        time.strftime("%H:%M:%S",time.gmtime(old_target))
+                    )
+                    recovered=None
+                    resume_completed_pass=0
+                    candidate_pool={}
+                log.info(
+                    "CYCLE_RESTART_ALIGNMENT cycle=%s old_target_utc=%s new_start_utc=%s signal_utc=%s target_utc=%s",
+                    cycle_id,
+                    time.strftime("%H:%M:%S",time.gmtime(old_target)),
+                    time.strftime("%H:%M:%S",time.gmtime(cycle_start)),
+                    time.strftime("%H:%M:%S",time.gmtime(signal_at)),
+                    time.strftime("%H:%M:%S",time.gmtime(target))
+                )
         until_start=cycle_start-time.time()
         if until_start>0:
             log.info(
@@ -3630,6 +3647,7 @@ async def cycle_loop():
                             and bool(x.get("deep_verified"))
                         ],
                         key=lambda x:(
+                            float(x.get("meta_rank_score") or x.get("confidence") or 0),
                             int(x.get("confidence") or 0),
                             float(x.get("strategy_margin") or 0),
                             float(x.get("direction_agreement") or 0),
@@ -3695,6 +3713,7 @@ async def cycle_loop():
                                 prepared_selected,
                                 key=lambda x:(
                                     float(x.get("final_delivery_precheck") or -900.0),
+                                    float(x.get("meta_rank_score") or x.get("confidence") or 0),
                                     int(x.get("confidence") or 0),
                                     float(x.get("strategy_margin") or 0),
                                     float(x.get("direction_agreement") or 0),
