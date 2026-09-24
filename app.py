@@ -3012,13 +3012,13 @@ async def result_watch(key):
     )
     await telegram(
         "📊 <b>CANDICE RESULT</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
+        "\n"
         f"📈 <b>{label}</b>\n"
         f"{direction_icon} <b>{rec['direction']}</b>  •  <b>{rec['expiry_minutes']} MIN</b>\n"
         f"💰 Entry → <code>{rec['entry_price']}</code>\n"
         f"🏁 Exit → <code>{rec['exit_price']}</code>\n"
         f"{result_icon} <b>{rec['result']}</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
+        "\n"
         f"📈 15M Bias → <b>{trend_label}</b>\n"
         f"🕯️ 1M Close → <b>{structure_label}</b>\n"
         "📐 Engine → <b>AVWAP + VOLUME PROFILE</b>\n"
@@ -4982,13 +4982,13 @@ def format_candice_signal_message(s, indicator_check, ts, target):
     )
     return (
         "🚨 <b>CANDICE AI • PRO SIGNAL</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
+        "\n"
         f"📊 <b>{s.display_name}</b>\n\n"
         f"<b>{arrow}</b>  •  <b>1 MIN</b>\n"
         f"🎯 <b>ENTRY → {uae_time(target)} UAE</b>\n"
         f"💰 Reference → <code>{s.entry_price}</code>\n"
         f"🎯 Confidence → <b>{s.confidence}%</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
+        "\n"
         f"📈 15M Bias → <b>{trend_label}</b>\n"
         f"🕯️ 1M Close → <b>{structure_label}</b>\n"
         "📐 Engine → <b>AVWAP + VOLUME PROFILE</b>\n"
