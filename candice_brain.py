@@ -224,6 +224,120 @@ def _efficiency(v, n=8):
     return min(1.0, abs(window[-1] - window[0]) / total)
 
 
+
+def _median(xs):
+    xs=[float(x) for x in xs if _f(x,0.0)>0]
+    if not xs:
+        return 0.0
+    xs=sorted(xs)
+    m=len(xs)//2
+    return xs[m] if len(xs)%2 else (xs[m-1]+xs[m])/2.0
+
+
+def _pro_price_action(cs, direction):
+    """Indicator-independent M1 price-action confluence gate.
+
+    Uses only completed OHLC candles. It looks for either:
+      continuation: structure shift -> displacement -> retest/hold -> confirmation
+      reversal: liquidity sweep -> structure shift -> displacement -> retest/confirm
+    The gate is deliberately strict; it is a selector, not a claim of any fixed
+    future win rate.
+    """
+    if len(cs) < 20:
+        return {"qualified":False,"type":"INSUFFICIENT","score":0,"checks":{}}
+
+    recent=cs[-20:]
+    prior=cs[-12:-1]
+    highs=[c["high"] for c in prior]
+    lows=[c["low"] for c in prior]
+    if not highs or not lows:
+        return {"qualified":False,"type":"INSUFFICIENT","score":0,"checks":{}}
+
+    last=cs[-1]
+    prev=cs[-2]
+    avg_ranges=[max(c["high"]-c["low"],0.0) for c in cs[-8:-1]]
+    med_range=max(_median(avg_ranges),1e-12)
+    last_range=max(last["high"]-last["low"],1e-12)
+    last_body=abs(last["close"]-last["open"])
+    body_ratio=min(1.0,last_body/last_range)
+    close_edge_up=(last["high"]-last["close"])/last_range <= 0.25
+    close_edge_down=(last["close"]-last["low"])/last_range <= 0.25
+
+    swing_high=max(highs[-6:])
+    swing_low=min(lows[-6:])
+    earlier_high=max(highs[:6])
+    earlier_low=min(lows[:6])
+
+    if direction=="UP":
+        structure_shift=last["close"]>swing_high and prev["close"]<=swing_high
+        displacement=body_ratio>=0.62 and last_range>=med_range*1.15 and last["close"]>last["open"] and close_edge_up
+        broken_level=swing_high
+        retest_window=cs[-5:-1]
+        retest=min(abs(c["low"]-broken_level) for c in retest_window) if retest_window else 1e99
+        retest_hold=retest <= max(med_range*0.75,1e-12) and last["low"]>=broken_level-max(med_range*0.85,1e-12)
+        confirmation=last["close"]>prev["close"] and last["close"]>=last["open"]
+        sweep=(last["low"]<earlier_low and last["close"]>earlier_low)
+        clean_space=(max(c["high"] for c in recent[-5:])-last["close"]) >= -max(med_range*0.5,1e-12)
+    else:
+        structure_shift=last["close"]<swing_low and prev["close"]>=swing_low
+        displacement=body_ratio>=0.62 and last_range>=med_range*1.15 and last["close"]<last["open"] and close_edge_down
+        broken_level=swing_low
+        retest_window=cs[-5:-1]
+        retest=min(abs(c["high"]-broken_level) for c in retest_window) if retest_window else 1e99
+        retest_hold=retest <= max(med_range*0.75,1e-12) and last["high"]<=broken_level+max(med_range*0.85,1e-12)
+        confirmation=last["close"]<prev["close"] and last["close"]<=last["open"]
+        sweep=(last["high"]>earlier_high and last["close"]<earlier_high)
+        clean_space=(last["close"]-min(c["low"] for c in recent[-5:])) >= -max(med_range*0.5,1e-12)
+
+    # Continuation is deliberately stricter than a single breakout:
+    continuation_checks={
+        "structure_shift":bool(structure_shift),
+        "displacement":bool(displacement),
+        "retest_hold":bool(retest_hold),
+        "confirmation":bool(confirmation),
+        "clean_space":bool(clean_space),
+    }
+    continuation_score=sum(1 for x in continuation_checks.values() if x)
+
+    # Reversal requires a genuine sweep before the same structure/displacement
+    # sequence. This prevents a generic overbought/oversold reading from becoming
+    # a reversal signal.
+    reversal_checks={
+        "liquidity_sweep":bool(sweep),
+        "structure_shift":bool(structure_shift),
+        "displacement":bool(displacement),
+        "retest_hold":bool(retest_hold),
+        "confirmation":bool(confirmation),
+    }
+    reversal_score=sum(1 for x in reversal_checks.values() if x)
+
+    if continuation_score>=5:
+        kind="CONTINUATION"
+        selected=continuation_checks
+        score=100
+    elif reversal_score>=5:
+        kind="REVERSAL"
+        selected=reversal_checks
+        score=100
+    else:
+        # A 4/5 setup is tracked for learning/audit, but cannot reach the live signal pool.
+        kind="WATCH"
+        selected=continuation_checks if continuation_score>=reversal_score else reversal_checks
+        score=max(continuation_score,reversal_score)*20
+
+    return {
+        "qualified":bool(score>=100),
+        "type":kind,
+        "score":int(score),
+        "checks":selected,
+        "continuation_score":int(continuation_score),
+        "reversal_score":int(reversal_score),
+        "body_ratio":round(body_ratio,3),
+        "range_vs_median":round(last_range/max(med_range,1e-12),3),
+        "broken_level":float(broken_level),
+    }
+
+
 def analyze_asset(asset, candles, price=None, forced_strategy=None, learning_campaign=False):
     cs = [_norm(c) for c in candles if isinstance(c, dict)]
     if len(cs) < 45:
@@ -307,7 +421,18 @@ def analyze_asset(asset, candles, price=None, forced_strategy=None, learning_cam
         "DOWN": _sequence_quality(cs, "DOWN"),
     }
 
+    pro_price_action = {
+        "UP": _pro_price_action(cs, "UP"),
+        "DOWN": _pro_price_action(cs, "DOWN"),
+    }
+
     def score(direction, strategy):
+        # High-accuracy live mode is price-action-first: no strategy can enter
+        # the delivery pool unless the completed OHLC sequence passes the strict
+        # indicator-independent PRO structure gate.
+        if not pro_price_action[direction]["qualified"]:
+            return -1.0
+
         structure_ok = (
             direction == "UP" and ema_bull
         ) or (
@@ -600,6 +725,8 @@ def analyze_asset(asset, candles, price=None, forced_strategy=None, learning_cam
             "down_direction_compatible": not (trend == "UP"),
             "up_qualified": bool(strategy_active and up_score >= 82 and trend != "DOWN"),
             "down_qualified": bool(strategy_active and down_score >= 82 and trend != "UP"),
+            "price_action_gate_up": bool(pro_price_action["UP"]["qualified"]),
+            "price_action_gate_down": bool(pro_price_action["DOWN"]["qualified"]),
         })
 
     candidates = []
@@ -682,7 +809,7 @@ def analyze_asset(asset, candles, price=None, forced_strategy=None, learning_cam
         f"RSI={rr:.1f} | momentum={momentum_norm:.2f}ATR | "
         f"EMA_gap={ema_gap_norm:.2f}ATR | EMA_slope={ema_slope_norm:.2f}ATR | "
         f"structure_q={structure_quality[expected]:.2f} | body={body_ratio:.2f} | "
-        f"efficiency={_efficiency(v, 8):.2f} | pattern={pattern} | "
+        f"PRO={pro_price_action[expected]['type']} 5/5 | efficiency={_efficiency(v, 8):.2f} | pattern={pattern} | "
         f"Donchian30={dc['state']}/{('EXPANDING' if dc['expansion'] else 'FLAT')} | "
         f"Stoch14,3,3={stoch_k:.1f}/{stoch_d:.1f}/{stoch_cross} | "
         f"volatility={volatility_ratio:.2f} | support={support:.6g} | resistance={resistance:.6g}"
@@ -698,6 +825,12 @@ def analyze_asset(asset, candles, price=None, forced_strategy=None, learning_cam
         "strategy_audit": strategy_audit,
         "strategy_audit_count": len(strategy_audit),
         "indicator_audit_scope": "ALL_8_STRATEGIES_SAME_LIVE_INDICATORS",
+        "pro_price_action": {
+            "UP": dict(pro_price_action["UP"]),
+            "DOWN": dict(pro_price_action["DOWN"]),
+            "selected": dict(pro_price_action[expected]),
+            "live_gate": "5_OF_5_COMPLETED_OHLC_CHECKS",
+        },
         "strategy_candidates": [
             {
                 "strategy": str(v.get("strategy") or ""),
@@ -757,6 +890,10 @@ def analyze_asset(asset, candles, price=None, forced_strategy=None, learning_cam
             "support": round(support, 8),
             "resistance": round(resistance, 8),
             "strategy_audit_count": len(strategy_audit),
+            "pro_price_action_type": pro_price_action[expected]["type"],
+            "pro_price_action_score": pro_price_action[expected]["score"],
+            "pro_price_action_qualified": bool(pro_price_action[expected]["qualified"]),
+            "pro_price_action_checks": dict(pro_price_action[expected]["checks"]),
             "bollinger_period": 30,
             "bollinger_stddev": 2.2,
             "bollinger_signal": bb["signal"],
