@@ -2828,30 +2828,56 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
             proxy_volume=(ind_ctx.get("real_volume_verified") is not True)
             local["volume_proxy_mode"]=bool(proxy_volume)
             local["volume_proxy_ai_verified"]=False
+            local["volume_proxy_local_fallback"]=False
             if proxy_volume and deep_analysis:
-                ai_verified=(
-                    isinstance(d,dict)
-                    and str(d.get("direction") or "").upper()==str(x.get("direction") or "").upper()
-                    and int(float(d.get("confidence") or 0))>=80
-                )
-                if not ai_verified:
+                if isinstance(d,dict) and str(d.get("direction") or "").upper() in {"UP","DOWN"}:
+                    ai_direction=str(d.get("direction") or "").upper()
+                    try:
+                        ai_confidence=max(0,min(100,int(float(d.get("confidence") or 0))))
+                    except (TypeError,ValueError):
+                        ai_confidence=0
+                    if ai_direction!=str(x.get("direction") or "").upper() or ai_confidence<80:
+                        log.info(
+                            "AI_PROXY_VOLUME_VETO pair=%s local_direction=%s "
+                            "reason=strict_ai_disagreement_or_low_confidence provider=%s ai_direction=%s ai_confidence=%s",
+                            x.get("pair"),x.get("direction"),d.get("provider"),
+                            ai_direction,ai_confidence
+                        )
+                        CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
+                        return None
+                    local["volume_proxy_ai_verified"]=True
+                    local["volume_proxy_ai_confidence"]=ai_confidence
                     log.info(
-                        "AI_PROXY_VOLUME_VETO pair=%s local_direction=%s "
-                        "reason=no_strict_same_direction_verification provider=%s ai_direction=%s ai_confidence=%s",
-                        x.get("pair"),x.get("direction"),
-                        d.get("provider") if isinstance(d,dict) else "NONE",
-                        d.get("direction") if isinstance(d,dict) else "NONE",
-                        d.get("confidence") if isinstance(d,dict) else 0
+                        "AI_PROXY_VOLUME_VERIFIED pair=%s direction=%s ai_confidence=%s provider=%s",
+                        x.get("pair"),x.get("direction"),ai_confidence,d.get("provider")
                     )
-                    CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
-                    return None
-                local["volume_proxy_ai_verified"]=True
-                local["volume_proxy_ai_confidence"]=int(float(d.get("confidence") or 0))
-                log.info(
-                    "AI_PROXY_VOLUME_VERIFIED pair=%s direction=%s ai_confidence=%s provider=%s",
-                    x.get("pair"),x.get("direction"),
-                    local["volume_proxy_ai_confidence"],d.get("provider")
-                )
+                else:
+                    # External AI outage/quota exhaustion must not become a hidden
+                    # availability gate. Only exceptionally strong local exact setups
+                    # may use this fallback; an actual contradictory AI response above
+                    # remains a hard veto. This keeps the local Brain authoritative.
+                    strict_local_fallback=(
+                        int(local_confidence)>=94
+                        and ind_ctx.get("value_area_acceptance") is True
+                        and ind_ctx.get("m1_continuation_ok") is True
+                        and ind_ctx.get("slope_persistent") is True
+                        and ind_ctx.get("poc_migration_against") is not True
+                    )
+                    if not strict_local_fallback:
+                        log.info(
+                            "AI_PROXY_VOLUME_VETO pair=%s local_direction=%s "
+                            "reason=no_external_ai_and_local_fallback_threshold_not_met confidence=%s",
+                            x.get("pair"),x.get("direction"),local_confidence
+                        )
+                        CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
+                        return None
+                    local["volume_proxy_local_fallback"]=True
+                    local["volume_proxy_local_fallback_confidence"]=int(local_confidence)
+                    log.info(
+                        "AI_PROXY_VOLUME_LOCAL_FALLBACK pair=%s direction=%s confidence=%s "
+                        "reason=external_ai_unavailable_strict_local_gates",
+                        x.get("pair"),x.get("direction"),local_confidence
+                    )
 
         # Weak momentum inside a SIDEWAYS 15m regime produced two of the
         # consecutive losses. Keep this as a local zero-latency qualification
@@ -3432,8 +3458,16 @@ async def cycle_loop():
             real_volume_ok=(ind.get("real_volume_verified") is True)
             proxy_volume_ok=(
                 str(ind.get("volume_mode") or "").upper()=="M1_EQUAL_ACTIVITY_PROXY"
-                and candidate.get("volume_proxy_ai_verified") is True
-                and int(candidate.get("volume_proxy_ai_confidence") or 0)>=80
+                and (
+                    (
+                        candidate.get("volume_proxy_ai_verified") is True
+                        and int(candidate.get("volume_proxy_ai_confidence") or 0)>=80
+                    )
+                    or (
+                        candidate.get("volume_proxy_local_fallback") is True
+                        and int(candidate.get("volume_proxy_local_fallback_confidence") or 0)>=94
+                    )
+                )
             )
             if not real_volume_ok and not proxy_volume_ok:
                 log.info(
