@@ -56,13 +56,16 @@ def _ts(value, default=-1.0):
 
 
 def _norm(raw):
+    volume_raw=raw.get("volume",raw.get("v"))
+    volume=_f(volume_raw,0.0)
     return {
         "time":_ts(raw.get("time",raw.get("t"))),
         "open":_f(raw.get("open",raw.get("o"))),
         "high":_f(raw.get("high",raw.get("h"))),
         "low":_f(raw.get("low",raw.get("l"))),
         "close":_f(raw.get("close",raw.get("c"))),
-        "volume":max(_f(raw.get("volume",raw.get("v")),1.0),1.0),
+        "volume":max(volume,0.0),
+        "volume_present":bool(volume>0.0),
     }
 
 
@@ -131,38 +134,66 @@ def _volume_profile(cs,bins=PROFILE_BINS):
         return None
     low=min(c["low"] for c in sample)
     high=max(c["high"] for c in sample)
-    total=sum(max(c["volume"],1.0) for c in sample)
+    raw_volumes=[max(float(c.get("volume",0.0) or 0.0),0.0) for c in sample]
+    volume_bars=sum(1 for v in raw_volumes if v>0.0)
+    volume_coverage=volume_bars/max(1,len(sample))
+    volume_mode="REAL_VOLUME_OR_TICK_VOLUME" if volume_coverage>=0.80 else "M1_EQUAL_ACTIVITY_PROXY"
 
     if high<=low:
         px=sample[-1]["close"]
         return {
             "poc":px,"vah":px,"val":px,
             "range_high":high,"range_low":low,
-            "total_volume":total,"bins":1,
+            "total_volume":sum(v if v>0 else 1.0 for v in raw_volumes),
+            "bins":1,
+            "volume_coverage":volume_coverage,
+            "volume_mode":volume_mode,
+            "volume_bars":volume_bars,
         }
 
     step=(high-low)/float(bins)
     volumes=[0.0]*bins
-    for c in sample:
-        typical=(c["high"]+c["low"]+c["close"])/3.0
-        idx=int((typical-low)/step)
-        idx=max(0,min(bins-1,idx))
-        volumes[idx]+=max(c["volume"],1.0)
+    for c,v_raw in zip(sample,raw_volumes):
+        vol=v_raw if v_raw>0.0 else 1.0
+        clo=float(c["low"]); chi=float(c["high"])
+        if chi<=clo:
+            idx=int((float(c["close"])-low)/step)
+            idx=max(0,min(bins-1,idx))
+            volumes[idx]+=vol
+            continue
 
-    poc_idx=max(range(bins),key=lambda i:volumes[i])
+        first=max(0,min(bins-1,int((clo-low)/step)))
+        last=max(0,min(bins-1,int((chi-low)/step)))
+        span=max(chi-clo,1e-12)
+        for idx in range(first,last+1):
+            row_low=low+idx*step
+            row_high=low+(idx+1)*step
+            overlap=max(0.0,min(chi,row_high)-max(clo,row_low))
+            if overlap>0.0:
+                volumes[idx]+=vol*(overlap/span)
+
+    poc_idx=max(range(bins),key=lambda i:(volumes[i],-abs(i-(bins-1)/2.0)))
     target=sum(volumes)*VALUE_AREA_FRACTION
     accumulated=volumes[poc_idx]
     left=right=poc_idx
 
     while accumulated<target and (left>0 or right<bins-1):
-        lv=volumes[left-1] if left>0 else -1.0
-        rv=volumes[right+1] if right<bins-1 else -1.0
-        if rv>=lv:
-            right+=1
-            accumulated+=volumes[right]
-        else:
+        candidates=[]
+        if left>0:
+            candidates.append((volumes[left-1],"L"))
+        if right<bins-1:
+            candidates.append((volumes[right+1],"R"))
+        if not candidates:
+            break
+        next_volume,side=max(candidates,key=lambda item:item[0])
+        if accumulated+next_volume>target and accumulated>0:
+            break
+        if side=="L":
             left-=1
-            accumulated+=volumes[left]
+            accumulated+=next_volume
+        else:
+            right+=1
+            accumulated+=next_volume
 
     return {
         "poc":low+(poc_idx+0.5)*step,
@@ -172,6 +203,66 @@ def _volume_profile(cs,bins=PROFILE_BINS):
         "range_low":low,
         "total_volume":sum(volumes),
         "bins":bins,
+        "volume_coverage":volume_coverage,
+        "volume_mode":volume_mode,
+        "volume_bars":volume_bars,
+    }
+
+
+def _profile_migration(cs):
+    current=_volume_profile(cs[-PROFILE_LOOKBACK:])
+    if not current:
+        return None
+    previous_sample=cs[-(PROFILE_LOOKBACK*2):-PROFILE_LOOKBACK]
+    previous=_volume_profile(previous_sample) if previous_sample else None
+    if not previous:
+        return {
+            "poc_delta":0.0,
+            "poc_migration_norm":0.0,
+            "previous_poc":None,
+            "available":False,
+        }
+    scale=max(
+        abs(float(current["range_high"])-float(current["range_low"])),
+        abs(float(previous["range_high"])-float(previous["range_low"])),
+        1e-12,
+    )
+    delta=float(current["poc"])-float(previous["poc"])
+    return {
+        "poc_delta":delta,
+        "poc_migration_norm":delta/scale,
+        "previous_poc":float(previous["poc"]),
+        "available":True,
+    }
+
+
+def _avwap_slope_features(cs,anchor_ts):
+    if len(cs)<3:
+        current,_=_anchored_vwap(cs,anchor_ts)
+        return {
+            "avwap_series":[current],
+            "avwap_slope_1":0.0,
+            "avwap_slope_2":0.0,
+            "avwap_slope_3":0.0,
+            "slope_persistence":0,
+        }
+
+    values=[]
+    for cut in (3,2,1,0):
+        subset=cs[:-cut] if cut else cs
+        av,_=_anchored_vwap(subset,anchor_ts)
+        values.append(float(av))
+    s1=values[-1]-values[-2]
+    s2=values[-2]-values[-3]
+    s3=values[-3]-values[-4]
+    pos=sum(1 for s in (s1,s2,s3) if s>0)
+    neg=sum(1 for s in (s1,s2,s3) if s<0)
+    return {
+        "avwap_series":values,
+        "avwap_slope_1":s1,
+        "avwap_slope_2":s2,
+        "avwap_slope_3":s3,
+        "slope_persistence":pos if pos>=neg else -neg,
     }
 
 
@@ -190,12 +281,7 @@ def analyze_asset(
     forced_strategy=None,
     learning_campaign=False,
 ):
-    """Return one deterministic AVWAP + Volume Profile candidate or None.
-
-    `forced_strategy` and `learning_campaign` remain accepted for API
-    compatibility with the overnight learning lab. Live direction is never
-    delegated to those legacy strategy names.
-    """
+    """Return one deterministic AVWAP + Volume Profile candidate or None."""
     forced=str(forced_strategy or "").upper().strip()
     if forced and forced!=ALLOWED_STRATEGY:
         return None
@@ -213,19 +299,25 @@ def analyze_asset(
         return None
 
     last=cs[-1]
+    previous=cs[-2]
     anchor_ts=int(blocks[-1]["time"])
     avwap,avwap_volume=_anchored_vwap(cs,anchor_ts)
-    previous_avwap,_=_anchored_vwap(cs[:-1],anchor_ts)
+    if avwap<=0:
+        _diag(pair,"invalid_avwap",avwap=avwap)
+        return None
+
     profile=_volume_profile(cs)
-    if avwap<=0 or not profile:
-        _diag(pair,"invalid_avwap_or_profile",avwap=avwap,profile=bool(profile))
+    if not profile or float(profile.get("poc") or 0.0)<=0:
+        _diag(pair,"invalid_profile",profile=bool(profile))
         return None
 
     px=float(last["close"])
     poc=float(profile["poc"])
     vah=float(profile["vah"])
     val=float(profile["val"])
-    slope=avwap-previous_avwap
+    slope=avwap-float(_anchored_vwap(cs[:-1],anchor_ts)[0])
+    slope_features=_avwap_slope_features(cs,anchor_ts)
+    migration=_profile_migration(cs)
 
     up=px>avwap and px>poc
     down=px<avwap and px<poc
@@ -234,16 +326,90 @@ def analyze_asset(
         return None
 
     direction="UP" if up else "DOWN"
-    slope_aligned=(slope>0) if direction=="UP" else (slope<0)
-    value_acceptance=(px>=vah) if direction=="UP" else (px<=val)
+    slope_aligned_steps=(
+        sum(
+            1 for s in (
+                slope_features["avwap_slope_1"],
+                slope_features["avwap_slope_2"],
+                slope_features["avwap_slope_3"],
+            ) if s>0
+        ) if direction=="UP" else
+        sum(
+            1 for s in (
+                slope_features["avwap_slope_1"],
+                slope_features["avwap_slope_2"],
+                slope_features["avwap_slope_3"],
+            ) if s<0
+        )
+    )
+    slope_persistent=slope_aligned_steps>=2
 
-    # This is a rule-quality score, NOT a future win probability.
+    value_acceptance=(px>=vah) if direction=="UP" else (px<=val)
+    prev_key=max(avwap,poc) if direction=="UP" else min(avwap,poc)
+    current_key=max(avwap,poc) if direction=="UP" else min(avwap,poc)
+    level_reclaim=(
+        float(previous["close"])<=prev_key and px>current_key
+        if direction=="UP"
+        else float(previous["close"])>=prev_key and px<current_key
+    )
+
+    migration_norm=float((migration or {}).get("poc_migration_norm") or 0.0)
+    migration_aligned=(
+        migration_norm>0.05 if direction=="UP"
+        else migration_norm<-0.05
+    )
+    migration_against=(
+        migration_norm<-0.15 if direction=="UP"
+        else migration_norm>0.15
+    )
+
+    value_width=max(vah-val,1e-12)
+    profile_range=max(float(profile["range_high"])-float(profile["range_low"]),1e-12)
+    value_position=(
+        "ABOVE_VALUE" if px>vah else
+        "BELOW_VALUE" if px<val else
+        "UPPER_VALUE" if px>poc else
+        "LOWER_VALUE" if px<poc else "AT_POC"
+    )
+
+    coverage=float(profile.get("volume_coverage") or 0.0)
+    # Real/tick volume is preferred. A sparse volume source remains visible to
+    # the learner and costs score, but does not silently disappear.
+    volume_quality="HIGH" if coverage>=0.80 else "MEDIUM" if coverage>=0.50 else "LOW"
+
+    # A one-minute expiry benefits from directional acceptance or a genuine
+    # reclaim of AVWAP/POC. A mere location above/below both levels while still
+    # trapped inside the value area is treated as a weak setup.
+    directional_acceptance=bool(value_acceptance or level_reclaim)
+    if not directional_acceptance:
+        _diag(
+            pair,"inside_value_without_acceptance",
+            direction=direction,price=round(px,10),avwap=round(avwap,10),
+            poc=round(poc,10),vah=round(vah,10),val=round(val,10),
+            reclaim=level_reclaim
+        )
+        return None
+
+    if migration_against:
+        _diag(pair,"poc_migration_against",direction=direction,migration_norm=round(migration_norm,4))
+        return None
+
+    # If a previous profile exists and the POC is migrating in the same
+    # direction, that is a reinforcing confluence. Flat migration is neutral.
     score=90
-    if slope_aligned:
-        score+=5
+    if slope_persistent:
+        score+=3
     if value_acceptance:
-        score+=4
-    confidence=min(99,score)
+        score+=3
+    elif level_reclaim:
+        score+=1
+    if migration_aligned:
+        score+=2
+    if coverage>=0.80:
+        score+=1
+    if coverage<0.50:
+        score-=2
+    confidence=min(99,max(0,int(score)))
 
     trend="AVWAP_BULLISH" if up else "AVWAP_BEARISH"
     structure="ABOVE_AVWAP_POC" if up else "BELOW_AVWAP_POC"
@@ -254,14 +420,32 @@ def analyze_asset(
         "volume_profile_vah":vah,
         "volume_profile_val":val,
         "avwap_slope":slope,
+        "avwap_slope_1":slope_features["avwap_slope_1"],
+        "avwap_slope_2":slope_features["avwap_slope_2"],
+        "avwap_slope_3":slope_features["avwap_slope_3"],
+        "avwap_slope_persistence":slope_features["slope_persistence"],
+        "profile_poc_delta":float((migration or {}).get("poc_delta") or 0.0),
+        "profile_poc_migration_norm":migration_norm,
+        "profile_previous_poc":(migration or {}).get("previous_poc"),
+        "profile_migration_available":bool((migration or {}).get("available")),
         "profile_range_high":profile["range_high"],
         "profile_range_low":profile["range_low"],
+        "profile_range":profile_range,
+        "profile_value_area_width":value_width,
         "profile_total_volume":profile["total_volume"],
         "profile_bins":profile["bins"],
+        "volume_coverage":coverage,
+        "volume_bars":int(profile.get("volume_bars") or 0),
+        "volume_mode":profile.get("volume_mode"),
+        "volume_quality":volume_quality,
+        "value_position":value_position,
+        "value_area_acceptance":value_acceptance,
+        "level_reclaim":level_reclaim,
+        "slope_persistent":slope_persistent,
+        "poc_migration_aligned":migration_aligned,
+        "poc_migration_against":migration_against,
         "anchor_15m_start_ts":anchor_ts,
         "avwap_volume":avwap_volume,
-        "slope_aligned":slope_aligned,
-        "value_area_acceptance":value_acceptance,
     }
 
     result={
@@ -287,7 +471,9 @@ def analyze_asset(
         "reason":(
             f"Closed M1 price={px:.8f}; AVWAP={avwap:.8f}; POC={poc:.8f}; "
             f"VAH={vah:.8f}; VAL={val:.8f}; AVWAP_slope={slope:.8f}; "
-            f"AVWAP+POC aligned; closed 1M + completed 15M anchor only."
+            f"slope_persistence={slope_aligned_steps}/3; value={value_position}; "
+            f"reclaim={level_reclaim}; POC_migration={migration_norm:.4f}; "
+            f"volume_quality={volume_quality}; AVWAP+POC aligned."
         ),
         "indicator_features":features,
         "indicators":features,
@@ -302,13 +488,13 @@ def analyze_asset(
         "decision_candle_closed":True,
         "price":px,
         "five_minute_eligible":False,
-        "self_strategy_version":"AVWAP_VP_V1",
+        "self_strategy_version":"AVWAP_VP_V2",
         "strategy_candidates":[{
             "strategy":ALLOWED_STRATEGY,
             "direction":direction,
             "score":confidence,
             "expiry_minutes":1,
-            "self_strategy_version":"AVWAP_VP_V1",
+            "self_strategy_version":"AVWAP_VP_V2",
         }],
         "strategy_audit":[{
             "strategy":ALLOWED_STRATEGY,
