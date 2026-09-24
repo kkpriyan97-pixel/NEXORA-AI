@@ -508,10 +508,7 @@ async def _initialize_campaign(session_id):
             votes=dict(seed.get("council_votes") or {})
     except Exception:
         pass
-    core=[
-        "TREND_FOLLOWING","MOMENTUM","BREAKOUT","PULLBACK",
-        "REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY"
-    ]
+    core=["AVWAP_VOLUME_PROFILE"]
     ordered=[]
     if strategy: ordered.append(strategy)
     for s,_ in sorted(votes.items(),key=lambda kv:(-int(kv[1] or 0),kv[0])):
@@ -770,10 +767,10 @@ def _research_strategy_hint(snapshot):
     except Exception:
         return hints
     aliases=(
-        ("breakout", "BREAKOUT"),("break out","BREAKOUT"),("trend following","TREND_FOLLOWING"),
-        ("momentum","MOMENTUM"),("pullback","PULLBACK"),("retest","PULLBACK"),
-        ("reversal","REVERSAL"),("mean reversion","MEAN_REVERSION"),
-        ("price action","PRICE_ACTION"),("volatility","VOLATILITY"),("vwap","MOMENTUM"),
+        ("anchored vwap","AVWAP_VOLUME_PROFILE"),("volume profile","AVWAP_VOLUME_PROFILE"),
+        ("point of control","AVWAP_VOLUME_PROFILE"),("poc","AVWAP_VOLUME_PROFILE"),
+        ("vah","AVWAP_VOLUME_PROFILE"),("val","AVWAP_VOLUME_PROFILE"),
+        ("avwap","AVWAP_VOLUME_PROFILE"),
     )
     seen=set()
     for mid,payload in rows:
@@ -789,10 +786,10 @@ async def _load_research_hints():
         return []
     import psycopg
     aliases=(
-        ("breakout","BREAKOUT"),("break out","BREAKOUT"),("trend following","TREND_FOLLOWING"),
-        ("momentum","MOMENTUM"),("pullback","PULLBACK"),("retest","PULLBACK"),
-        ("reversal","REVERSAL"),("mean reversion","MEAN_REVERSION"),
-        ("price action","PRICE_ACTION"),("volatility","VOLATILITY"),("vwap","MOMENTUM"),
+        ("anchored vwap","AVWAP_VOLUME_PROFILE"),("volume profile","AVWAP_VOLUME_PROFILE"),
+        ("point of control","AVWAP_VOLUME_PROFILE"),("poc","AVWAP_VOLUME_PROFILE"),
+        ("vah","AVWAP_VOLUME_PROFILE"),("val","AVWAP_VOLUME_PROFILE"),
+        ("avwap","AVWAP_VOLUME_PROFILE"),
     )
     try:
         def read():
@@ -970,9 +967,8 @@ async def _build_candidate(forced_strategy=None,return_all=False):
         print(f"LEARNING_RESEARCH_HINTS_FAILED type={type(e).__name__} message={str(e)[:120]} fallback=core_strategy_families")
     session_day=_learning_session_day(_now_uae())
     session_id=f"{session_day}:OVERNIGHT"
-    base_preferred=[x[0] for x in hints] or [
-        "TREND_FOLLOWING","MOMENTUM","BREAKOUT","PULLBACK",
-        "REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY"
+    base_preferred=[x[0] for x in hints if x[0]=="AVWAP_VOLUME_PROFILE"] or [
+        "AVWAP_VOLUME_PROFILE"
     ]
     if forced_strategy:
         forced_strategy=str(forced_strategy).upper().strip()
