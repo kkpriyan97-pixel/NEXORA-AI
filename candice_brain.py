@@ -319,6 +319,86 @@ def _decision_time_bucket(ts):
         return "UAE_UNKNOWN"
 
 
+
+
+def _bollinger_confirmation(candles, direction, period=18, multiplier=2.0):
+    """Return a zero-network M1 Bollinger 18/2 confirmation layer.
+    
+    Bollinger is confirmation only: it never chooses or flips the AVWAP+VP
+    direction and it never hard-blocks a live candidate. This keeps the
+    3-minute scheduler and signal cadence independent of the confirmation.
+    """
+    try:
+        n=int(period)
+        k=float(multiplier)
+    except (TypeError,ValueError):
+        n=18
+        k=2.0
+    n=max(18,min(18,n))
+    k=2.0
+
+    closes=[_f(x.get("close"),0.0) for x in (candles or []) if isinstance(x,dict)]
+    closes=[x for x in closes if x>0.0]
+    if len(closes)<n:
+        return {
+            "bb_period":n,
+            "bb_multiplier":k,
+            "bb_ready":False,
+            "bb_confirmation":"UNAVAILABLE",
+            "bb_basis":None,
+            "bb_upper":None,
+            "bb_lower":None,
+            "bb_bandwidth":None,
+            "bb_bandwidth_expanding":False,
+        }
+
+    window=closes[-n:]
+    mean=sum(window)/n
+    variance=sum((x-mean)*(x-mean) for x in window)/n
+    stdev=variance**0.5
+    upper=mean+(k*stdev)
+    lower=mean-(k*stdev)
+
+    prev_window=closes[-(n+1):-1] if len(closes)>=n+1 else []
+    prev_mean=(sum(prev_window)/n) if len(prev_window)==n else mean
+    prev_var=(
+        sum((x-prev_mean)*(x-prev_mean) for x in prev_window)/n
+        if len(prev_window)==n else variance
+    )
+    prev_stdev=max(0.0,prev_var**0.5)
+    prev_upper=prev_mean+(k*prev_stdev)
+    prev_lower=prev_mean-(k*prev_stdev)
+
+    bandwidth=(upper-lower)/max(abs(mean),1e-12)
+    prev_bandwidth=(prev_upper-prev_lower)/max(abs(prev_mean),1e-12)
+    bandwidth_expanding=bandwidth>prev_bandwidth
+
+    last_close=window[-1]
+    direction=str(direction or "").upper()
+    if direction=="UP":
+        aligned=(last_close>=mean and upper>=prev_upper and (bandwidth_expanding or last_close>=upper*0.995))
+        state="ALIGNED" if aligned else "NEUTRAL"
+    elif direction=="DOWN":
+        aligned=(last_close<=mean and lower<=prev_lower and (bandwidth_expanding or last_close<=lower*1.005))
+        state="ALIGNED" if aligned else "NEUTRAL"
+    else:
+        state="UNAVAILABLE"
+
+    return {
+        "bb_period":n,
+        "bb_multiplier":k,
+        "bb_ready":True,
+        "bb_confirmation":state,
+        "bb_basis":mean,
+        "bb_upper":upper,
+        "bb_lower":lower,
+        "bb_bandwidth":bandwidth,
+        "bb_bandwidth_expanding":bandwidth_expanding,
+        "bb_last_close":last_close,
+        "bb_previous_basis":prev_mean,
+        "bb_previous_upper":prev_upper,
+        "bb_previous_lower":prev_lower,
+    }
 def analyze_asset(
     asset,
     candles,
@@ -371,6 +451,9 @@ def analyze_asset(
         return None
 
     direction="UP" if up else "DOWN"
+    # Bollinger Bands 18/2 are a secondary M1 confirmation layer only.
+    # No BB state can change the AVWAP+VP direction or block the scheduler.
+    bb=_bollinger_confirmation(cs,direction,period=18,multiplier=2.0)
     slope_aligned_steps=(
         sum(
             1 for s in (
@@ -491,6 +574,11 @@ def analyze_asset(
         _diag(pair,"poc_migration_against",direction=direction,migration_norm=round(migration_norm,4))
         return None
 
+    # Bollinger 18/2 confirmation affects confluence/ranking only.
+    # It is deliberately soft so an isolated BB disagreement cannot suppress
+    # otherwise valid AVWAP+VP setups or disturb the 3-minute signal cadence.
+    bb_bonus=2 if bb.get("bb_confirmation")=="ALIGNED" else 0
+
     # If a previous profile exists and the POC is migrating in the same
     # direction, that is a reinforcing confluence. Flat migration is neutral.
     score=90
@@ -502,6 +590,8 @@ def analyze_asset(
         score+=1
     if migration_aligned:
         score+=2
+    if bb_bonus:
+        score+=bb_bonus
     if coverage>=0.80:
         score+=1
     elif volume_proxy_mode:
@@ -528,6 +618,16 @@ def analyze_asset(
         "profile_poc_migration_norm":migration_norm,
         "profile_previous_poc":(migration or {}).get("previous_poc"),
         "profile_migration_available":bool((migration or {}).get("available")),
+        "bb_period":bb.get("bb_period",18),
+        "bb_multiplier":bb.get("bb_multiplier",2.0),
+        "bb_ready":bb.get("bb_ready",False),
+        "bb_confirmation":bb.get("bb_confirmation","UNAVAILABLE"),
+        "bb_basis":bb.get("bb_basis"),
+        "bb_upper":bb.get("bb_upper"),
+        "bb_lower":bb.get("bb_lower"),
+        "bb_bandwidth":bb.get("bb_bandwidth"),
+        "bb_bandwidth_expanding":bb.get("bb_bandwidth_expanding",False),
+        "bb_confirmation_bonus":bb_bonus,
         "profile_range_high":profile["range_high"],
         "profile_range_low":profile["range_low"],
         "profile_range":profile_range,
@@ -583,7 +683,8 @@ def analyze_asset(
             f"VAH={vah:.8f}; VAL={val:.8f}; AVWAP_slope={slope:.8f}; "
             f"slope_persistence={slope_aligned_steps}/3; value={value_position}; "
             f"reclaim={level_reclaim}; POC_migration={migration_norm:.4f}; "
-            f"volume_quality={volume_quality}; AVWAP+POC aligned."
+            f"volume_quality={volume_quality}; AVWAP+POC aligned; "
+            f"BB(18,2)={bb.get("bb_confirmation","UNAVAILABLE")}."
         ),
         "indicator_features":features,
         "indicators":features,
@@ -613,7 +714,7 @@ def analyze_asset(
             "down_qualified":bool(down),
         }],
         "strategy_audit_count":1,
-        "indicator_audit_scope":"AVWAP_VOLUME_PROFILE_ONLY",
+        "indicator_audit_scope":"AVWAP_VOLUME_PROFILE_WITH_BB18_2_CONFIRMATION",
         "m1_sequence_signature":features["m1_sequence_signature"],
         "market_regime":features["market_regime"],
         "decision_time_bucket":features["decision_time_bucket"],
