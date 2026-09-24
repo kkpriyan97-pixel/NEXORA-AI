@@ -1,1024 +1,304 @@
-"""Candice Brain: regime-aware, evidence-first multi-strategy market analysis.
-Read-only DEMO analysis. No trade execution and no credential handling.
+"""Candice live technical brain.
+
+Live signal direction is generated ONLY from:
+1) Anchored VWAP
+2) Volume Profile (POC / VAH / VAL)
+
+The production scheduler, Telegram delivery and DEMO result watcher live in
+app.py. This module intentionally contains no legacy EMA/RSI/MACD/Donchian/
+Bollinger/Stochastic strategy families.
 """
 from __future__ import annotations
 
+import time
 from math import isfinite
-from self_strategy import discover as discover_self_strategy
-from strategy_knowledge import strategy_live_eligible
 
-EXPIRIES = (1, 2, 3, 4, 5, 10, 15)
+EXPIRIES=(1,)
+MIN_CLOSED_CANDLES=60
+ONE_MINUTE=60
+FIFTEEN_MINUTES=900
+CLOSE_GRACE_SECONDS=1
+PROFILE_LOOKBACK=60
+PROFILE_BINS=24
+VALUE_AREA_FRACTION=0.70
+ALLOWED_STRATEGY="AVWAP_VOLUME_PROFILE"
 
 
-def _f(x, d=0.0):
+def _f(value, default=0.0):
     try:
-        v = float(x)
-        return v if isfinite(v) else d
-    except Exception:
-        return d
+        x=float(value)
+        return x if isfinite(x) else default
+    except (TypeError, ValueError):
+        return default
 
 
-def _norm(c):
+def _ts(value, default=-1.0):
+    try:
+        x=float(value)
+        if x>20_000_000_000:
+            x/=1000.0
+        return x if isfinite(x) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _norm(raw):
     return {
-        "time": c.get("time", c.get("t")),
-        "open": _f(c.get("open", c.get("o"))),
-        "high": _f(c.get("high", c.get("h"))),
-        "low": _f(c.get("low", c.get("l"))),
-        "close": _f(c.get("close", c.get("c"))),
-        "volume": _f(c.get("volume", c.get("v"))),
+        "time":_ts(raw.get("time",raw.get("t"))),
+        "open":_f(raw.get("open",raw.get("o"))),
+        "high":_f(raw.get("high",raw.get("h"))),
+        "low":_f(raw.get("low",raw.get("l"))),
+        "close":_f(raw.get("close",raw.get("c"))),
+        "volume":max(_f(raw.get("volume",raw.get("v")),1.0),1.0),
     }
 
 
-def ema(v, n):
-    if not v:
-        return 0.0
-    k = 2 / (n + 1)
-    e = v[0]
-    for x in v[1:]:
-        e = x * k + e * (1 - k)
-    return e
-
-
-def rsi(v, n=14):
-    if len(v) < n + 1:
-        return 50.0
-    gains = []
-    losses = []
-    for a, b in zip(v[-n - 1:-1], v[-n:]):
-        d = b - a
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    ag = sum(gains) / n
-    al = sum(losses) / n
-    return 100.0 if al == 0 else 100 - (100 / (1 + ag / al))
-
-
-def stochastic(cs, k_period=14, d_period=3, slowing=3):
-    """Stochastic %K/%D using the chart settings shown by the user: 14/3/3."""
-    if len(cs) < k_period + slowing + d_period:
-        return 50.0, 50.0, "NEUTRAL"
-    raw=[]
-    for i in range(k_period, len(cs)+1):
-        w=cs[i-k_period:i]
-        hi=max(x["high"] for x in w)
-        lo=min(x["low"] for x in w)
-        den=max(hi-lo,1e-12)
-        raw.append(100.0*(cs[i-1]["close"]-lo)/den)
-    smooth=[]
-    for i in range(slowing, len(raw)+1):
-        smooth.append(sum(raw[i-slowing:i])/slowing)
-    if not smooth:
-        return 50.0,50.0,"NEUTRAL"
-    k=smooth[-1]
-    d=sum(smooth[-d_period:])/min(d_period,len(smooth))
-    prev_k=smooth[-2] if len(smooth)>=2 else k
-    prev_d=(sum(smooth[-d_period-1:-1])/min(d_period,len(smooth)-1)
-            if len(smooth)>=2 else d)
-    cross="BULLISH_CROSS" if prev_k<=prev_d and k>d else "BEARISH_CROSS" if prev_k>=prev_d and k<d else "NEUTRAL"
-    return k,d,cross
-
-
-
-def bollinger(cs, n=30, mult=2.2):
-    """Bollinger Bands matching the user's history AI settings: 30, 2.2."""
-    if len(cs) < n:
-        return {"middle":0.0,"upper":0.0,"lower":0.0,"signal":"UNKNOWN","position":"INSUFFICIENT","width_norm":0.0}
-    closes=[x["close"] for x in cs[-n:]]
-    middle=sum(closes)/n
-    variance=sum((x-middle)**2 for x in closes)/n
-    sd=variance**0.5
-    upper=middle+mult*sd
-    lower=middle-mult*sd
-    last=closes[-1]
-    width=max(upper-lower,0.0)
-    if last>upper:
-        signal="UP"; position="ABOVE_UPPER"
-    elif last<lower:
-        signal="DOWN"; position="BELOW_LOWER"
-    elif last>=middle:
-        signal="UP"; position="ABOVE_MIDDLE"
-    else:
-        signal="DOWN"; position="BELOW_MIDDLE"
-    return {
-        "middle":middle,"upper":upper,"lower":lower,
-        "signal":signal,"position":position,
-        "width_norm":width/max(abs(last),1e-12)
-    }
-
-def donchian(cs, period=30):
-    """Donchian Channel 30: prior-channel breakout plus channel-width regime."""
-    if len(cs) < period + 2:
-        return {"upper":0.0,"lower":0.0,"middle":0.0,"width_norm":0.0,
-                "state":"INSUFFICIENT","expansion":False,"breakout_up":False,"breakout_down":False}
-    prior=cs[-period-1:-1]
-    upper=max(x["high"] for x in prior)
-    lower=min(x["low"] for x in prior)
-    middle=(upper+lower)/2.0
-    last=cs[-1]
-    width=max(upper-lower,0.0)
-    prev_prior=cs[-period-2:-2]
-    prev_upper=max(x["high"] for x in prev_prior)
-    prev_lower=min(x["low"] for x in prev_prior)
-    prev_width=max(prev_upper-prev_lower,0.0)
-    expansion=width>prev_width*1.03
-    state="BREAKOUT_UP" if last["close"]>upper else "BREAKOUT_DOWN" if last["close"]<lower else "INSIDE"
-    return {
-        "upper":upper,"lower":lower,"middle":middle,
-        "width_norm":width/max(abs(last["close"]),1e-12),
-        "state":state,"expansion":expansion,
-        "breakout_up":state=="BREAKOUT_UP","breakout_down":state=="BREAKOUT_DOWN",
-    }
-
-
-def atr(cs, n=14):
-    if len(cs) < 2:
-        return 0.0
-    trs = [
-        max(
-            b["high"] - b["low"],
-            abs(b["high"] - a["close"]),
-            abs(b["low"] - a["close"]),
-        )
-        for a, b in zip(cs[-n - 1:-1], cs[-n:])
-    ]
-    return sum(trs) / len(trs) if trs else 0.0
-
-
-def _trend15_info(cs):
-    """Build a 15m regime from three completed 15x1m blocks.
-
-    A block is directional only when its net move is large enough relative to
-    its average candle range. The last two blocks must agree; three aligned
-    blocks are treated as the strongest persistence state.
-    """
-    if len(cs) < 45:
-        return "SIDEWAYS", 0
-
-    blocks = [cs[-45:-30], cs[-30:-15], cs[-15:]]
-    block_ranges = []
-    directions = []
-    closes = []
-    highs = []
-    lows = []
-
-    for block in blocks:
-        avg_range = sum(max(c["high"] - c["low"], 0.0) for c in block) / 15.0
-        move = block[-1]["close"] - block[0]["open"]
-        threshold = max(avg_range * 1.25, 1e-12)
-        if move > threshold:
-            directions.append("UP")
-        elif move < -threshold:
-            directions.append("DOWN")
-        else:
-            directions.append("SIDEWAYS")
-        block_ranges.append(avg_range)
-        closes.append(block[-1]["close"])
-        highs.append(max(c["high"] for c in block))
-        lows.append(min(c["low"] for c in block))
-
-    last = directions[-1]
-    if last not in {"UP", "DOWN"}:
-        return "SIDEWAYS", 0
-
-    persistence = sum(1 for x in reversed(directions) if x == last)
-    if persistence < 2:
-        return "SIDEWAYS", persistence
-
-    if last == "UP":
-        structure_ok = closes[-1] >= closes[-2] and highs[-1] >= highs[-2] and lows[-1] >= lows[-2]
-    else:
-        structure_ok = closes[-1] <= closes[-2] and lows[-1] <= lows[-2] and highs[-1] <= highs[-2]
-
-    if not structure_ok:
-        return "SIDEWAYS", 1
-
-    return last, persistence
-
-
-def _trend15(cs):
-    return _trend15_info(cs)[0]
-
-
-def _sequence_quality(cs, direction):
-    """Recent 1m directional structure quality, normalized to [0,1]."""
-    recent = cs[-6:]
-    if len(recent) < 6:
-        return 0.0
-    if direction == "UP":
-        hh = sum(1 for a, b in zip(recent, recent[1:]) if b["high"] > a["high"])
-        hl = sum(1 for a, b in zip(recent, recent[1:]) if b["low"] > a["low"])
-    else:
-        hh = sum(1 for a, b in zip(recent, recent[1:]) if b["high"] < a["high"])
-        hl = sum(1 for a, b in zip(recent, recent[1:]) if b["low"] < a["low"])
-    return min(1.0, (hh + hl) / 10.0)
-
-
-def _efficiency(v, n=8):
-    """Directional efficiency: net displacement / total absolute movement."""
-    if len(v) < n + 1:
-        return 0.0
-    window = v[-n - 1:]
-    total = sum(abs(b - a) for a, b in zip(window[:-1], window[1:]))
-    if total <= 0:
-        return 0.0
-    return min(1.0, abs(window[-1] - window[0]) / total)
-
-
-
-def _median(xs):
-    xs=[float(x) for x in xs if _f(x,0.0)>0]
-    if not xs:
-        return 0.0
-    xs=sorted(xs)
-    m=len(xs)//2
-    return xs[m] if len(xs)%2 else (xs[m-1]+xs[m])/2.0
-
-
-def _pro_price_action(cs, direction):
-    """Strict indicator-independent price-action sequence for live M1 selection.
-
-    The live gate is:
-      reversal path: liquidity sweep -> MSS -> displacement -> retest -> confirmation
-      continuation path: structure break -> displacement -> retest -> hold -> confirmation
-
-    All observations are derived from completed OHLC candles only. Indicators are
-    deliberately excluded from this gate. A 5/5 result is confluence quality, not
-    a claimed 98% future win probability.
-    """
-    if len(cs) < 24:
-        return {"qualified":False,"type":"INSUFFICIENT","score":0,"checks":{}}
-
-    def rng(c):
-        return max(c["high"]-c["low"],1e-12)
-
-    def body_ratio(c):
-        return min(1.0,abs(c["close"]-c["open"])/rng(c))
-
-    def bullish(c):
-        return c["close"]>c["open"]
-
-    def bearish(c):
-        return c["close"]<c["open"]
-
-    def displacement(c, direction, baseline):
-        edge=((c["high"]-c["close"])/rng(c) <= 0.25) if direction=="UP" else ((c["close"]-c["low"])/rng(c) <= 0.25)
-        return (
-            (bullish(c) if direction=="UP" else bearish(c))
-            and body_ratio(c)>=0.62
-            and rng(c)>=max(baseline*1.15,1e-12)
-            and edge
-        )
-
-    ranges=[rng(c) for c in cs[-12:-1]]
-    baseline=max(_median(ranges),1e-12)
-    scan_start=max(4,len(cs)-11)
-    scan_end=len(cs)-1
-    current=cs[-1]
-
-    # --- continuation path ---
-    continuation=None
-    for break_idx in range(scan_start+1,scan_end-1):
-        before=cs[max(0,break_idx-6):break_idx]
-        if len(before)<4:
+def _closed_1m(candles,now=None):
+    now=time.time() if now is None else float(now)
+    latest={}
+    for raw in candles or []:
+        if not isinstance(raw,dict):
             continue
-        prior_high=max(c["high"] for c in before)
-        prior_low=min(c["low"] for c in before)
-        br=cs[break_idx]
-        if direction=="UP":
-            structure_break=br["close"]>prior_high and bullish(br)
-            level=prior_high
-        else:
-            structure_break=br["close"]<prior_low and bearish(br)
-            level=prior_low
-        if not structure_break or not displacement(br,direction,baseline):
+        c=_norm(raw)
+        if c["time"]<0:
             continue
-
-        retest_idx=None
-        for j in range(break_idx+1,scan_end):
-            c=cs[j]
-            if direction=="UP":
-                touched=c["low"]<=level+baseline*0.80 and c["low"]>=level-baseline*0.85
-                held=c["close"]>=level
-            else:
-                touched=c["high"]>=level-baseline*0.80 and c["high"]<=level+baseline*0.85
-                held=c["close"]<=level
-            if touched and held:
-                retest_idx=j
-                break
-        if retest_idx is None or retest_idx>=scan_end:
+        minute=int(c["time"]//ONE_MINUTE)*ONE_MINUTE
+        # Never use a currently forming candle.
+        if minute+ONE_MINUTE>now-CLOSE_GRACE_SECONDS:
             continue
+        c["time"]=minute
+        latest[minute]=c
+    return [latest[k] for k in sorted(latest)]
 
-        confirm=current
-        confirm_ok=(bullish(confirm) and confirm["close"]>cs[retest_idx]["close"]) if direction=="UP" else (bearish(confirm) and confirm["close"]<cs[retest_idx]["close"])
-        hold_ok=(confirm["low"]>=level-baseline*0.55) if direction=="UP" else (confirm["high"]<=level+baseline*0.55)
-        if confirm_ok and hold_ok:
-            continuation={
-                "type":"CONTINUATION",
-                "score":5,
-                "checks":{
-                    "structure_break":True,
-                    "displacement":True,
-                    "retest_hold":True,
-                    "follow_through":True,
-                    "confirmation":True,
-                },
-                "break_index":break_idx,
-                "retest_index":retest_idx,
-                "level":float(level),
-            }
-            break
 
-    # --- reversal path ---
-    reversal=None
-    for sweep_idx in range(scan_start,scan_end-3):
-        before=cs[max(0,sweep_idx-7):sweep_idx]
-        if len(before)<4:
+def _complete_15m_blocks(cs,now=None):
+    now=time.time() if now is None else float(now)
+    groups={}
+    for c in cs:
+        minute=int(c["time"])
+        bucket=(minute//FIFTEEN_MINUTES)*FIFTEEN_MINUTES
+        if bucket+FIFTEEN_MINUTES>now-CLOSE_GRACE_SECONDS:
             continue
-        sweep=cs[sweep_idx]
-        prior_high=max(c["high"] for c in before)
-        prior_low=min(c["low"] for c in before)
-        if direction=="UP":
-            sweep_ok=sweep["low"]<prior_low and sweep["close"]>prior_low
-            swept_level=prior_low
-        else:
-            sweep_ok=sweep["high"]>prior_high and sweep["close"]<prior_high
-            swept_level=prior_high
-        if not sweep_ok:
+        groups.setdefault(bucket,[]).append(c)
+
+    blocks=[]
+    for bucket,bars in sorted(groups.items()):
+        bars=sorted(bars,key=lambda x:x["time"])
+        expected=[bucket+i*ONE_MINUTE for i in range(15)]
+        if [int(x["time"]) for x in bars]!=expected:
             continue
-
-        # MSS must occur AFTER the sweep and break the pre-sweep internal extreme.
-        internal=cs[sweep_idx+1:min(scan_end,sweep_idx+6)]
-        if len(internal)<1:
-            continue
-        internal_high=max(c["high"] for c in before[-4:])
-        internal_low=min(c["low"] for c in before[-4:])
-        mss_idx=None
-        mss_level=None
-        for j in range(sweep_idx+1,scan_end):
-            c=cs[j]
-            if direction=="UP" and c["close"]>internal_high and bullish(c):
-                mss_idx=j; mss_level=internal_high; break
-            if direction=="DOWN" and c["close"]<internal_low and bearish(c):
-                mss_idx=j; mss_level=internal_low; break
-        if mss_idx is None or not displacement(cs[mss_idx],direction,baseline):
-            continue
-
-        retest_idx=None
-        for j in range(mss_idx+1,scan_end):
-            c=cs[j]
-            if direction=="UP":
-                touched=c["low"]<=mss_level+baseline*0.80 and c["low"]>=mss_level-baseline*0.85
-                held=c["close"]>=mss_level
-            else:
-                touched=c["high"]>=mss_level-baseline*0.80 and c["high"]<=mss_level+baseline*0.85
-                held=c["close"]<=mss_level
-            if touched and held:
-                retest_idx=j
-                break
-        if retest_idx is None:
-            continue
-
-        confirm_ok=(bullish(current) and current["close"]>cs[retest_idx]["close"]) if direction=="UP" else (bearish(current) and current["close"]<cs[retest_idx]["close"])
-        hold_ok=(current["low"]>=mss_level-baseline*0.55) if direction=="UP" else (current["high"]<=mss_level+baseline*0.55)
-        if confirm_ok and hold_ok:
-            reversal={
-                "type":"REVERSAL",
-                "score":5,
-                "checks":{
-                    "liquidity_sweep":True,
-                    "structure_shift":True,
-                    "displacement":True,
-                    "retest_hold":True,
-                    "confirmation":True,
-                },
-                "sweep_index":sweep_idx,
-                "mss_index":mss_idx,
-                "retest_index":retest_idx,
-                "level":float(mss_level),
-                "swept_level":float(swept_level),
-            }
-            break
-
-    selected=reversal or continuation
-    if selected:
-        selected=dict(selected)
-        selected["qualified"]=True
-        selected["score"]=5
-        return selected
-
-    # Audit-only near misses; never enter live delivery.
-    return {
-        "qualified":False,
-        "type":"WATCH",
-        "score":4 if continuation is not None else 0,
-        "checks":(continuation or reversal or {}).get("checks",{}),
-    }
-
-
-
-def analyze_asset(asset, candles, price=None, forced_strategy=None, learning_campaign=False):
-    cs = [_norm(c) for c in candles if isinstance(c, dict)]
-    if len(cs) < 45:
-        return None
-
-    v = [c["close"] for c in cs]
-    last = cs[-1]
-    p = _f(price, last["close"])
-
-    e9 = ema(v[-40:], 9)
-    e21 = ema(v[-40:], 21)
-    prev_e9 = ema(v[-45:-5], 9)
-    rr = rsi(v)
-    aa = atr(cs)
-
-    body = last["close"] - last["open"]
-    rng = max(last["high"] - last["low"], 1e-12)
-    body_ratio = min(1.0, abs(body) / rng)
-    upper = last["high"] - max(last["open"], last["close"])
-    lower = min(last["open"], last["close"]) - last["low"]
-
-    trend, trend_persistence = _trend15_info(cs)
-    prev = cs[-2]["close"]
-    momentum = p - prev
-    momentum_norm = abs(momentum) / max(aa, 1e-12)
-
-    avg_rng = sum(max(c["high"] - c["low"], 0.0) for c in cs[-14:]) / 14.0
-    volatility_ratio = (aa / avg_rng) if avg_rng else 1.0
-
-    resistance = max(c["high"] for c in cs[-20:-1])
-    support = min(c["low"] for c in cs[-20:-1])
-
-    dc = donchian(cs,30)
-    bb = bollinger(cs,30,2.2)
-    stoch_k, stoch_d, stoch_cross = stochastic(cs,14,3,3)
-    dc_breakout_up = bool(dc["breakout_up"] and body > 0)
-    dc_breakout_down = bool(dc["breakout_down"] and body < 0)
-    breakout_up = bool((p > resistance and body > 0) or dc_breakout_up)
-    breakout_down = bool((p < support and body < 0) or dc_breakout_down)
-    breakout_distance_up = max((p - resistance) / max(aa, 1e-12),
-                               (p - dc["upper"]) / max(aa, 1e-12))
-    breakout_distance_down = max((support - p) / max(aa, 1e-12),
-                                 (dc["lower"] - p) / max(aa, 1e-12))
-    stoch_bull = stoch_k > stoch_d and stoch_k >= 50
-    stoch_bear = stoch_k < stoch_d and stoch_k <= 50
-    stoch_oversold = stoch_k <= 20
-    stoch_overbought = stoch_k >= 80
-
-    near_support = (p - support) <= max(aa * 0.35, 1e-12)
-    near_resistance = (resistance - p) <= max(aa * 0.35, 1e-12)
-
-    bullish_rejection = lower > max(abs(body) * 1.2, rng * 0.35) and p >= last["open"]
-    bearish_rejection = upper > max(abs(body) * 1.2, rng * 0.35) and p <= last["open"]
-
-    pattern = (
-        "BULLISH_CANDLE" if body > 0 and body_ratio >= 0.55 else
-        "BEARISH_CANDLE" if body < 0 and body_ratio >= 0.55 else
-        "BULLISH_REJECTION" if bullish_rejection else
-        "BEARISH_REJECTION" if bearish_rejection else
-        "NEUTRAL"
-    )
-
-    ema_gap_norm = abs(e9 - e21) / max(aa, 1e-12)
-    ema_slope = e9 - prev_e9
-    ema_slope_norm = abs(ema_slope) / max(aa, 1e-12)
-
-    ema_bull = e9 > e21 and p >= e9
-    ema_bear = e9 < e21 and p <= e9
-
-    bull_recent = sum(1 for c in cs[-3:] if c["close"] > c["open"])
-    bear_recent = sum(1 for c in cs[-3:] if c["close"] < c["open"])
-
-    def aligned_recent(direction):
-        return bull_recent if direction == "UP" else bear_recent
-
-    def rsi_supports(direction):
-        return (48 <= rr <= 68) if direction == "UP" else (32 <= rr <= 52)
-
-    structure_quality = {
-        "UP": _sequence_quality(cs, "UP"),
-        "DOWN": _sequence_quality(cs, "DOWN"),
-    }
-
-    pro_price_action = {
-        "UP": _pro_price_action(cs, "UP"),
-        "DOWN": _pro_price_action(cs, "DOWN"),
-    }
-
-    def score(direction, strategy):
-        # High-accuracy live mode is price-action-first: no strategy can enter
-        # the delivery pool unless the completed OHLC sequence passes the strict
-        # indicator-independent PRO structure gate.
-        if not pro_price_action[direction]["qualified"]:
-            return -1.0
-
-        structure_ok = (
-            direction == "UP" and ema_bull
-        ) or (
-            direction == "DOWN" and ema_bear
-        )
-        slope_ok = (
-            direction == "UP" and ema_slope > 0
-        ) or (
-            direction == "DOWN" and ema_slope < 0
-        )
-        trend_ok = direction == trend
-
-        if strategy == "BREAKOUT":
-            active = breakout_up if direction == "UP" else breakout_down
-            distance = breakout_distance_up if direction == "UP" else breakout_distance_down
-            prior_inside = prev <= resistance if direction == "UP" else prev >= support
-            # Strict breakout confirmation:
-            # 1) real price displacement must be meaningful (>= 0.15 ATR)
-            # 2) the breakout candle must have a strong body (>= 0.55)
-            # 3) momentum/efficiency must show continuation potential
-            # 4) either the 30-period Donchian itself broke in the same direction,
-            #    or the 20-bar level was cleared decisively.
-            dc_confirm = (
-                (direction == "UP" and dc_breakout_up) or
-                (direction == "DOWN" and dc_breakout_down)
-            )
-            level_confirm = bool(distance >= 0.15 and body_ratio >= 0.55)
-            continuation_confirm = bool(momentum_norm >= 0.30 and _efficiency(v, 8) >= 0.35)
-            stoch_confirm = (direction == "UP" and stoch_bull) or (direction == "DOWN" and stoch_bear)
-            # A breakout in a confirmed SIDEWAYS 15m regime is too unstable
-            # for a 1m directional signal. Require a directional higher-timeframe
-            # regime before allowing BREAKOUT into the live candidate pool.
-            if trend not in {"UP","DOWN"}:
-                return -1.0
-            # Tighten the live 1-minute breakout definition. A 0.15 ATR / 0.55
-            # body break can fail immediately; require stronger displacement,
-            # continuation and oscillator agreement without changing direction.
-            if (
-                not active
-                or distance < 0.20
-                or body_ratio < 0.60
-                or not prior_inside
-                or not (dc_confirm or level_confirm)
-                or momentum_norm < 0.35
-                or _efficiency(v, 8) < 0.40
-                or not stoch_confirm
-                or trend_persistence < 2
-            ):
-                return -1.0
-            s = 62.0
-            s += 10 if distance >= 0.20 else 6
-            s += 8 if body_ratio >= 0.65 else 4
-            s += 7 if trend_ok else 0
-            s += 6 if slope_ok else 0
-            s += 5 if aligned_recent(direction) >= 2 else 0
-            s += 4 if structure_ok else 0
-            s += 4 if stoch_confirm else 0
-            s += 4 if dc["expansion"] else 0
-            s += 4 if _efficiency(v, 8) >= 0.50 else 0
-            return min(96.0, s)
-
-        if strategy == "PULLBACK":
-            location = near_support if direction == "UP" else near_resistance
-            rejection = bullish_rejection if direction == "UP" else bearish_rejection
-            aligned = trend_ok and structure_ok and slope_ok
-            if trend not in {"UP", "DOWN"} or not location or not rejection or not aligned:
-                return -1.0
-            s = 58.0
-            s += 10 if structure_quality[direction] >= 0.5 else 4
-            s += 8 if momentum_norm >= 0.10 else 0
-            s += 8 if body_ratio >= 0.30 else 3
-            s += 6 if trend_persistence >= 2 else 0
-            s += 4 if rsi_supports(direction) else 0
-            return min(95.0, s)
-
-        if strategy == "REVERSAL":
-            extreme = (rr < 30) if direction == "UP" else (rr > 70)
-            rejection = bullish_rejection if direction == "UP" else bearish_rejection
-            location = near_support if direction == "UP" else near_resistance
-            trend_weak = trend == "SIDEWAYS" or trend_persistence <= 1
-            stoch_reversal = (direction == "UP" and (stoch_oversold or stoch_cross == "BULLISH_CROSS")) or (direction == "DOWN" and (stoch_overbought or stoch_cross == "BEARISH_CROSS"))
-            if not extreme or not rejection or not location or not stoch_reversal:
-                return -1.0
-            s = 62.0
-            s += 10 if trend_weak else 3
-            s += 8 if structure_quality[direction] >= 0.4 else 0
-            s += 8 if momentum_norm < 0.35 else 0
-            s += 6 if body_ratio >= 0.30 else 0
-            s += 5 if slope_ok else 0
-            s += 5 if ((direction == "UP" and stoch_bull) or (direction == "DOWN" and stoch_bear)) else 0
-            return min(94.0, s)
-
-        if strategy == "MEAN_REVERSION":
-            extreme = (rr < 27) if direction == "UP" else (rr > 73)
-            location = near_support if direction == "UP" else near_resistance
-            weak_momentum = momentum_norm < 0.35
-            rejection = bullish_rejection if direction == "UP" else bearish_rejection
-            stoch_mean = (direction == "UP" and stoch_oversold) or (direction == "DOWN" and stoch_overbought)
-            if not extreme or not location or not weak_momentum or not stoch_mean:
-                return -1.0
-            s = 64.0
-            s += 10 if trend == "SIDEWAYS" else 0
-            s += 8 if rejection else 0
-            s += 8 if structure_quality[direction] >= 0.4 else 0
-            s += 6 if body_ratio >= 0.25 else 0
-            return min(94.0, s)
-
-        if strategy == "PRICE_ACTION":
-            directional_pattern = (
-                direction == "UP" and pattern in {"BULLISH_CANDLE", "BULLISH_REJECTION"}
-            ) or (
-                direction == "DOWN" and pattern in {"BEARISH_CANDLE", "BEARISH_REJECTION"}
-            )
-            if not directional_pattern:
-                return -1.0
-            location = near_support if direction == "UP" else near_resistance
-            rejection = bullish_rejection if direction == "UP" else bearish_rejection
-            # A single directional candle away from a level is not sufficient for
-            # a 1-minute expiry. Require structural agreement and a meaningful
-            # location/rejection so the raw confidence cannot be inflated by one bar.
-            if (
-                not trend_ok
-                or not structure_ok
-                or structure_quality[direction] < 0.50
-                or aligned_recent(direction) < 2
-                or momentum_norm < 0.10
-                or not (location or rejection)
-            ):
-                return -1.0
-            s = 58.0
-            s += 12 if location else 8
-            s += 8 if structure_ok else 0
-            s += 7 if trend_ok else 0
-            s += 7 if body_ratio >= 0.60 else 2
-            s += 5 if slope_ok else 0
-            s += 5 if aligned_recent(direction) >= 2 else 0
-            s += 3 if structure_quality[direction] >= 0.70 else 0
-            return min(96.0, s)
-
-        if strategy == "MOMENTUM":
-            # Momentum is a continuation technique in this 1m system. A SIDEWAYS
-            # 15m regime is excluded completely to avoid single-candle range noise.
-            if trend == "SIDEWAYS":
-                return -1.0
-            if momentum_norm < 0.30 or body_ratio < 0.45:
-                return -1.0
-            if (direction == "UP" and momentum <= 0) or (direction == "DOWN" and momentum >= 0):
-                return -1.0
-            if (direction == "UP" and rr >= 73) or (direction == "DOWN" and rr <= 27):
-                return -1.0
-            if (direction == "UP" and not stoch_bull) or (direction == "DOWN" and not stoch_bear):
-                return -1.0
-            s = 60.0
-            s += 10 if momentum_norm >= 0.50 else 5
-            s += 8 if body_ratio >= 0.60 else 3
-            s += 7 if aligned_recent(direction) >= 2 else 0
-            s += 6 if trend_ok else 0
-            s += 5 if structure_ok else 0
-            s += 4 if slope_ok else 0
-            s += 5 if ((direction == "UP" and stoch_bull) or (direction == "DOWN" and stoch_bear)) else 0
-            return min(95.0, s)
-
-        if strategy == "VOLATILITY":
-            if volatility_ratio < 1.15 or momentum_norm < 0.30 or body_ratio < 0.45:
-                return -1.0
-            if trend in {"UP", "DOWN"} and not trend_ok:
-                return -1.0
-            s = 61.0
-            s += 10 if volatility_ratio >= 1.30 else 4
-            s += 8 if momentum_norm >= 0.50 else 3
-            s += 7 if body_ratio >= 0.60 else 3
-            s += 5 if trend_ok else 0
-            s += 5 if structure_ok else 0
-            s += 4 if dc["expansion"] else 0
-            s += 4 if ((direction == "UP" and stoch_bull) or (direction == "DOWN" and stoch_bear)) else 0
-            return min(94.0, s)
-
-        if strategy == "TREND_FOLLOWING":
-            if not trend_ok or not structure_ok or not slope_ok:
-                return -1.0
-            if momentum_norm < 0.20:
-                return -1.0
-            if structure_quality[direction] < 0.40:
-                return -1.0
-            if trend_persistence < 2:
-                return -1.0
-            if (direction == "UP" and near_resistance and not breakout_up) or (
-                direction == "DOWN" and near_support and not breakout_down
-            ):
-                return -1.0
-            if (direction == "UP" and rr >= 74) or (direction == "DOWN" and rr <= 26):
-                return -1.0
-            if (direction == "UP" and not stoch_bull) or (direction == "DOWN" and not stoch_bear):
-                return -1.0
-
-            s = 56.0
-            s += 10 if trend_persistence == 3 else 5
-            s += 9 if ema_gap_norm >= 0.15 else (6 if ema_gap_norm >= 0.08 else 2)
-            s += 9 if ema_slope_norm >= 0.08 else (5 if ema_slope_norm >= 0.04 else 0)
-            s += 9 if momentum_norm >= 0.40 else (5 if momentum_norm >= 0.25 else 2)
-            s += 7 if structure_quality[direction] >= 0.70 else 3
-            s += 6 if aligned_recent(direction) >= 2 else 0
-            s += 4 if rsi_supports(direction) else 0
-            s += 4 if _efficiency(v, 8) >= 0.45 else 0
-            s += 5 if ((direction == "UP" and stoch_bull) or (direction == "DOWN" and stoch_bear)) else 0
-            s += 4 if dc["expansion"] else 0
-
-            # Late-trend warning: a directionally aligned trend is less useful
-            # when price is pressing directly into the opposing 20-bar level.
-            if direction == "UP" and near_resistance and not breakout_up:
-                s -= 12
-            if direction == "DOWN" and near_support and not breakout_down:
-                s -= 12
-            return min(96.0, max(0.0, s))
-
-        return -1.0
-
-    self_profile = discover_self_strategy(
-        trend=trend,
-        structure="BULLISH" if ema_bull else "BEARISH" if ema_bear else "MIXED",
-        rsi_value=rr,
-        momentum=momentum,
-        atr_value=aa,
-        volatility_ratio=volatility_ratio,
-        breakout_up=breakout_up,
-        breakout_down=breakout_down,
-        near_support=near_support,
-        near_resistance=near_resistance,
-        pattern=pattern,
-        ema_gap_norm=ema_gap_norm,
-        ema_slope_norm=ema_slope_norm,
-        trend_persistence=trend_persistence,
-        body_ratio=body_ratio,
-        structure_quality=structure_quality,
-        efficiency=_efficiency(v, 8),
-        donchian_state=dc["state"],
-        donchian_expansion=dc["expansion"],
-        stochastic_k=stoch_k,
-        stochastic_d=stoch_d,
-        stochastic_cross=stoch_cross,
-    )
-
-    strategies = (
-        "TREND_FOLLOWING",
-        "MOMENTUM",
-        "PULLBACK",
-        "BREAKOUT",
-        "REVERSAL",
-        "MEAN_REVERSION",
-        "PRICE_ACTION",
-        "VOLATILITY",
-    )
-
-    forced = str(forced_strategy or "").upper().strip()
-    if forced and forced not in strategies:
-        return None
-    # Only a completed 100-trade DEMO failure at the explicit 85% gate can
-    # remove a strategy family from live Brain routing. The isolated learning
-    # campaign must still be able to re-test its assigned strategy; otherwise
-    # a previously rejected family can deadlock its own 100-trade re-validation.
-    # learning_campaign=True is used only by the overnight DEMO lab and never by
-    # the daytime/manual signal path.
-    if forced:
-        active_strategies = (
-            (forced,)
-            if (learning_campaign or strategy_live_eligible(forced))
-            else ()
-        )
-    else:
-        active_strategies = tuple(s for s in strategies if strategy_live_eligible(s))
-    if not active_strategies:
-        return None
-
-    # Full strategy audit: Candice evaluates every known strategy family and both
-    # directions with the SAME live indicator snapshot. Only live-eligible families
-    # may enter the delivery candidate pool; non-eligible families remain visible in
-    # the audit so the user can see exactly what Candice checked without changing the
-    # live promotion/qualification rules.
-    strategy_audit = []
-    for strategy_name in strategies:
-        strategy_active = strategy_name in active_strategies
-        up_score = score("UP", strategy_name)
-        down_score = score("DOWN", strategy_name)
-        strategy_audit.append({
-            "strategy": strategy_name,
-            "active_for_live": bool(strategy_active),
-            "up_score": round(up_score, 2),
-            "down_score": round(down_score, 2),
-            "up_direction_compatible": not (trend == "DOWN"),
-            "down_direction_compatible": not (trend == "UP"),
-            "up_qualified": bool(strategy_active and up_score >= 82 and trend != "DOWN"),
-            "down_qualified": bool(strategy_active and down_score >= 82 and trend != "UP"),
-            "price_action_gate_up": bool(pro_price_action["UP"]["qualified"]),
-            "price_action_gate_down": bool(pro_price_action["DOWN"]["qualified"]),
+        blocks.append({
+            "time":bucket,
+            "open":bars[0]["open"],
+            "high":max(x["high"] for x in bars),
+            "low":min(x["low"] for x in bars),
+            "close":bars[-1]["close"],
+            "volume":sum(x["volume"] for x in bars),
         })
+    return blocks
 
-    candidates = []
-    for strategy in active_strategies:
-        for direction in ("UP", "DOWN"):
-            sc = score(direction, strategy)
-            if sc < 0:
-                continue
-            if strategy == self_profile["strategy"]:
-                sc = min(96.0, sc + min(4.0, float(self_profile.get("strength", 0.0))))
-            if sc >= 72:
-                candidates.append({
-                    "direction": direction,
-                    "strategy": strategy,
-                    "score": round(sc, 2),
-                    "expiry_minutes": 3,
-                    "self_strategy_version": self_profile["version"],
-                })
 
-    if not candidates:
+def _anchored_vwap(cs,anchor_ts):
+    sample=[c for c in cs if int(c["time"])>=int(anchor_ts)]
+    if not sample:
+        return 0.0,0.0
+    pv=0.0
+    vv=0.0
+    for c in sample:
+        typical=(c["high"]+c["low"]+c["close"])/3.0
+        vol=max(c["volume"],1.0)
+        pv+=typical*vol
+        vv+=vol
+    return (pv/vv if vv else 0.0),vv
+
+
+def _volume_profile(cs,bins=PROFILE_BINS):
+    sample=list(cs[-PROFILE_LOOKBACK:])
+    if not sample:
         return None
+    low=min(c["low"] for c in sample)
+    high=max(c["high"] for c in sample)
+    total=sum(max(c["volume"],1.0) for c in sample)
 
-    valid = [
-        x for x in candidates
-        if not (trend == "UP" and x["direction"] == "DOWN")
-        and not (trend == "DOWN" and x["direction"] == "UP")
-    ]
-    if not valid:
-        return None
+    if high<=low:
+        px=sample[-1]["close"]
+        return {
+            "poc":px,"vah":px,"val":px,
+            "range_high":high,"range_low":low,
+            "total_volume":total,"bins":1,
+        }
 
-    ranked = sorted(valid, key=lambda x: x["score"], reverse=True)
-    # Do not collapse a market setup to one technique too early. Keep every
-    # independently qualified strategy/direction variant (score >= 82) so the
-    # final delivery layer can fall through to the next technique when the
-    # first technique fails a late 2m/1m/live-price gate.
-    qualified_variants = [x for x in ranked if x["score"] >= 82]
-    if not qualified_variants:
-        return None
+    step=(high-low)/float(bins)
+    volumes=[0.0]*bins
+    for c in sample:
+        typical=(c["high"]+c["low"]+c["close"])/3.0
+        idx=int((typical-low)/step)
+        idx=max(0,min(bins-1,idx))
+        volumes[idx]+=max(c["volume"],1.0)
 
-    best = qualified_variants[0]
-    second_score = ranked[1]["score"] if len(ranked) > 1 else 0.0
-    strategy_margin = max(0.0, best["score"] - second_score)
-    expected = best["direction"]
+    poc_idx=max(range(bins),key=lambda i:volumes[i])
+    target=sum(volumes)*VALUE_AREA_FRACTION
+    accumulated=volumes[poc_idx]
+    left=right=poc_idx
 
-    # 5m is never a normal/default expiry. This flag only says that the market
-    # structure is strong enough for the expiry-learning layer to consider it.
-    five_minute_eligible = bool(
-        best["strategy"] == "TREND_FOLLOWING"
-        and expected == trend
-        and trend_persistence == 3
-        and structure_quality[expected] >= 0.70
-        and ema_gap_norm >= 0.15
-        and ema_slope_norm >= 0.08
-        and momentum_norm >= 0.35
-        and _efficiency(v, 8) >= 0.45
-        and aligned_recent(expected) >= 2
-        and body_ratio >= 0.55
-        and ((expected == "UP" and stoch_bull) or (expected == "DOWN" and stoch_bear))
-        and dc["expansion"]
-        and not ((expected == "UP" and rr >= 72) or (expected == "DOWN" and rr <= 28))
-        and not ((expected == "UP" and near_resistance and not breakout_up) or
-                 (expected == "DOWN" and near_support and not breakout_down))
-    )
-
-    best["five_minute_eligible"] = five_minute_eligible
-    confidence = max(0, min(96, int(round(best["score"]))))
-    direction_agreement = (
-        1.0
-        if (
-            expected == trend
-            and ((expected == "UP" and ema_bull) or (expected == "DOWN" and ema_bear))
-            and ((expected == "UP" and momentum > 0) or (expected == "DOWN" and momentum < 0))
-        )
-        else 0.0
-    )
-
-    reason = (
-        f"{best['strategy']} | 15m={trend} (persist={trend_persistence}) | "
-        f"1m={('BULLISH' if ema_bull else 'BEARISH' if ema_bear else 'MIXED')} | "
-        f"RSI={rr:.1f} | momentum={momentum_norm:.2f}ATR | "
-        f"EMA_gap={ema_gap_norm:.2f}ATR | EMA_slope={ema_slope_norm:.2f}ATR | "
-        f"structure_q={structure_quality[expected]:.2f} | body={body_ratio:.2f} | "
-        f"PRO={pro_price_action[expected]['type']} 5/5 | efficiency={_efficiency(v, 8):.2f} | pattern={pattern} | "
-        f"Donchian30={dc['state']}/{('EXPANDING' if dc['expansion'] else 'FLAT')} | "
-        f"Stoch14,3,3={stoch_k:.1f}/{stoch_d:.1f}/{stoch_cross} | "
-        f"volatility={volatility_ratio:.2f} | support={support:.6g} | resistance={resistance:.6g}"
-    )
+    while accumulated<target and (left>0 or right<bins-1):
+        lv=volumes[left-1] if left>0 else -1.0
+        rv=volumes[right+1] if right<bins-1 else -1.0
+        if rv>=lv:
+            right+=1
+            accumulated+=volumes[right]
+        else:
+            left-=1
+            accumulated+=volumes[left]
 
     return {
-        "pair": str(asset.get("pair", "")),
-        "display_name": str(asset.get("display_name") or asset.get("title") or ""),
-        "direction": expected,
-        "confidence": confidence,
-        "strategy": best["strategy"],
-        "expiry_minutes": best["expiry_minutes"],
-        "strategy_audit": strategy_audit,
-        "strategy_audit_count": len(strategy_audit),
-        "indicator_audit_scope": "ALL_8_STRATEGIES_SAME_LIVE_INDICATORS",
-        "pro_price_action": {
-            "UP": dict(pro_price_action["UP"]),
-            "DOWN": dict(pro_price_action["DOWN"]),
-            "selected": dict(pro_price_action[expected]),
-            "live_gate": "5_OF_5_COMPLETED_OHLC_CHECKS",
-        },
-        "strategy_candidates": [
-            {
-                "strategy": str(v.get("strategy") or ""),
-                "direction": str(v.get("direction") or "").upper(),
-                "score": int(round(v.get("score") or 0)),
-                "expiry_minutes": int(v.get("expiry_minutes") or 3),
-                "self_strategy_version": str(v.get("self_strategy_version") or ""),
-            }
-            for v in qualified_variants
-        ],
-        "five_minute_eligible": five_minute_eligible,
-        "self_strategy": self_profile["strategy"],
-        "self_strategy_strength": self_profile["strength"],
-        "self_strategy_weights": self_profile.get("weights", {}),
-        "self_strategy_margin": self_profile.get("margin", 0.0),
-        "pattern": pattern,
-        "trend_15m": trend,
-        "structure_1m": ("BULLISH" if ema_bull else "BEARISH" if ema_bear else "MIXED"),
-        "market_quality": best["score"],
-        "strategy_margin": round(strategy_margin, 2),
-        "direction_agreement": direction_agreement,
-        "reason": reason,
-        "self_strategy_version": best.get("self_strategy_version", ""),
-        "entry_candle_ts": last["time"],
-        "price": p,
-        "support": support,
-        "resistance": resistance,
-        "atr": aa,
-        "momentum": momentum,
-        "momentum_norm": momentum_norm,
-        "breakout_distance_up": round(breakout_distance_up, 4),
-        "breakout_distance_down": round(breakout_distance_down, 4),
-        "breakout_confirmed": bool(
-            (expected == "UP" and breakout_up and breakout_distance_up >= 0.15)
-            or (expected == "DOWN" and breakout_down and breakout_distance_down >= 0.15)
-        ),
-        "ema_gap_norm": ema_gap_norm,
-        "ema_slope_norm": ema_slope_norm,
-        "body_ratio": body_ratio,
-        "volatility_ratio": volatility_ratio,
-        "trend_persistence": trend_persistence,
-        "structure_quality": structure_quality[expected],
-        "efficiency": _efficiency(v, 8),
-        "indicators": {
-            "ema_fast_period": 9,
-            "ema_slow_period": 21,
-            "ema_fast": round(e9, 8),
-            "ema_slow": round(e21, 8),
-            "ema_fast_above_slow": bool(e9 > e21),
-            "rsi_period": 14,
-            "rsi": round(rr, 2),
-            "atr_period": 14,
-            "atr": round(aa, 8),
-            "momentum": round(momentum, 8),
-            "momentum_norm_atr": round(momentum_norm, 3),
-            "volatility_ratio": round(volatility_ratio, 3),
-            "support": round(support, 8),
-            "resistance": round(resistance, 8),
-            "strategy_audit_count": len(strategy_audit),
-            "pro_price_action_type": pro_price_action[expected]["type"],
-            "pro_price_action_score": pro_price_action[expected]["score"],
-            "pro_price_action_qualified": bool(pro_price_action[expected]["qualified"]),
-            "pro_price_action_checks": dict(pro_price_action[expected]["checks"]),
-            "bollinger_period": 30,
-            "bollinger_stddev": 2.2,
-            "bollinger_signal": bb["signal"],
-            "bollinger_position": bb["position"],
-            "bollinger_middle": bb["middle"],
-            "bollinger_upper": bb["upper"],
-            "bollinger_lower": bb["lower"],
-            "bollinger_width_norm": bb["width_norm"],
-            "donchian_period": 30,
-            "bollinger_signal": bb["signal"],
-            "bollinger_position": bb["position"],
-            "donchian_state": dc["state"],
-            "donchian_expansion": dc["expansion"],
-            "donchian_upper": dc["upper"],
-            "donchian_lower": dc["lower"],
-            "donchian_middle": dc["middle"],
-            "stochastic_k": round(stoch_k,2),
-            "stochastic_d": round(stoch_d,2),
-            "stochastic_cross": stoch_cross,
-            "stochastic_oversold": stoch_oversold,
-            "stochastic_overbought": stoch_overbought,
-        },
-        "evidence": {
-            "trend": trend,
-            "trend_persistence": trend_persistence,
-            "structure": ("BULLISH" if ema_bull else "BEARISH" if ema_bear else "MIXED"),
-            "structure_quality": structure_quality[expected],
-            "momentum_norm": momentum_norm,
-            "ema_gap_norm": ema_gap_norm,
-            "ema_slope_norm": ema_slope_norm,
-            "volatility": volatility_ratio,
-            "efficiency": _efficiency(v, 8),
-            "breakout_up": breakout_up,
-            "breakout_down": breakout_down,
-            "breakout_distance": breakout_distance_up if expected == "UP" else breakout_distance_down,
-            "breakout_confirmed": bool(
-                (expected == "UP" and breakout_up and breakout_distance_up >= 0.15)
-                or (expected == "DOWN" and breakout_down and breakout_distance_down >= 0.15)
-            ),
-            "near_support": near_support,
-            "near_resistance": near_resistance,
-            "pattern": pattern,
-            "recent_aligned_candles": aligned_recent(expected),
-            "donchian_state": dc["state"],
-            "donchian_expansion": dc["expansion"],
-            "stochastic_k": stoch_k,
-            "stochastic_d": stoch_d,
-            "stochastic_cross": stoch_cross,
-        },
+        "poc":low+(poc_idx+0.5)*step,
+        "vah":min(high,low+(right+1)*step),
+        "val":max(low,low+left*step),
+        "range_high":high,
+        "range_low":low,
+        "total_volume":sum(volumes),
+        "bins":bins,
     }
+
+
+def _slope(cs,anchor_ts):
+    if len(cs)<2:
+        return 0.0
+    current,_=_anchored_vwap(cs,anchor_ts)
+    previous,_=_anchored_vwap(cs[:-1],anchor_ts)
+    return current-previous
+
+
+def analyze_asset(
+    asset,
+    candles,
+    price=None,
+    forced_strategy=None,
+    learning_campaign=False,
+):
+    """Return one deterministic AVWAP + Volume Profile candidate or None.
+
+    `forced_strategy` and `learning_campaign` remain accepted for API
+    compatibility with the overnight learning lab. Live direction is never
+    delegated to those legacy strategy names.
+    """
+    forced=str(forced_strategy or "").upper().strip()
+    if forced and forced!=ALLOWED_STRATEGY:
+        return None
+
+    now=time.time()
+    cs=_closed_1m(candles,now)
+    if len(cs)<MIN_CLOSED_CANDLES:
+        return None
+
+    blocks=_complete_15m_blocks(cs,now)
+    if not blocks:
+        return None
+
+    last=cs[-1]
+    anchor_ts=int(blocks[-1]["time"])
+    avwap,avwap_volume=_anchored_vwap(cs,anchor_ts)
+    previous_avwap,_=_anchored_vwap(cs[:-1],anchor_ts)
+    profile=_volume_profile(cs)
+    if avwap<=0 or not profile:
+        return None
+
+    px=float(last["close"])
+    poc=float(profile["poc"])
+    vah=float(profile["vah"])
+    val=float(profile["val"])
+    slope=avwap-previous_avwap
+
+    up=px>avwap and px>poc
+    down=px<avwap and px<poc
+    if not (up or down):
+        return None
+
+    direction="UP" if up else "DOWN"
+    slope_aligned=(slope>0) if direction=="UP" else (slope<0)
+    value_acceptance=(px>=vah) if direction=="UP" else (px<=val)
+
+    # This is a rule-quality score, NOT a future win probability.
+    score=90
+    if slope_aligned:
+        score+=5
+    if value_acceptance:
+        score+=4
+    confidence=min(99,score)
+
+    trend="AVWAP_BULLISH" if up else "AVWAP_BEARISH"
+    structure="ABOVE_AVWAP_POC" if up else "BELOW_AVWAP_POC"
+
+    features={
+        "anchored_vwap":avwap,
+        "volume_profile_poc":poc,
+        "volume_profile_vah":vah,
+        "volume_profile_val":val,
+        "avwap_slope":slope,
+        "profile_range_high":profile["range_high"],
+        "profile_range_low":profile["range_low"],
+        "profile_total_volume":profile["total_volume"],
+        "profile_bins":profile["bins"],
+        "anchor_15m_start_ts":anchor_ts,
+        "avwap_volume":avwap_volume,
+        "slope_aligned":slope_aligned,
+        "value_area_acceptance":value_acceptance,
+    }
+
+    result={
+        "pair":str(asset.get("pair") or ""),
+        "display_name":str(
+            asset.get("display_name")
+            or asset.get("title")
+            or asset.get("name")
+            or asset.get("pair")
+            or ""
+        ),
+        "direction":direction,
+        "confidence":confidence,
+        "strategy":ALLOWED_STRATEGY,
+        "expiry_minutes":1,
+        "pattern":"AVWAP_VOLUME_PROFILE_ALIGNMENT",
+        "trend_15m":trend,
+        "structure_1m":structure,
+        "market_quality":float(score),
+        "confluence_score":float(score),
+        "direction_agreement":1.0,
+        "value_area_acceptance":value_acceptance,
+        "reason":(
+            f"Closed M1 price={px:.8f}; AVWAP={avwap:.8f}; POC={poc:.8f}; "
+            f"VAH={vah:.8f}; VAL={val:.8f}; AVWAP_slope={slope:.8f}; "
+            f"AVWAP+POC aligned; closed 1M + completed 15M anchor only."
+        ),
+        "indicator_features":features,
+        "indicators":features,
+        "avwap":avwap,
+        "poc":poc,
+        "vah":vah,
+        "val":val,
+        "avwap_slope":slope,
+        "entry_candle_ts":last["time"],
+        "closed_1m_ts":last["time"],
+        "closed_15m_ts":anchor_ts,
+        "decision_candle_closed":True,
+        "price":px,
+        "five_minute_eligible":False,
+        "self_strategy_version":"AVWAP_VP_V1",
+        "strategy_candidates":[{
+            "strategy":ALLOWED_STRATEGY,
+            "direction":direction,
+            "score":confidence,
+            "expiry_minutes":1,
+            "self_strategy_version":"AVWAP_VP_V1",
+        }],
+        "strategy_audit":[{
+            "strategy":ALLOWED_STRATEGY,
+            "active_for_live":True,
+            "up_qualified":bool(up),
+            "down_qualified":bool(down),
+        }],
+        "strategy_audit_count":1,
+        "indicator_audit_scope":"AVWAP_VOLUME_PROFILE_ONLY",
+    }
+    return result
