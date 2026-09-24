@@ -9,7 +9,7 @@ PROVIDER_COOLDOWN={}
 PROVIDER_COOLDOWN_SECONDS=120.0
 TRANSIENT_COOLDOWN_SECONDS=10.0
 CREDIT_EXHAUSTION_COOLDOWN_SECONDS=21600.0
-DEFAULT_FALLBACKS=("GROQ","OPENROUTER","NVIDIA","MISTRAL","GEMINI","OPENAI")
+DEFAULT_FALLBACKS=("GROQ","OPENROUTER","NVIDIA","MISTRAL","GEMINI","NARAROUTER","OPENAI")
 PROVIDER_LOCKS={}
 ANALYSIS_SEMAPHORE=asyncio.Semaphore(3)
 REVIEW_SEMAPHORE=asyncio.Semaphore(1)
@@ -41,12 +41,12 @@ def _cfg(name):
     if not key and name=="NVIDIA":key=os.getenv("NVIDIA_API_KEY","").strip() or os.getenv("NVIDIA_NIM_API_KEY","").strip()
     base=os.getenv(f"{name}_BASE_URL","").strip().rstrip("/")
     if not base:
-        base={"OPENAI":"https://api.openai.com/v1","GEMINI":"https://generativelanguage.googleapis.com/v1beta/openai","GROQ":"https://api.groq.com/openai/v1","NVIDIA":"https://integrate.api.nvidia.com/v1","OPENROUTER":"https://openrouter.ai/api/v1","MISTRAL":"https://api.mistral.ai/v1"}.get(name,"")
+        base={"OPENAI":"https://api.openai.com/v1","GEMINI":"https://generativelanguage.googleapis.com/v1beta/openai","GROQ":"https://api.groq.com/openai/v1","NVIDIA":"https://integrate.api.nvidia.com/v1","OPENROUTER":"https://openrouter.ai/api/v1","MISTRAL":"https://api.mistral.ai/v1","NARAROUTER":"https://router.bynara.id/v1"}.get(name,"")
     # Provider-specific models must override the global AI_MODEL. A global model
     # such as gpt-5.6 is not valid for Gemini/Groq/etc.
     model=os.getenv(f"{name}_MODEL","").strip()
     if not model:
-        model={"GEMINI":"gemini-3.8-flash","GROQ":"openai/gpt-oss-20b","NVIDIA":"openai/gpt-oss-20b"}.get(name,"")
+        model={"GEMINI":"gemini-3.8-flash","GROQ":"openai/gpt-oss-20b","NVIDIA":"openai/gpt-oss-20b","NARAROUTER":"auto/bynara"}.get(name,"")
     if not model:
         model=os.getenv("AI_MODEL","").strip()
     if not key or not base or not model:return None
