@@ -104,6 +104,21 @@ ASSET_TRADEABILITY_CACHE_TTL=45.0
 ASSET_TRADEABILITY_HARD_MAX_AGE=50.0
 ASSET_TRADEABILITY_CACHE={}
 
+KNOWN_BROKER_CLOSURES_UAE={
+    "ALTCOIN": datetime(2026,9,27,23,52,tzinfo=UAE_TZ).timestamp(),
+}
+
+def known_broker_closure_reason(pair, now_ts=None):
+    p=str(pair or "").strip().upper()
+    until=KNOWN_BROKER_CLOSURES_UAE.get(p)
+    if until is None:
+        return ""
+    now=time.time() if now_ts is None else float(now_ts)
+    if now < until:
+        return f"terminal_closed_until:{datetime.fromtimestamp(until,UAE_TZ).strftime('%Y-%m-%d %H:%M %Z')}"
+    return ""
+
+
 def broker_unavailable_reason(item):
     """Return a broker-provided temporary/unavailable reason, or empty string."""
     if not isinstance(item,dict):
