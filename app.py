@@ -2091,7 +2091,7 @@ async def refresh_candles(force=False):
     try:
         await asyncio.gather(*(one(a) for a in due),return_exceptions=True)
     finally:
-reference=time.time()
+        reference=time.time()
         analyzed_count=0
         live_price_count=0
         for a in assets:
