@@ -422,8 +422,10 @@ def analyze_asset(
     # live selector: ABOVE_VALUE + no level reclaim + persistent AVWAP slope.
     # This is an empirical qualification rule, not a promise of future wins.
     exact_live_setup=(
-        direction=="UP"
-        and value_position=="ABOVE_VALUE"
+        (
+            (direction=="UP" and value_position=="ABOVE_VALUE")
+            or (direction=="DOWN" and value_position=="BELOW_VALUE")
+        )
         and level_reclaim is False
         and slope_persistent is True
     )
@@ -457,9 +459,10 @@ def analyze_asset(
     last_close=float(last["close"])
     previous_close=float(previous["close"])
     m1_continuation_ok=(
-        direction=="UP"
-        and last_close>=last_open
-        and last_close>previous_close
+        (
+            (direction=="UP" and last_close>=last_open and last_close>previous_close)
+            or (direction=="DOWN" and last_close<=last_open and last_close<previous_close)
+        )
     )
     if not m1_continuation_ok:
         _diag(
