@@ -90,14 +90,13 @@ async def save_persistent_learning():
 BRAIN=BrainState()
 UAE_TZ=ZoneInfo("Asia/Dubai")
 
-SIGNAL_SESSION_START_HOUR=6
-SIGNAL_SESSION_END_HOUR=18
+SIGNAL_SESSION_START_HOUR=0
+SIGNAL_SESSION_END_HOUR=24
 # Fixed five-pass Candice scan window inside every 3-minute cycle.
 # Offsets are measured backward from the 1-minute entry/expiry boundary.
 CYCLE_SCAN_OFFSETS=(150.0,120.0,90.0,75.0,60.0)
 CYCLE_SCAN_COUNT=len(CYCLE_SCAN_OFFSETS)
-# DEMO/testing override only. When enabled, the normal daytime signal scheduler
-# may run outside the UAE 06:00–18:00 window. It does NOT enable broker auto-trading.
+# The signal scheduler runs continuously across the full UAE day. It does NOT enable broker auto-trading.
 FORCE_SIGNAL_MODE=os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}
 ASSET_TRADEABILITY_PROBE_TIMEOUT=0.6
 ASSET_TRADEABILITY_CACHE_TTL=45.0
@@ -3266,7 +3265,7 @@ async def result_watch(key):
     )
 
 async def cycle_loop():
-    # Fast 3-minute signal scheduler, active only during the UAE 06:00–18:00 signal session.
+    # Fast 3-minute signal scheduler, active 24/7.
     # For each cycle:
     #   - cycle_start = T - 180s
     #   - Telegram signal = cycle_start + 150s (2m30s after Candice cycle start)
@@ -3287,7 +3286,7 @@ async def cycle_loop():
     async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
         if not signal_session_active(target):
             log.info(
-                "SIGNAL_DELIVERY_BLOCKED_OUTSIDE_06_18 cycle=%s target_utc=%s",
+                "SIGNAL_DELIVERY_BLOCKED_OUTSIDE_SESSION cycle=%s target_utc=%s",
                 cycle_id,time.strftime("%H:%M:%S",time.gmtime(target))
             )
             return False
@@ -3614,14 +3613,12 @@ async def cycle_loop():
     while True:
         now=time.time()
 
-        # Normal signal delivery is restricted to the UAE 06:00–18:00 session
-        # unless the explicit DEMO/testing override is enabled.
-        # Overnight hours still keep automatic learning orders isolated from the
-        # Telegram signal path; the override only permits signal-cycle testing.
+        # Signal delivery is enabled across the full UAE day. This changes only
+        # the signal schedule; broker auto-trading remains isolated/off.
         if not signal_session_active(now):
             if target is not None:
                 log.info(
-                    "SIGNAL_SESSION_OFF start=06:00 end=18:00 timezone=Asia/Dubai "
+                    "SIGNAL_SESSION_OFF start=00:00 end=24:00 timezone=Asia/Dubai "
                     "reason=overnight_learning_mode"
                 )
             target=None
