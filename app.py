@@ -1869,7 +1869,10 @@ async def refresh_candles(force=False):
                 try:
                     await asyncio.sleep(0.05 if attempt==1 else CANDLE_FETCH_RETRY_DELAY)
                     cs=await asyncio.wait_for(
-                        client.market.get_candles(p,size=60,count=60),
+                        # Fetch extra closed history so the forming/current
+                        # M1 bar cannot reduce the live Brain input to 59 bars.
+                        # AVWAP+Volume Profile requires 60 completed M1 candles.
+                        client.market.get_candles(p,size=60,count=75),
                         timeout=2.0
                     )
                     normalized=[]
@@ -1891,7 +1894,7 @@ async def refresh_candles(force=False):
                         newest=_candle_epoch(closed[-1]) if closed else None
                         closed_at=_candle_closed_at(closed[-1]) if closed else None
                         age=(reference-closed_at) if closed_at is not None else None
-                        if newest is not None and age is not None and 0 <= age <= 75.0 and len(closed)>=45:
+                        if newest is not None and age is not None and 0 <= age <= 75.0 and len(closed)>=60:
                             STATE["candles"][p]=normalized
                             CANDLE_FETCH_LAST[p]=time.time()
                             CANDLE_GOOD_ONCE.add(p)
@@ -1929,7 +1932,7 @@ async def refresh_candles(force=False):
         if price is not None:
             live_price_count+=1
         closed=_closed_candles(STATE["candles"].get(p,[]),reference)
-        if len(closed)<45:
+        if len(closed)<60:
             if a.get("signal_eligible",True):
                 STATE["analyses"].pop(p,None)
             continue
