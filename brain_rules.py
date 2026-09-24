@@ -906,7 +906,12 @@ def rank_signal_candidates(candidates):
         if bool(x.get("ai_learning_blocked")):
             continue
         ind=dict(x.get("indicators") or x.get("indicator_context") or {})
-        if str(ind.get("value_position") or "").upper()!="ABOVE_VALUE":
+        value_position=str(ind.get("value_position") or "").upper()
+        direction=str(x.get("direction") or "").upper()
+        if (
+            (direction=="UP" and value_position!="ABOVE_VALUE")
+            or (direction=="DOWN" and value_position!="BELOW_VALUE")
+        ):
             continue
         if ind.get("level_reclaim") is not False:
             continue
