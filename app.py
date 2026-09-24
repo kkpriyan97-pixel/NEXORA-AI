@@ -3163,6 +3163,33 @@ async def cycle_loop():
         strategy_name=str(candidate.get("strategy") or "").upper()
         trend_name=str(candidate.get("trend_15m") or "").upper()
 
+        # Exact-entry market-state gate: the closed M1 setup must still be
+        # aligned with the live authenticated quote at the instant of delivery.
+        # This uses only the AVWAP + Volume Profile levels already produced by
+        # the locked technical Brain; it does not introduce another indicator.
+        if strategy_name=="AVWAP_VOLUME_PROFILE":
+            ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
+            avwap=float(ind.get("anchored_vwap") or candidate.get("avwap") or 0.0)
+            poc=float(ind.get("volume_profile_poc") or candidate.get("poc") or 0.0)
+            vah=float(ind.get("volume_profile_vah") or candidate.get("vah") or 0.0)
+            val=float(ind.get("volume_profile_val") or candidate.get("val") or 0.0)
+            aligned_live=(entry>avwap and entry>poc) if expected=="UP" else (entry<avwap and entry<poc)
+            acceptance_live=(entry>=vah) if expected=="UP" else (entry<=val)
+            if not aligned_live:
+                log.info(
+                    "FINAL_LIVE_AVWAP_VP_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=live_quote_crossed_avwap_or_poc entry=%s avwap=%s poc=%s next_asset=TRUE",
+                    cycle_id,p,expected,entry,avwap,poc
+                )
+                return False
+            if bool(ind.get("value_area_acceptance")) and not acceptance_live:
+                log.info(
+                    "FINAL_LIVE_AVWAP_VP_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=live_quote_reentered_value_area entry=%s vah=%s val=%s next_asset=TRUE",
+                    cycle_id,p,expected,entry,vah,val
+                )
+                return False
+
         log.info(
             "FINAL_AVWAP_VOLUME_PROFILE_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
             cycle_id,p,expected,candidate.get("final_delivery_diagnostic") or {}
