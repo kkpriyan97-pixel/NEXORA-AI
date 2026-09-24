@@ -1065,7 +1065,7 @@ CANDIDATE_CACHE_TTL=75.0
 # when a new closed candle forms.
 CANDIDATE_CACHE_HARD_REJECTED={}
 AI_PROVIDER_COOLDOWN={}
-AI_REVIEW_TIMEOUT=1.8
+AI_REVIEW_TIMEOUT=5.5
 # Rotating account-wide live quote scan. It does not touch Brain timing; it only
 # keeps current account prices warm for analysis/candidate selection.
 ACCOUNT_LIVE_SCAN_BATCH=32
