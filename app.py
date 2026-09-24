@@ -123,84 +123,104 @@ def broker_unavailable_reason(item):
     return ""
 
 async def check_broker_asset_tradeability(pair, cycle_id=None, force=False):
-    """Fresh authenticated broker check used as the final tradability safety gate."""
+    """Return False only when the authenticated broker explicitly says the asset is closed."""
     p=str(pair or "").strip()
     now=time.time()
     if not p or not CLIENT or not getattr(CLIENT,"account_id",None):
-        return False
+        return True
+
     cached=ASSET_TRADEABILITY_CACHE.get(p)
     if (
         not force
         and isinstance(cached,dict)
         and now-float(cached.get("checked_at") or 0.0) <= ASSET_TRADEABILITY_CACHE_TTL
     ):
-        result=bool(cached.get("tradeable"))
+        state=str(cached.get("state") or "UNKNOWN").upper()
+        allowed=state!="CLOSED"
         log.info(
-            "BROKER_TRADEABILITY_CHECK cycle=%s pair=%s tradeable=%s source=cache age=%.2f reason=%s",
-            cycle_id,p,result,max(0.0,now-float(cached.get("checked_at") or now)),
+            "BROKER_TRADEABILITY_CHECK cycle=%s pair=%s state=%s source=cache age=%.2f reason=%s",
+            cycle_id,p,state,max(0.0,now-float(cached.get("checked_at") or now)),
             cached.get("reason") or "cached"
         )
         asset=next((a for a in STATE.get("assets") or [] if str(a.get("pair"))==p),None)
         if asset is not None:
-            asset["broker_tradeable"]=result
+            asset["broker_tradeable"]=(
+                True if state=="OPEN" else False if state=="CLOSED" else None
+            )
             asset["broker_tradeability_checked_at"]=float(cached.get("checked_at") or now)
-            asset["broker_tradeability_source"]="cache"
-            asset["broker_tradeable"]=result
-        if not result:
+            asset["broker_tradeability_source"]=str(cached.get("source") or "cache")
+        if state=="CLOSED":
             STATE.get("analyses",{}).pop(p,None)
-        return result
+        return allowed
 
     method=getattr(getattr(CLIENT,"market",None),"probe_asset_tradeability",None)
     if not callable(method):
         log.warning(
-            "BROKER_TRADEABILITY_CHECK pair=%s tradeable=False source=unavailable reason=probe_method_missing",
-            p
+            "BROKER_TRADEABILITY_CHECK cycle=%s pair=%s state=UNKNOWN source=unavailable reason=probe_method_missing",
+            cycle_id,p
         )
-        return False
+        return True
     try:
         strike=await asyncio.wait_for(
             method(p,category="digital",timeout=ASSET_TRADEABILITY_PROBE_TIMEOUT),
             timeout=ASSET_TRADEABILITY_PROBE_TIMEOUT+1.0,
         )
-        tradeable=isinstance(strike,dict)
         checked_at=time.time()
-        reason="" if tradeable else "event95_or_event80_rejected"
+        if strike is None:
+            state="UNKNOWN"
+            reason="event80_timeout_or_no_explicit_status"
+        elif isinstance(strike,dict) and strike.get("__broker_tradeable") is False:
+            state="CLOSED"
+            reason=str(strike.get("__probe_reason") or "broker_rejected")
+        else:
+            state="OPEN"
+            reason=(
+                str(strike.get("__probe_reason") or "fresh_strike_confirmed")
+                if isinstance(strike,dict) else "fresh_response"
+            )
         ASSET_TRADEABILITY_CACHE[p]={
-            "tradeable":tradeable,"checked_at":checked_at,
-            "reason":reason,"source":"event95+event80"
+            "state":state,
+            "checked_at":checked_at,
+            "tradeable":(True if state=="OPEN" else False if state=="CLOSED" else None),
+            "reason":reason,
+            "source":"event95+event80",
         }
         asset=next((a for a in STATE.get("assets") or [] if str(a.get("pair"))==p),None)
         if asset is not None:
-            asset["broker_tradeable"]=tradeable
+            asset["broker_tradeable"]=(
+                True if state=="OPEN" else False if state=="CLOSED" else None
+            )
             asset["broker_tradeability_checked_at"]=checked_at
             asset["broker_tradeability_source"]="event95+event80"
-            asset["broker_tradeable"]=tradeable
-        if not tradeable:
+        if state=="CLOSED":
             STATE.get("analyses",{}).pop(p,None)
+            log.info(
+                "BROKER_TRADEABILITY_CHECK cycle=%s pair=%s state=CLOSED source=event95+event80 reason=%s",
+                cycle_id,p,reason
+            )
+            return False
         log.info(
-            "BROKER_TRADEABILITY_CHECK cycle=%s pair=%s tradeable=%s source=event95+event80 reason=%s",
-            cycle_id,p,tradeable,reason or "fresh_strike_confirmed"
+            "BROKER_TRADEABILITY_CHECK cycle=%s pair=%s state=%s source=event95+event80 reason=%s",
+            cycle_id,p,state,reason
         )
-        return tradeable
+        return True
     except Exception as e:
         checked_at=time.time()
         reason=f"{type(e).__name__}:{str(e)[:100]}"
         ASSET_TRADEABILITY_CACHE[p]={
-            "tradeable":False,"checked_at":checked_at,
-            "reason":reason,"source":"event95+event80"
+            "state":"UNKNOWN","checked_at":checked_at,"tradeable":None,
+            "reason":reason,"source":"event95+event80",
         }
         asset=next((a for a in STATE.get("assets") or [] if str(a.get("pair"))==p),None)
         if asset is not None:
-            asset["broker_tradeable"]=False
+            asset["broker_tradeable"]=None
             asset["broker_tradeability_checked_at"]=checked_at
             asset["broker_tradeability_source"]="event95+event80"
-            asset["signal_eligible"]=False
-        STATE.get("analyses",{}).pop(p,None)
         log.info(
-            "BROKER_TRADEABILITY_CHECK cycle=%s pair=%s tradeable=False source=event95+event80 reason=%s",
+            "BROKER_TRADEABILITY_CHECK cycle=%s pair=%s state=UNKNOWN source=event95+event80 reason=%s",
             cycle_id,p,reason
         )
-        return False
+        return True
 
 def broker_tradeability_fresh(pair, reference_ts=None):
     p=str(pair or "").strip()
