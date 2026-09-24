@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from math import isfinite
 
 EXPIRIES=(1,)
@@ -274,6 +275,50 @@ def _slope(cs,anchor_ts):
     return current-previous
 
 
+def _m1_sequence_signature(cs,length=6):
+    """Compact closed-M1 price geometry signature; no new indicator."""
+    sample=list(cs[-max(3,int(length)):])
+    parts=[]
+    for c in sample:
+        try:
+            o=float(c["open"]); h=float(c["high"]); l=float(c["low"]); close=float(c["close"])
+            rng=max(h-l,1e-12)
+            body=min(1.0,abs(close-o)/rng)
+            close_pos=min(1.0,max(0.0,(close-l)/rng))
+            body_bin=min(3,int(body*4.0))
+            close_bin=min(3,int(close_pos*4.0))
+            direction="U" if close>o else "D" if close<o else "F"
+            parts.append(f"{direction}{body_bin}{close_bin}")
+        except (TypeError,ValueError):
+            parts.append("F00")
+    return ">".join(parts)
+
+
+def _market_regime(direction,slope_persistent,value_acceptance,level_reclaim,migration_aligned,migration_against,value_position):
+    d=str(direction or "").upper()
+    if d in {"UP","DOWN"} and migration_against:
+        return "CONFLICT"
+    if d in {"UP","DOWN"} and value_acceptance and migration_aligned:
+        return "ACCEPTED_" + d
+    if d in {"UP","DOWN"} and level_reclaim and slope_persistent:
+        return "RECLAIM_" + d
+    if d in {"UP","DOWN"} and slope_persistent:
+        return "TREND_" + d
+    vp=str(value_position or "").upper()
+    if vp in {"UPPER_VALUE","LOWER_VALUE"}:
+        return "ROTATION_" + ("UP" if vp=="UPPER_VALUE" else "DOWN")
+    return "BALANCED"
+
+
+def _decision_time_bucket(ts):
+    """Coarse two-hour UAE bucket to reduce time-of-day overfitting."""
+    try:
+        hour=(datetime.fromtimestamp(float(ts),tz=timezone.utc).hour+4)%24
+        return f"UAE_{(hour//2)*2:02d}_{((hour//2)*2+2)%24:02d}"
+    except (TypeError,ValueError,OSError):
+        return "UAE_UNKNOWN"
+
+
 def analyze_asset(
     asset,
     candles,
@@ -446,6 +491,12 @@ def analyze_asset(
         "poc_migration_against":migration_against,
         "anchor_15m_start_ts":anchor_ts,
         "avwap_volume":avwap_volume,
+        "m1_sequence_signature":_m1_sequence_signature(cs,6),
+        "market_regime":_market_regime(
+            direction,slope_persistent,value_acceptance,level_reclaim,
+            migration_aligned,migration_against,value_position
+        ),
+        "decision_time_bucket":_decision_time_bucket(last["time"]),
     }
 
     result={
@@ -504,5 +555,8 @@ def analyze_asset(
         }],
         "strategy_audit_count":1,
         "indicator_audit_scope":"AVWAP_VOLUME_PROFILE_ONLY",
+        "m1_sequence_signature":features["m1_sequence_signature"],
+        "market_regime":features["market_regime"],
+        "decision_time_bucket":features["decision_time_bucket"],
     }
     return result
