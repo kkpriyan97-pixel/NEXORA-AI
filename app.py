@@ -4992,7 +4992,7 @@ async def build_live_analysis_payload():
             "strategy_candidates":list(an.get("strategy_candidates") or []),
             "strategy_audit":list(an.get("strategy_audit") or []),
             "strategy_audit_count":int(an.get("strategy_audit_count") or 0),
-            "indicator_audit_scope":an.get("indicator_audit_scope") or "ALL_8_STRATEGIES_SAME_LIVE_INDICATORS",
+            "indicator_audit_scope":an.get("indicator_audit_scope") or "AVWAP_VOLUME_PROFILE_ONLY",
             "indicators":dict(an.get("indicators") or {}),
         })
     return {
@@ -5003,8 +5003,8 @@ async def build_live_analysis_payload():
         "authenticated_account_feed":str(STATE.get("feed_source") or "").startswith("authenticated_websocket:"),
         "asset_count":len(rows),
         "qualified_count":len(STATE.get("analyses") or {}),
-        "strategy_families_checked":8,
-        "strategy_families":list(("TREND_FOLLOWING","MOMENTUM","PULLBACK","BREAKOUT","REVERSAL","MEAN_REVERSION","PRICE_ACTION","VOLATILITY")),
+        "strategy_families_checked":1,
+        "strategy_families":["AVWAP_VOLUME_PROFILE"],
         "five_scan_cycle":dict(STATE.get("cycle_scan_status") or {}),
         "protocol":"FLEX_MANUAL",
         "signal_expiry_minutes":1,
@@ -5069,15 +5069,16 @@ pre{white-space:pre-wrap;word-break:break-word;font-size:11px;opacity:.85}.empty
         ) or "No strategy audit available"
         ind=asset.get("indicators") or {}
         ind_text="\n".join([
-            "EMA 9/21: %s / %s"%(esc(ind.get("ema_fast")),esc(ind.get("ema_slow"))),
-            "RSI 14: %s"%esc(ind.get("rsi")),
-            "Stoch 14/3/3: %s / %s / %s"%(esc(ind.get("stochastic_k")),esc(ind.get("stochastic_d")),esc(ind.get("stochastic_cross"))),
-            "Bollinger 30/2.2: %s • %s"%(esc(ind.get("bollinger_signal")),esc(ind.get("bollinger_position"))),
-            "Donchian 30: %s • %s"%(esc(ind.get("donchian_state")), "EXPANDING" if ind.get("donchian_expansion") else "FLAT"),
-            "ATR 14: %s"%esc(ind.get("atr")),
-            "Momentum: %s ATR"%esc(ind.get("momentum_norm_atr")),
-            "Volatility: %s"%esc(ind.get("volatility_ratio")),
-            "Support / Resistance: %s / %s"%(esc(ind.get("support")),esc(ind.get("resistance")))
+            "Anchored VWAP: %s"%esc(ind.get("anchored_vwap")),
+            "Volume Profile POC: %s"%esc(ind.get("volume_profile_poc")),
+            "VAH / VAL: %s / %s"%(esc(ind.get("volume_profile_vah")),esc(ind.get("volume_profile_val"))),
+            "AVWAP slope: %s"%esc(ind.get("avwap_slope")),
+            "Slope persistence: %s"%esc(ind.get("slope_persistent")),
+            "POC migration: %s"%esc(ind.get("profile_poc_migration_norm")),
+            "Value position: %s"%esc(ind.get("value_position")),
+            "Value acceptance: %s"%("YES" if ind.get("value_area_acceptance") else "NO"),
+            "Level reclaim: %s"%("YES" if ind.get("level_reclaim") else "NO"),
+            "Volume quality: %s (%s)"%(esc(ind.get("volume_quality")),esc(ind.get("volume_mode"))),
         ])
         cards.append(
             '<div class="setup"><div class="row"><div><div class="assetname">%d. %s</div>'
@@ -5085,7 +5086,7 @@ pre{white-space:pre-wrap;word-break:break-word;font-size:11px;opacity:.85}.empty
             '<div class="%s">%s</div></div>'
             '<div class="meta">🎯 %s • Confidence %s%% • 15m %s • 1m %s</div>'
             '<details><summary>📊 Full live indicators</summary><pre>%s</pre></details>'
-            '<details><summary>🧠 All 8 strategy checks</summary><pre>%s</pre></details></div>'
+            '<details><summary>🧠 Active engine check</summary><pre>%s</pre></details></div>'
             % (idx,esc(asset.get("display_name") or asset.get("pair")),
                esc(asset.get("pair")),esc(asset.get("live_price")),esc(asset.get("live_price_source")),
                dc,esc(direction),esc(cand.get("strategy") or asset.get("strategy")),
@@ -5147,7 +5148,7 @@ pre{white-space:pre-wrap;word-break:break-word;font-size:11px;opacity:.85}.empty
 <div class="grid">
 <div class="card"><div class="label">Account Assets</div><div class="kpi">%s</div></div>
 <div class="card"><div class="label">Detected Setups</div><div class="kpi">%s</div></div>
-<div class="card"><div class="label">Strategies Checked</div><div class="kpi">8</div></div>
+<div class="card"><div class="label">Active Engine</div><div class="kpi">AVWAP + VP</div></div>
 <div class="card"><div class="label">Signal Expiry</div><div class="kpi">1 MIN</div></div></div>
 <div class="card"><b>🔎 5-SCAN CYCLE</b><br>Cycle: %s • Pass: %s/5<br>Protocol: <b>FLEX MANUAL</b> • Bot order placement: <b>OFF</b></div>
 <div class="card"><b>💼 LIVE ORDER / POSITION</b>%s</div>
