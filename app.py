@@ -3379,9 +3379,11 @@ async def cycle_loop():
             closed_setup_price=float(candidate.get("price") or 0.0)
             continuation_ok=(
                 bool(ind.get("m1_continuation_ok"))
-                and expected=="UP"
                 and closed_setup_price>0.0
-                and entry>=closed_setup_price
+                and (
+                    (expected=="UP" and entry>=closed_setup_price)
+                    or (expected=="DOWN" and entry<=closed_setup_price)
+                )
             )
             if not continuation_ok:
                 log.info(

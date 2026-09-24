@@ -901,7 +901,7 @@ def rank_signal_candidates(candidates):
             continue
         if int(x.get("confidence") or 0)<MIN_CONFIDENCE:
             continue
-        if str(x.get("direction","")).upper()!="UP":
+        if str(x.get("direction","")).upper() not in {"UP","DOWN"}:
             continue
         if bool(x.get("ai_learning_blocked")):
             continue
