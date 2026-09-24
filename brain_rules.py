@@ -314,11 +314,7 @@ class BrainState:
                 out={}
                 for r in rows:
                     ind=dict(r.get("indicator_context") or {})
-                    key="DC:{}:{}|ST:{}:{}".format(
-                        ind.get("donchian_state","UNKNOWN"),
-                        "EXPANDING" if ind.get("donchian_expansion") else "FLAT",
-                        "OVERSOLD" if ind.get("stochastic_oversold") else ("OVERBOUGHT" if ind.get("stochastic_overbought") else "MID"),
-                        ind.get("stochastic_cross","NEUTRAL"))
+                    key=self.vp_context_key(ind)
                     b=out.setdefault(key,{"n":0,"win":0,"loss":0,"tie":0})
                     b["n"]+=1
                     b[str(r.get("result","")).lower()]+=1
