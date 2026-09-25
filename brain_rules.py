@@ -38,6 +38,8 @@ class ActiveSignal:
     self_strategy:str=""
     self_strategy_version:str=""
     indicator_context:dict[str,Any]=field(default_factory=dict)
+    actual_entry_captured:bool=False
+    actual_entry_source:str=""
     telegram_eval_counted:bool=False
 
 @dataclass
