@@ -15,9 +15,9 @@ ACCESS_DENIED_COOLDOWN_SECONDS=3600.0
 # spend its qualification budget retrying a dead provider chain.
 GLOBAL_CHAIN_COOLDOWN_UNTIL=0.0
 GLOBAL_CHAIN_COOLDOWN_SECONDS=60.0
-# NaraRouter currently returns a deterministic Telegram-binding 403 in production;
-# keep it available only when explicitly added through AI_FALLBACK_PROVIDERS.
-DEFAULT_FALLBACKS=("NEXRA","NVIDIA","MISTRAL","GEMINI","OPENAI")
+# NaraRouter is the primary OpenAI-compatible gateway. Additional providers remain
+# as bounded fail-open fallbacks so an AI outage cannot stop the live scheduler.
+DEFAULT_FALLBACKS=("NARAROUTER","NVIDIA","MISTRAL","GEMINI","OPENAI")
 PROVIDER_LOCKS={}
 try:
     _ai_concurrency=int(os.getenv("AI_ANALYSIS_CONCURRENCY","2"))
@@ -38,7 +38,7 @@ _logged_ready=set()
 
 def _providers():
     names=[]
-    primary=os.getenv("AI_PROVIDER","NEXRA").strip().upper()
+    primary=os.getenv("AI_PROVIDER","NARAROUTER").strip().upper()
     if primary:names.append(primary)
     for n in os.getenv("AI_FALLBACK_PROVIDERS",",".join(DEFAULT_FALLBACKS)).split(","):
         n=n.strip().upper()
@@ -52,10 +52,9 @@ def _cfg(name):
     if not key and name=="GEMINI":key=os.getenv("GEMINI_API_KEY","").strip()
     if not key and name=="GROQ":key=os.getenv("GROQ_API_KEY","").strip()
     if not key and name=="NVIDIA":key=os.getenv("NVIDIA_API_KEY","").strip() or os.getenv("NVIDIA_NIM_API_KEY","").strip()
-    if not key and name=="NEXRA":key=os.getenv("NEXRA_API_KEY","").strip()
     base=os.getenv(f"{name}_BASE_URL","").strip().rstrip("/")
     if not base:
-        base={"OPENAI":"https://api.openai.com/v1","GEMINI":"https://generativelanguage.googleapis.com/v1beta/openai","GROQ":"https://api.groq.com/openai/v1","NVIDIA":"https://integrate.api.nvidia.com/v1","OPENROUTER":"https://openrouter.ai/api/v1","MISTRAL":"https://api.mistral.ai/v1","NARAROUTER":"https://router.bynara.id/v1","NEXRA":"https://nexra-ai.co/v1"}.get(name,"")
+        base={"OPENAI":"https://api.openai.com/v1","GEMINI":"https://generativelanguage.googleapis.com/v1beta/openai","GROQ":"https://api.groq.com/openai/v1","NVIDIA":"https://integrate.api.nvidia.com/v1","OPENROUTER":"https://openrouter.ai/api/v1","MISTRAL":"https://api.mistral.ai/v1","NARAROUTER":"https://router.bynara.id/v1"}.get(name,"")
     # Provider-specific models must override the global AI_MODEL. A global model
     # such as gpt-5.6 is not valid for Gemini/Groq/etc.
     model=os.getenv(f"{name}_MODEL","").strip()
