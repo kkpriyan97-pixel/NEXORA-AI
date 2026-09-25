@@ -61,6 +61,13 @@ def main():
         close=o+0.08
         no_volume.append({"time":t,"open":o,"high":close+0.03,"low":o-0.03,"close":close})
     assert analyze_asset({"pair":"TEST_NO_VOLUME","display_name":"TEST_NO_VOLUME"},no_volume) is None
+    discovery=analyze_asset(
+        {"pair":"TEST_NO_VOLUME_DISCOVERY","display_name":"TEST_NO_VOLUME_DISCOVERY"},
+        no_volume,
+        require_high_volume=False,
+    )
+    assert discovery and discovery["indicators"]["high_volume_confirmed"] is False
+    assert discovery["indicators"]["high_volume_gate_pending"] is True
 
     print("NEXORA_AVWAP_VP_SMOKE_OK")
 
