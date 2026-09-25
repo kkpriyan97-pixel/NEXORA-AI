@@ -1116,6 +1116,7 @@ ACCOUNT_TICK_FRESH_WAIT=0.5
 ACCOUNT_TICK_FINAL_PROBE_LIMIT=8
 ACCOUNT_TICK_SUB_TIMEOUT=1.8
 ACCOUNT_TICK_SUBSCRIBED=set()
+ACCOUNT_TICK_SUBSCRIBED_AT={}
 ACCOUNT_TICK_LAST_ATTEMPT={}
 ACCOUNT_TICK_REJECT_COUNT=defaultdict(int)
 ACCOUNT_TICK_REJECT_UNTIL={}
@@ -1600,6 +1601,7 @@ async def _unsubscribe_account_tick(pair):
     try:
         await asyncio.wait_for(client.market.unsubscribe_ticks(pair),timeout=4.0)
         ACCOUNT_TICK_SUBSCRIBED.discard(pair)
+        ACCOUNT_TICK_SUBSCRIBED_AT.pop(pair,None)
         log.info("ACCOUNT_TICK_UNSUBSCRIBE pair=%s status=accepted",pair)
         return True
     except Exception as e:
@@ -1635,6 +1637,7 @@ async def _subscribe_account_tick(pair):
             # stay latency-bounded because it is also used before signal delivery.
             await asyncio.wait_for(client.market.subscribe_ticks(pair),timeout=ACCOUNT_TICK_SUB_TIMEOUT)
             ACCOUNT_TICK_SUBSCRIBED.add(pair)
+            ACCOUNT_TICK_SUBSCRIBED_AT[pair]=time.time()
             ACCOUNT_TICK_LAST_ATTEMPT[pair]=time.time()
             ACCOUNT_TICK_REJECT_COUNT[pair]=0
             ACCOUNT_TICK_REJECT_UNTIL.pop(pair,None)
@@ -1747,22 +1750,90 @@ async def pin_account_tick_pairs(pairs,ttl=12.0,require_fresh=False,fresh_wait=N
         )
         return active_targets
 
-async def ensure_account_tick_subscriptions():
-    """Candidate-driven authenticated event-1 coverage manager.
+async def _rotate_account_tick_collection_once(fill_all=False):
+    """Maintain low-churn background Event-1 coverage outside final signal pinning."""
+    if _tick_pinned_pairs():
+        return 0
+    client=CLIENT
+    assets=list(STATE.get("assets") or [])
+    if not client or not assets or not getattr(client.connection,"is_connected",False):
+        return 0
 
-    Final candidate preparation owns event-12 live slots. Do not rotate
-    subscriptions across the full account universe; that creates avoidable
-    INVALID_REQUEST churn and can consume the timing budget.
-    """
-    return None
+    async with ACCOUNT_TICK_CONTROL_LOCK:
+        if _tick_pinned_pairs():
+            return 0
+        pairs=[str(a.get("pair") or "") for a in assets if a.get("pair")]
+        if not pairs:
+            return 0
+        global ACCOUNT_TICK_ROTATE_CURSOR
+        now=time.time()
+        accepted=0
+
+        target_count=ACCOUNT_TICK_MAX_SLOTS if fill_all else min(
+            ACCOUNT_TICK_MAX_SLOTS,len(ACCOUNT_TICK_SUBSCRIBED)+1
+        )
+        attempts=0
+        while len(ACCOUNT_TICK_SUBSCRIBED)<target_count and attempts<len(pairs):
+            p=pairs[ACCOUNT_TICK_ROTATE_CURSOR % len(pairs)]
+            ACCOUNT_TICK_ROTATE_CURSOR=(ACCOUNT_TICK_ROTATE_CURSOR+1)%max(1,len(pairs))
+            attempts+=1
+            if p in ACCOUNT_TICK_SUBSCRIBED:
+                continue
+            if float(ACCOUNT_TICK_REJECT_UNTIL.get(p) or 0.0)>now:
+                continue
+            if await _subscribe_account_tick(p):
+                accepted+=1
+
+        if (
+            not fill_all
+            and len(ACCOUNT_TICK_SUBSCRIBED)>=ACCOUNT_TICK_MAX_SLOTS
+            and pairs
+        ):
+            active=sorted(
+                ACCOUNT_TICK_SUBSCRIBED,
+                key=lambda p:float(ACCOUNT_TICK_SUBSCRIBED_AT.get(p,0.0) or 0.0)
+            )
+            replacement=None
+            for _ in range(len(pairs)):
+                p=pairs[ACCOUNT_TICK_ROTATE_CURSOR % len(pairs)]
+                ACCOUNT_TICK_ROTATE_CURSOR=(ACCOUNT_TICK_ROTATE_CURSOR+1)%max(1,len(pairs))
+                if p not in ACCOUNT_TICK_SUBSCRIBED and float(ACCOUNT_TICK_REJECT_UNTIL.get(p) or 0.0)<=time.time():
+                    replacement=p
+                    break
+            if active and replacement:
+                oldest=active[0]
+                await _unsubscribe_account_tick(oldest)
+                if await _subscribe_account_tick(replacement):
+                    accepted+=1
+                    log.info(
+                        "ACCOUNT_TICK_COLLECTOR_ROTATION replaced=%s->%s active=%s",
+                        oldest,replacement,sorted(ACCOUNT_TICK_SUBSCRIBED)
+                    )
+
+        log.info(
+            "ACCOUNT_TICK_COLLECTOR_STATE active=%d max=%d accepted=%d pinned=%s cursor=%d",
+            len(ACCOUNT_TICK_SUBSCRIBED),ACCOUNT_TICK_MAX_SLOTS,accepted,
+            bool(_tick_pinned_pairs()),ACCOUNT_TICK_ROTATE_CURSOR
+        )
+        return accepted
+
+async def ensure_account_tick_subscriptions():
+    # Seed available read-only Event-1 slots before the first candle scan.
+    return await _rotate_account_tick_collection_once(fill_all=True)
 
 async def account_tick_subscription_worker():
-    # Event-12 ownership is candidate-driven now; no background subscription churn.
+    """Rotate read-only Event-1 subscriptions to accumulate truthful M1 tick activity."""
     while True:
         try:
-            await asyncio.sleep(5.0)
+            await _rotate_account_tick_collection_once(fill_all=False)
         except asyncio.CancelledError:
             raise
+        except Exception as e:
+            log.warning(
+                "ACCOUNT_TICK_COLLECTOR_WORKER_ERROR type=%s message=%s",
+                type(e).__name__,str(e)[:160]
+            )
+        await asyncio.sleep(ACCOUNT_TICK_ROTATE_INTERVAL)
 TELEGRAM_HTTP_CLIENT=None
 TELEGRAM_HTTP_CLIENT_LOCK=asyncio.Lock()
 TELEGRAM_SIGNAL_TIMEOUT=2.0
@@ -2911,7 +2982,12 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
             int(candidate.get("confidence") or 0),
         )
 
-    volume_enabled=[x for x in analyzed if _volume_priority_key(x)[0]>0 and _volume_priority_key(x)[1]>0.0]
+    volume_min_coverage=max(0.80,min(1.0,float(os.getenv("VOLUME_PRIORITY_MIN_COVERAGE","0.80") or 0.80)))
+    volume_enabled=[
+        x for x in analyzed
+        if _volume_priority_key(x)[0]>0
+        and _volume_priority_key(x)[1]>=volume_min_coverage
+    ]
     volume_enabled.sort(key=_volume_priority_key,reverse=True)
     volume_selected=volume_enabled[:volume_priority_top_n]
     if volume_selected:
@@ -2930,17 +3006,17 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         analyzed_for_brain=volume_selected
         log.info(
             "VOLUME_PRIORITY_SCAN account_assets=%d analyzed=%d volume_enabled=%d "
-            "selected=%d top_n=%d modes=%s pairs=%s",
+            "selected=%d top_n=%d min_coverage=%.2f modes=%s pairs=%s",
             len(STATE.get("assets") or []),len(analyzed),len(volume_enabled),
-            len(volume_selected),volume_priority_top_n,selected_modes,
+            len(volume_selected),volume_priority_top_n,volume_min_coverage,selected_modes,
             ",".join(str(x.get("pair")) for x in volume_selected),
         )
     else:
         analyzed_for_brain=analyzed
         log.warning(
-            "VOLUME_PRIORITY_FALLBACK account_assets=%d analyzed=%d reason=no_usable_volume_data "
-            "action=preserve_existing_brain_pool",
-            len(STATE.get("assets") or []),len(analyzed)
+            "VOLUME_PRIORITY_FALLBACK account_assets=%d analyzed=%d min_coverage=%.2f "
+            "reason=no_usable_volume_data action=preserve_existing_brain_pool",
+            len(STATE.get("assets") or []),len(analyzed),volume_min_coverage
         )
 
     adapted=[BRAIN.adaptive_candidate(x) for x in analyzed_for_brain]
