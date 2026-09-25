@@ -2635,18 +2635,23 @@ async def refresh_candles(force=False):
             log.warning("CANDLE_REFRESH_REJECTED pair=%s attempts=%d reason=%s",
                         p,CANDLE_FETCH_RETRIES,last_reason)
 
-    # Pass-level refreshes are time-bounded by the scheduler. A timeout must not
-    # cancel the final analysis phase after individual assets have already returned
-    # usable closed candles. Finalize analysis from every successfully stored dataset
-    # even when the surrounding wait_for() is cancelling this coroutine; this prevents
-    # the observed state where CANDLE_REFRESH_RECOVERED exists but analyzed=0.
+    # Pass-level refreshes are hard-bounded by the scheduler. On cancellation,
+    # return immediately: do not run a large synchronous analysis/finalization loop
+    # from a finally block because that defeats the outer wait_for() deadline and can
+    # push pass 4/5 beyond the exact 30-second signal boundary.
     try:
         await asyncio.gather(*(one(a) for a in due),return_exceptions=True)
-    finally:
-        reference=time.time()
-        analyzed_count=0
-        live_price_count=0
-        for a in assets:
+    except asyncio.CancelledError:
+        log.warning(
+            "CANDLE_REFRESH_CANCELLED due=%d reason=deadline_preserve_scheduler",
+            len(due)
+        )
+        return
+
+    reference=time.time()
+    analyzed_count=0
+    live_price_count=0
+    for a in assets:
             p=a["pair"]
             price=STATE["prices"].get(p,(None,None))[0]
             if price is not None:
