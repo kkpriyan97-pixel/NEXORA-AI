@@ -98,13 +98,42 @@ def build_ai_request(snapshot: MarketSnapshot) -> dict[str, Any]:
 
 def ai_environment_status() -> dict[str, Any]:
     """Report configuration presence without exposing secret values."""
-    provider = os.getenv("AI_PROVIDER", "").strip()
+    provider = os.getenv("AI_PROVIDER", "").strip().upper()
     model = os.getenv("AI_MODEL", "").strip()
+    nara_key_present = any(
+        os.getenv(name, "").strip()
+        for name in (
+            "NARAROUTER_API_KEY",
+            "BYNARA_API_KEY",
+            "NARA_API_KEY",
+            "NARA_ROUTER_API_KEY",
+            "NARAROUTER_API_TOKEN",
+            "NARA_ROUTER_TOKEN",
+            "NARAROUTER_TOKEN",
+            "BYNARA_API_TOKEN",
+            "BYNARA_TOKEN",
+            "BYNARA_KEY",
+            "NARA_TOKEN",
+            "NARA_KEY",
+            "NARA_ROUTER_KEY",
+            "AI_API_KEY",
+        )
+    )
     api_key_present = bool(
-        os.getenv("AI_API_KEY", "").strip()
+        nara_key_present
         or os.getenv("OPENAI_API_KEY", "").strip()
         or os.getenv("OPENROUTER_API_KEY", "").strip()
     )
+    if provider == "NARAROUTER" and nara_key_present:
+        provider_model = (
+            os.getenv("NARAROUTER_MODEL", "").strip()
+            or os.getenv("BYNARA_MODEL", "").strip()
+            or os.getenv("NARA_MODEL", "").strip()
+            or os.getenv("NARA_ROUTER_MODEL", "").strip()
+            or "auto/bynara"
+        )
+    else:
+        provider_model = model
     return {
         "configured": bool(provider and model and api_key_present),
         "provider": provider or None,
