@@ -515,14 +515,22 @@ def _alligator_confirmation(cs,direction):
             lips>teeth+ALLIGATOR_MIN_SEPARATION
             and teeth>jaw+ALLIGATOR_MIN_SEPARATION
         )
-        sloping=(lips>=prev_lips and teeth>=prev_teeth and jaw>=prev_jaw)
+        slope_votes=sum(
+            1 for current,previous in ((lips,prev_lips),(teeth,prev_teeth),(jaw,prev_jaw))
+            if current>=previous
+        )
+        sloping=slope_votes>=2
         price_position=last_close>=lips
     else:
         aligned=(
             lips<teeth-ALLIGATOR_MIN_SEPARATION
             and teeth<jaw-ALLIGATOR_MIN_SEPARATION
         )
-        sloping=(lips<=prev_lips and teeth<=prev_teeth and jaw<=prev_jaw)
+        slope_votes=sum(
+            1 for current,previous in ((lips,prev_lips),(teeth,prev_teeth),(jaw,prev_jaw))
+            if current<=previous
+        )
+        sloping=slope_votes>=2
         price_position=last_close<=lips
 
     return {
