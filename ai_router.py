@@ -312,9 +312,9 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                         and "telegram_required" in detail.lower()
                     )
                     if nararouter_telegram_required:
-                        // This is an account-side entitlement gate. /models is
-                        // subject to the same gate, so discovery cannot resolve it.
-                        // Quarantine briefly and retry after official Telegram binding.
+                        # This is an account-side entitlement gate. /models is
+                        # subject to the same gate, so discovery cannot resolve it.
+                        # Quarantine briefly and retry after official Telegram binding.
                         PROVIDER_COOLDOWN[name]=time.time()+NARAROUTER_TELEGRAM_REQUIRED_COOLDOWN_SECONDS
                         log.warning(
                             "NARAROUTER_TELEGRAM_BIND_REQUIRED provider=%s cooldown=%.0fs settings_url=%s action=link_telegram_then_auto_retry",
