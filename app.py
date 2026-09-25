@@ -3702,6 +3702,36 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
              len(raw),len(top),len(reviewed),require_live_price)
     return None
 
+def _exact_expiry_candle(candles,target_ts,reference_ts=None):
+    """Return only the 1m candle whose START exactly matches the entry boundary.
+
+    A 1-minute signal entered at target_ts must be evaluated against the candle
+    that starts at that minute and closes at target_ts + 60s. Never substitute a
+    newer candle merely because the broker response arrived late.
+    """
+    reference=time.time() if reference_ts is None else float(reference_ts)
+    try:
+        target_start=(int(float(target_ts))//60)*60
+    except (TypeError,ValueError):
+        return None
+    for raw in candles or []:
+        if not isinstance(raw,dict):
+            continue
+        ts=_candle_epoch(raw)
+        if ts is None or int(ts//60)*60 != target_start:
+            continue
+        close_at=float(ts)+60.0
+        if close_at>reference:
+            return None
+        try:
+            close=float(raw.get("close",raw.get("c")))
+        except (TypeError,ValueError):
+            return None
+        if not isfinite(close):
+            return None
+        return raw,close
+    return None
+
 async def result_watch(key):
     s=BRAIN.active_signals.get(key)
     if not s:return
@@ -3789,11 +3819,11 @@ async def result_watch(key):
                 if normalized:
                     try:normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
                     except Exception:pass
-                    closed=_closed_candles(normalized,time.time())
-                    if closed:
-                        expiry_price=float(closed[-1].get("close",closed[-1].get("c")))
+                    exact=_exact_expiry_candle(normalized,s.entry_ts,time.time())
+                    if exact:
+                        _,expiry_price=exact
                         STATE["candles"][s.pair]=normalized
-                        expiry_source="candle-closed"
+                        expiry_source="candle-closed:exact-entry-minute"
                         break
         except Exception as e:
             log.warning("RESULT_CANDLE_READ_FAILED pair=%s attempt=%d type=%s message=%s",
@@ -3825,11 +3855,11 @@ async def result_watch(key):
                         if normalized:
                             try:normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
                             except Exception:pass
-                            closed=_closed_candles(normalized,time.time())
-                            if closed:
-                                expiry_price=float(closed[-1].get("close",closed[-1].get("c")))
+                            exact=_exact_expiry_candle(normalized,s.entry_ts,time.time())
+                            if exact:
+                                _,expiry_price=exact
                                 STATE["candles"][s.pair]=normalized
-                                expiry_source="candle-closed"
+                                expiry_source="candle-closed:exact-entry-minute"
                                 break
                 except Exception as e:
                     log.warning("RESULT_CANDLE_RETRY_FAILED pair=%s attempt=%d type=%s message=%s",
