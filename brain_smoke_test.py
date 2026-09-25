@@ -50,6 +50,18 @@ def main():
 
     flat=[{"time":start+i*60,"open":100,"high":100.01,"low":99.99,"close":100,"volume":100} for i in range(120)]
     assert analyze_asset({"pair":"TEST_FLAT","display_name":"TEST_FLAT"},flat) is None
+
+    # A structurally valid setup with no broker-reported volume must be rejected
+    # by the strict HIGH-volume live gate rather than being labelled HIGH.
+    no_volume=[]
+    for i in range(120):
+        t=start+i*60
+        base=100+(i-99)*0.45 if i>=100 else 100+(i%5)*0.01
+        o=base
+        close=o+0.08
+        no_volume.append({"time":t,"open":o,"high":close+0.03,"low":o-0.03,"close":close})
+    assert analyze_asset({"pair":"TEST_NO_VOLUME","display_name":"TEST_NO_VOLUME"},no_volume) is None
+
     print("NEXORA_AVWAP_VP_SMOKE_OK")
 
 
