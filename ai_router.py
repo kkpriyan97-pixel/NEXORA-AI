@@ -122,7 +122,7 @@ def _cfg(name):
                 model=candidate
                 break
     if not model:
-        model={"GEMINI":"gemini-3.8-flash","GROQ":"openai/gpt-oss-20b","NVIDIA":"openai/gpt-oss-20b","NARAROUTER":"auto/bynara"}.get(name,"")
+        model={"GEMINI":"gemini-3.8-flash","GROQ":"openai/gpt-oss-20b","NVIDIA":"openai/gpt-oss-20b","NARAROUTER":"ling-3.0-flash-fin-free"}.get(name,"")
     if not model:
         model=os.getenv("AI_MODEL","").strip()
     if not key or not base or not model:return None
@@ -182,8 +182,12 @@ async def _discover_nararouter_models(base,key,timeout=1.5):
         ids=[]
         for row in rows:
             if isinstance(row,dict) and row.get("id"):
-                ids.append(str(row["id"]).strip())
-        preferred=("agnes","laguna","ling","nemotron","stepfun","glm","qwen","deepseek","mistral")
+                model_id=str(row["id"]).strip()
+                low=model_id.lower()
+                if any(blocked in low for blocked in ("embed","fim","code")):
+                    continue
+                ids.append(model_id)
+        preferred=("ling","agnes","laguna","nemotron","stepfun","deepseek","glm","qwen","mistral")
         ordered=sorted(
             dict.fromkeys(ids),
             key=lambda model: (
