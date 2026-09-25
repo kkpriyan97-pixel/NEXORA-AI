@@ -10,6 +10,11 @@ PROVIDER_COOLDOWN_SECONDS=120.0
 TRANSIENT_COOLDOWN_SECONDS=10.0
 CREDIT_EXHAUSTION_COOLDOWN_SECONDS=21600.0
 ACCESS_DENIED_COOLDOWN_SECONDS=3600.0
+// NaraRouter FREE-model access is account-gated by Telegram linking. Keep this
+// account-side restriction on a short recovery probe so official binding can
+// recover without a Render restart. Never bypass the provider gate.
+NARAROUTER_TELEGRAM_REQUIRED_COOLDOWN_SECONDS=60.0
+NARAROUTER_SETTINGS_URL="https://router.bynara.id/settings"
 # When every configured AI provider is already cooling down or has just failed,
 # short-circuit subsequent verifier calls so the live 3-minute scheduler does not
 # spend its qualification budget retrying a dead provider chain.
@@ -301,14 +306,27 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                     # /v1/models catalog to discover aliases actually entitled to
                     # this key, then retry once with an accessible model. This is
                     # provider-supported failover, not a quota/rate-limit bypass.
-                    if (
+                    nararouter_telegram_required=(
                         name=="NARAROUTER"
                         and status==403
-                        and (
-                            "telegram_required" in detail.lower()
-                            or "telegram" in detail.lower()
+                        and "telegram_required" in detail.lower()
+                    )
+                    if nararouter_telegram_required:
+                        // This is an account-side entitlement gate. /models is
+                        // subject to the same gate, so discovery cannot resolve it.
+                        // Quarantine briefly and retry after official Telegram binding.
+                        PROVIDER_COOLDOWN[name]=time.time()+NARAROUTER_TELEGRAM_REQUIRED_COOLDOWN_SECONDS
+                        log.warning(
+                            "NARAROUTER_TELEGRAM_BIND_REQUIRED provider=%s cooldown=%.0fs settings_url=%s action=link_telegram_then_auto_retry",
+                            name,NARAROUTER_TELEGRAM_REQUIRED_COOLDOWN_SECONDS,NARAROUTER_SETTINGS_URL
                         )
-                    ):
+                    elif name=="NARAROUTER" and status==403 and "telegram" in detail.lower():
+                        PROVIDER_COOLDOWN[name]=time.time()+NARAROUTER_TELEGRAM_REQUIRED_COOLDOWN_SECONDS
+                        log.warning(
+                            "NARAROUTER_TELEGRAM_ACCESS_BLOCKED provider=%s cooldown=%.0fs settings_url=%s",
+                            name,NARAROUTER_TELEGRAM_REQUIRED_COOLDOWN_SECONDS,NARAROUTER_SETTINGS_URL
+                        )
+                    else:
                         discovered=await _discover_nararouter_models(base,key)
                         if discovered:
                             log.warning(
@@ -638,7 +656,17 @@ async def review_result_with_fallback(rec:dict[str,Any])->dict[str,Any]:
                 detail=e.response.text[:160].replace("\n"," ")
                 log.warning("AI_POST_RESULT_REVIEW_FAILED provider=%s status=%s detail=%s",
                             name,status,detail)
-                if status==429:
+                if (
+                    name=="NARAROUTER"
+                    and status==403
+                    and "telegram_required" in detail.lower()
+                ):
+                    REVIEW_PROVIDER_COOLDOWN[name]=time.time()+NARAROUTER_TELEGRAM_REQUIRED_COOLDOWN_SECONDS
+                    log.warning(
+                        "NARAROUTER_POST_RESULT_TELEGRAM_BIND_REQUIRED cooldown=%.0fs settings_url=%s action=link_telegram_then_auto_retry",
+                        NARAROUTER_TELEGRAM_REQUIRED_COOLDOWN_SECONDS,NARAROUTER_SETTINGS_URL
+                    )
+                elif status==429:
                     # Respect provider-side backoff; the durable queue owns retries.
                     retry_after=0.0
                     try:
@@ -646,6 +674,8 @@ async def review_result_with_fallback(rec:dict[str,Any])->dict[str,Any]:
                     except (TypeError,ValueError):
                         retry_after=0.0
                     REVIEW_PROVIDER_COOLDOWN[name]=time.time()+max(REVIEW_429_COOLDOWN_SECONDS,retry_after)
+                elif status in (401,403):
+                    REVIEW_PROVIDER_COOLDOWN[name]=time.time()+ACCESS_DENIED_COOLDOWN_SECONDS
                 elif status in (408,425,500,502,503,504,413):
                     REVIEW_PROVIDER_COOLDOWN[name]=time.time()+REVIEW_TRANSIENT_COOLDOWN_SECONDS
             except (httpx.TimeoutException,httpx.NetworkError) as e:
