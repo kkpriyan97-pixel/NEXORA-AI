@@ -154,6 +154,46 @@ def _content_json(content:Any)->dict[str,Any]:
             return json.loads(s[start:end+1])
         raise
 
+async def _discover_nararouter_models(base,key,timeout=1.5):
+    """Discover model aliases actually entitled to the current NaraRouter key."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout,connect=min(0.8,timeout))
+        ) as h:
+            r=await h.get(
+                base.rstrip("/")+"/models",
+                headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+            )
+            if r.status_code>=400:
+                log.info(
+                    "NARAROUTER_MODEL_DISCOVERY_FAILED status=%s detail=%s",
+                    r.status_code,r.text[:160].replace("\n"," ")
+                )
+                return []
+            data=r.json()
+        rows=data.get("data") if isinstance(data,dict) else None
+        if not isinstance(rows,list):
+            return []
+        ids=[]
+        for row in rows:
+            if isinstance(row,dict) and row.get("id"):
+                ids.append(str(row["id"]).strip())
+        preferred=("agnes","laguna","ling","nemotron","stepfun","glm","qwen","deepseek","mistral")
+        ordered=sorted(
+            dict.fromkeys(ids),
+            key=lambda model: (
+                next((preferred.index(p) for p in preferred if p in model.lower()),99),
+                model.lower()
+            )
+        )
+        return ordered[:8]
+    except Exception as e:
+        log.info(
+            "NARAROUTER_MODEL_DISCOVERY_FAILED type=%s message=%s",
+            type(e).__name__,str(e)[:140]
+        )
+        return []
+
 async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
     global GLOBAL_CHAIN_COOLDOWN_UNTIL
     # External LLM verification runs here when enabled, but is never authoritative.
@@ -255,6 +295,65 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                     status=e.response.status_code
                     detail=e.response.text[:320].replace("\n"," ")
                     log.warning("AI_PROVIDER_FAILED provider=%s status=%s detail=%s",name,status,detail)
+
+                    # NaraRouter may reject the generic auto/bynara alias when the
+                    # account requires Telegram binding. Use the authenticated
+                    # /v1/models catalog to discover aliases actually entitled to
+                    # this key, then retry once with an accessible model. This is
+                    # provider-supported failover, not a quota/rate-limit bypass.
+                    if (
+                        name=="NARAROUTER"
+                        and status==403
+                        and (
+                            "telegram_required" in detail.lower()
+                            or "telegram" in detail.lower()
+                        )
+                    ):
+                        discovered=await _discover_nararouter_models(base,key)
+                        if discovered:
+                            log.warning(
+                                "NARAROUTER_AUTO_MODEL_REJECTED fallback_models=%s",
+                                discovered
+                            )
+                        for alternate_model in discovered[:4]:
+                            try:
+                                retry_payload=dict(payload)
+                                retry_payload["model"]=alternate_model
+                                async with httpx.AsyncClient(
+                                    timeout=httpx.Timeout(http_timeout,connect=connect_timeout)
+                                ) as h:
+                                    rr=await h.post(
+                                        base+"/chat/completions",
+                                        headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+                                        json=retry_payload
+                                    )
+                                    rr.raise_for_status()
+                                    body=rr.json()
+                                    content=body["choices"][0]["message"]["content"]
+                                    data=_content_json(content)
+                                    d=parse_ai_decision(data,snapshot)
+                                    if d:
+                                        log.info(
+                                            "NARAROUTER_MODEL_FAILOVER_OK model=%s",
+                                            alternate_model
+                                        )
+                                        return {
+                                            "decision":"SIGNAL",
+                                            "direction":d.direction,
+                                            "confidence":d.confidence,
+                                            "reason":d.reason,
+                                            "display_name":d.display_name,
+                                            "pair":d.pair,
+                                            "provider":name,
+                                            "model":alternate_model,
+                                        }
+                            except Exception as retry_error:
+                                log.info(
+                                    "NARAROUTER_MODEL_FAILOVER_FAILED model=%s type=%s message=%s",
+                                    alternate_model,type(retry_error).__name__,
+                                    str(retry_error)[:120]
+                                )
+
                     if status==429:
                         # A quota/billing exhaustion 429 is not a short rate-limit event.
                         # Park that provider for several hours so the live chain immediately
