@@ -3841,17 +3841,19 @@ async def result_watch(key):
             datetime.fromtimestamp(s.entry_ts,tz=timezone.utc).strftime("%H:%M:%S")
         )
     # First preference: exact-boundary broker-timestamped tick already captured
-    # by the authenticated Event-1 stream.
-    boundary=boundary_entry_tick(s.pair,s.entry_ts,window_seconds=3.0)
-    if boundary is not None:
-        entry_price,boundary_ts,_,entry_boundary_delta=boundary
-        entry_source=f"tick-boundary:{entry_boundary_delta:.3f}s"
-        log.info(
-            "ACTUAL_ENTRY_BOUNDARY_TICK pair=%s entry=%.12g broker_ts=%s delta=%.3fs",
-            s.pair,entry_price,
-            datetime.fromtimestamp(boundary_ts,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
-            entry_boundary_delta
-        )
+    # by the authenticated Event-1 stream. Only use it when no actual entry was
+    # previously persisted.
+    if entry_price is None:
+        boundary=boundary_entry_tick(s.pair,s.entry_ts,window_seconds=3.0)
+        if boundary is not None:
+            entry_price,boundary_ts,_,entry_boundary_delta=boundary
+            entry_source=f"tick-boundary:{entry_boundary_delta:.3f}s"
+            log.info(
+                "ACTUAL_ENTRY_BOUNDARY_TICK pair=%s entry=%.12g broker_ts=%s delta=%.3fs",
+                s.pair,entry_price,
+                datetime.fromtimestamp(boundary_ts,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
+                entry_boundary_delta
+            )
     entry_deadline=time.time()+8.0
     while time.time()<entry_deadline and entry_price is None:
         # Give the boundary tick a moment to arrive if the websocket was a little
