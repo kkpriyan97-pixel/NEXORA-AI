@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import candice_brain as cb
 from candice_brain import ALLOWED_STRATEGY, OTC_STRATEGY, analyze_asset
 
 
