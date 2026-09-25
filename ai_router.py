@@ -10,9 +10,9 @@ PROVIDER_COOLDOWN_SECONDS=120.0
 TRANSIENT_COOLDOWN_SECONDS=10.0
 CREDIT_EXHAUSTION_COOLDOWN_SECONDS=21600.0
 ACCESS_DENIED_COOLDOWN_SECONDS=3600.0
-// NaraRouter FREE-model access is account-gated by Telegram linking. Keep this
-// account-side restriction on a short recovery probe so official binding can
-// recover without a Render restart. Never bypass the provider gate.
+# NaraRouter FREE-model access is account-gated by Telegram linking. Keep this
+# account-side restriction on a short recovery probe so official binding can
+# recover without a Render restart. Never bypass the provider gate.
 NARAROUTER_TELEGRAM_REQUIRED_COOLDOWN_SECONDS=60.0
 NARAROUTER_SETTINGS_URL="https://router.bynara.id/settings"
 # When every configured AI provider is already cooling down or has just failed,
