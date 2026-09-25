@@ -498,9 +498,10 @@ class BrainState:
         if n<=0: return 0.0
         return max(-3.0,min(3.0,(float(b.get("weighted",0) or 0)/n)*3.0))
 
-    def finish_signal(self,key,exit_price,result_ts=None, result_source="", broker_trade_id="", broker_status="", broker_profit=None):
+    def finish_signal(self,key,exit_price,result_ts=None, result_source="", broker_trade_id="", broker_status="", broker_profit=None, result_override=None):
         s=self.active_signals.pop(key)
-        result=self.classify_result(s.direction,s.entry_price,float(exit_price))
+        override=str(result_override or "").upper().strip()
+        result=override if override in {"WIN","LOSS","TIE"} else self.classify_result(s.direction,s.entry_price,float(exit_price))
         now=utc_now() if result_ts is None else float(result_ts)
         rec={
             "cycle_id":s.cycle_id,"account_id":s.account_id,"pair":s.pair,"display_name":s.display_name,
