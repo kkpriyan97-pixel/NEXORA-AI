@@ -3452,22 +3452,18 @@ async def cycle_loop():
             # The 1-minute continuation check is part of the exact setup. At the
             # delivery boundary, the authenticated live quote must not have fallen
             # below the closed candle that qualified the setup.
-            closed_setup_price=float(candidate.get("price") or 0.0)
-            continuation_ok=(
-                bool(ind.get("m1_continuation_ok"))
-                and closed_setup_price>0.0
-                and (
-                    (expected=="UP" and entry>=closed_setup_price)
-                    or (expected=="DOWN" and entry<=closed_setup_price)
-                )
-            )
+            # The Brain already validates M1 continuation on CLOSED candles.
+            # At the delivery boundary, AVWAP/POC alignment plus value-area
+            # acceptance are the live-state guards. Requiring the live quote to
+            # remain beyond the old confirmation-candle close is redundant and
+            # incorrectly rejects normal retest/hold behavior before a 1-minute
+            # entry. Keep the Brain's closed-candle continuation evidence.
+            continuation_ok=bool(ind.get("m1_continuation_ok"))
             if not continuation_ok:
                 log.info(
                     "FINAL_LIVE_AVWAP_VP_REJECTED cycle=%s pair=%s direction=%s "
-                    "reason=m1_continuation_failed_or_reversed entry=%s closed_setup_price=%s "
-                    "continuation=%s next_asset=TRUE",
-                    cycle_id,p,expected,entry,closed_setup_price,
-                    ind.get("m1_continuation_ok")
+                    "reason=closed_m1_continuation_invalid continuation=%s next_asset=TRUE",
+                    cycle_id,p,expected,ind.get("m1_continuation_ok")
                 )
                 return False
 
@@ -4448,7 +4444,12 @@ async def cycle_loop():
                 # This is an availability/resilience aid; the authoritative send
                 # gate below remains unchanged.
                 pass5_depth=len(prepared_keys)
-                if pass5_depth < 2 and recovery_seeds:
+                # Three final candidates can all fail the exact live-state
+                # gate in the same boundary. Keep at least the configured tick-slot
+                # count in the final candidate set by rescuing unused candidates
+                # before the boundary.
+                recovery_min_pool=max(2,int(ACCOUNT_TICK_PIN_SLOTS))
+                if pass5_depth < recovery_min_pool and recovery_seeds:
                     recovery_remaining=max(0,signal_at-time.time())
                     if recovery_remaining>=10.0:
                         recovery_timeout=min(8.0,max(1.0,recovery_remaining-8.0))
