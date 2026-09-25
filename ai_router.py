@@ -38,7 +38,7 @@ _logged_ready=set()
 
 def _providers():
     names=[]
-    primary=os.getenv("AI_PROVIDER","GROQ").strip().upper()
+    primary=os.getenv("AI_PROVIDER","NEXRA").strip().upper()
     if primary:names.append(primary)
     for n in os.getenv("AI_FALLBACK_PROVIDERS",",".join(DEFAULT_FALLBACKS)).split(","):
         n=n.strip().upper()
@@ -51,7 +51,8 @@ def _cfg(name):
     if not key and name=="OPENROUTER":key=os.getenv("OPENROUTER_API_KEY","").strip()
     if not key and name=="GEMINI":key=os.getenv("GEMINI_API_KEY","").strip()
     if not key and name=="GROQ":key=os.getenv("GROQ_API_KEY","").strip()
-    if not key and name=="NVIDIA":key=os.getenv("NVIDIA_API_KEY","").strip() or os.getenv("NVIDIA_NIM_API_KEY","").strip()\n    if not key and name=="NEXRA":key=os.getenv("NEXRA_API_KEY","").strip()
+    if not key and name=="NVIDIA":key=os.getenv("NVIDIA_API_KEY","").strip() or os.getenv("NVIDIA_NIM_API_KEY","").strip()
+    if not key and name=="NEXRA":key=os.getenv("NEXRA_API_KEY","").strip()
     base=os.getenv(f"{name}_BASE_URL","").strip().rstrip("/")
     if not base:
         base={"OPENAI":"https://api.openai.com/v1","GEMINI":"https://generativelanguage.googleapis.com/v1beta/openai","GROQ":"https://api.groq.com/openai/v1","NVIDIA":"https://integrate.api.nvidia.com/v1","OPENROUTER":"https://openrouter.ai/api/v1","MISTRAL":"https://api.mistral.ai/v1","NARAROUTER":"https://router.bynara.id/v1","NEXRA":"https://nexra-ai.co/v1"}.get(name,"")
