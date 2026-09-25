@@ -636,6 +636,7 @@ def analyze_asset(
     price=None,
     forced_strategy=None,
     learning_campaign=False,
+    require_high_volume=True,
 ):
     """Return one deterministic AVWAP + Volume Profile candidate or None."""
     forced=str(forced_strategy or "").upper().strip()
@@ -789,10 +790,13 @@ def analyze_asset(
         real_coverage>=HIGH_VOLUME_MIN_COVERAGE
         and volume_bars>=int(PROFILE_LOOKBACK*HIGH_VOLUME_MIN_COVERAGE)
     )
-    # Live signals are allowed only when broker-reported real/traded volume is
-    # sufficiently complete. Tick-volume and locally observed activity remain
-    # diagnostics/filters but cannot qualify a "HIGH VOLUME" live signal.
-    if not high_volume_confirmed:
+    # The offline/unit-test contract stays strict by default: real broker volume
+    # must satisfy the HIGH-volume definition. The live scheduler can temporarily
+    # inspect the same AVWAP+VP setup without this discovery gate so it can first
+    # pin Event-1 and prove genuinely HIGH observed tick activity. That proxy is
+    # explicitly named HIGH_TICK_ACTIVITY_PROXY downstream and never relabelled
+    # as traded volume.
+    if require_high_volume and not high_volume_confirmed:
         _diag(
             pair,"high_volume_required",
             real_volume_coverage=round(real_coverage,3),
@@ -927,6 +931,7 @@ def analyze_asset(
         "volume_coverage":coverage,
         "volume_bars":int(profile.get("volume_bars") or 0),
         "high_volume_confirmed":high_volume_confirmed,
+        "high_volume_gate_pending":bool((not high_volume_confirmed) and (not require_high_volume)),
         "high_volume_min_coverage":HIGH_VOLUME_MIN_COVERAGE,
         "high_volume_required_bars":int(PROFILE_LOOKBACK*HIGH_VOLUME_MIN_COVERAGE),
         "volume_mode":profile.get("volume_mode"),
@@ -946,6 +951,10 @@ def analyze_asset(
         "tick_activity_coverage":float(profile.get("tick_activity_coverage") or 0.0),
         "tick_activity_partial_bars":tick_activity_partial_bars,
         "volume_proxy_mode":volume_proxy_mode,
+        "volume_gate_mode":(
+            "REAL_VOLUME_REQUIRED" if require_high_volume else
+            "LIVE_DISCOVERY_PENDING_HIGH_TICK_ACTIVITY"
+        ),
         "m1_continuation_ok":m1_continuation_ok,
         "value_position":value_position,
         "value_area_acceptance":value_acceptance,
