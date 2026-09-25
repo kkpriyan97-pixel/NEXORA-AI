@@ -795,13 +795,6 @@ def analyze_otc_asset(
 
     now=time.time()
     pair=str(asset.get("pair") or "")
-    if _is_otc_asset(asset):
-        return analyze_otc_asset(
-            asset,candles,price,
-            forced_strategy=forced_strategy,
-            learning_campaign=learning_campaign,
-            require_high_volume=require_high_volume,
-        )
     cs=_closed_1m(candles,now)
     if len(cs)<MIN_CLOSED_CANDLES:
         _diag(pair,"otc_history_short",closed=len(cs),required=MIN_CLOSED_CANDLES)
@@ -973,6 +966,13 @@ def analyze_asset(
 
     now=time.time()
     pair=str(asset.get("pair") or "")
+    if _is_otc_asset(asset):
+        return analyze_otc_asset(
+            asset,candles,price,
+            forced_strategy=forced_strategy,
+            learning_campaign=learning_campaign,
+            require_high_volume=require_high_volume,
+        )
     cs=_closed_1m(candles,now)
     if len(cs)<MIN_CLOSED_CANDLES:
         _diag(pair,"history_short",closed=len(cs),required=MIN_CLOSED_CANDLES)
