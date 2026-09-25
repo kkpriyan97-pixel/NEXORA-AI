@@ -1105,9 +1105,10 @@ ACCOUNT_TICK_SUB_DELAY=0.35
 # keep multiple independent candidates live at the exact signal boundary.
 # This does not change Brain direction/quality gates; it only preserves live
 # quote coverage for fallback candidates.
-ACCOUNT_TICK_MAX_SLOTS=4
-ACCOUNT_TICK_PIN_SLOTS=4
-ACCOUNT_TICK_ROTATE_INTERVAL=15.0
+ACCOUNT_TICK_MAX_SLOTS=2
+ACCOUNT_TICK_PIN_SLOTS=2
+ACCOUNT_TICK_ROTATE_INTERVAL=10.0
+ACCOUNT_TICK_COLLECTION_PROBE_LIMIT=6
 # Temporarily back off pairs that the authenticated event-12 channel explicitly
 # rejects, instead of wasting every rotation/final-boundary slot on them.
 ACCOUNT_TICK_REJECT_COOLDOWN=600.0
@@ -1751,7 +1752,7 @@ async def pin_account_tick_pairs(pairs,ttl=12.0,require_fresh=False,fresh_wait=N
         return active_targets
 
 async def _rotate_account_tick_collection_once(fill_all=False):
-    """Maintain low-churn background Event-1 coverage outside final signal pinning."""
+    """Maintain bounded background Event-1 coverage outside final signal pinning."""
     if _tick_pinned_pairs():
         return 0
     client=CLIENT
@@ -1768,21 +1769,31 @@ async def _rotate_account_tick_collection_once(fill_all=False):
         global ACCOUNT_TICK_ROTATE_CURSOR
         now=time.time()
         accepted=0
+        probe_limit=max(1,min(
+            ACCOUNT_TICK_COLLECTION_PROBE_LIMIT,
+            len(pairs)
+        ))
 
-        target_count=ACCOUNT_TICK_MAX_SLOTS if fill_all else min(
-            ACCOUNT_TICK_MAX_SLOTS,len(ACCOUNT_TICK_SUBSCRIBED)+1
-        )
-        attempts=0
-        while len(ACCOUNT_TICK_SUBSCRIBED)<target_count and attempts<len(pairs):
-            p=pairs[ACCOUNT_TICK_ROTATE_CURSOR % len(pairs)]
-            ACCOUNT_TICK_ROTATE_CURSOR=(ACCOUNT_TICK_ROTATE_CURSOR+1)%max(1,len(pairs))
-            attempts+=1
-            if p in ACCOUNT_TICK_SUBSCRIBED:
-                continue
-            if float(ACCOUNT_TICK_REJECT_UNTIL.get(p) or 0.0)>now:
-                continue
-            if await _subscribe_account_tick(p):
-                accepted+=1
+        # Fill missing slots using only a small probe window. Rejected broker
+        # capabilities are already put on cooldown, so this cannot hammer all
+        # 100 account assets in one scheduler pass.
+        while len(ACCOUNT_TICK_SUBSCRIBED)<ACCOUNT_TICK_MAX_SLOTS:
+            attempts=0
+            progressed=False
+            while attempts<probe_limit:
+                p=pairs[ACCOUNT_TICK_ROTATE_CURSOR % len(pairs)]
+                ACCOUNT_TICK_ROTATE_CURSOR=(ACCOUNT_TICK_ROTATE_CURSOR+1)%max(1,len(pairs))
+                attempts+=1
+                if p in ACCOUNT_TICK_SUBSCRIBED:
+                    continue
+                if float(ACCOUNT_TICK_REJECT_UNTIL.get(p) or 0.0)>now:
+                    continue
+                progressed=True
+                if await _subscribe_account_tick(p):
+                    accepted+=1
+                    break
+            if len(ACCOUNT_TICK_SUBSCRIBED)>=ACCOUNT_TICK_MAX_SLOTS or not progressed:
+                break
 
         if (
             not fill_all
@@ -1794,12 +1805,15 @@ async def _rotate_account_tick_collection_once(fill_all=False):
                 key=lambda p:float(ACCOUNT_TICK_SUBSCRIBED_AT.get(p,0.0) or 0.0)
             )
             replacement=None
-            for _ in range(len(pairs)):
+            for _ in range(probe_limit):
                 p=pairs[ACCOUNT_TICK_ROTATE_CURSOR % len(pairs)]
                 ACCOUNT_TICK_ROTATE_CURSOR=(ACCOUNT_TICK_ROTATE_CURSOR+1)%max(1,len(pairs))
-                if p not in ACCOUNT_TICK_SUBSCRIBED and float(ACCOUNT_TICK_REJECT_UNTIL.get(p) or 0.0)<=time.time():
-                    replacement=p
-                    break
+                if p in ACCOUNT_TICK_SUBSCRIBED:
+                    continue
+                if float(ACCOUNT_TICK_REJECT_UNTIL.get(p) or 0.0)>time.time():
+                    continue
+                replacement=p
+                break
             if active and replacement:
                 oldest=active[0]
                 await _unsubscribe_account_tick(oldest)
@@ -1811,9 +1825,9 @@ async def _rotate_account_tick_collection_once(fill_all=False):
                     )
 
         log.info(
-            "ACCOUNT_TICK_COLLECTOR_STATE active=%d max=%d accepted=%d pinned=%s cursor=%d",
+            "ACCOUNT_TICK_COLLECTOR_STATE active=%d max=%d accepted=%d pinned=%s probe_limit=%d cursor=%d",
             len(ACCOUNT_TICK_SUBSCRIBED),ACCOUNT_TICK_MAX_SLOTS,accepted,
-            bool(_tick_pinned_pairs()),ACCOUNT_TICK_ROTATE_CURSOR
+            bool(_tick_pinned_pairs()),probe_limit,ACCOUNT_TICK_ROTATE_CURSOR
         )
         return accepted
 
