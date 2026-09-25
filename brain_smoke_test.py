@@ -95,7 +95,16 @@ def main():
         {"pair":"EURUSD_OTC","display_name":"EURUSD OTC","mode":"OTC"},
         otc_structure_candles(start=otc_start),
     )
-    assert otc and otc["direction"]=="UP"
+    if not otc:
+        _closed=cb._closed_1m(otc_structure_candles(start=otc_start),time.time())
+        _blocks=cb._complete_15m_blocks(_closed,time.time())
+        _bias=cb._otc_15m_bias(_blocks)
+        _setup=cb._otc_structure_setup(_closed,"UP")
+        raise AssertionError(
+            f"OTC debug closed={len(_closed)} blocks={len(_blocks)} bias={_bias} "
+            f"setup={_setup} last={_closed[-3:] if _closed else []}"
+        )
+    assert otc["direction"]=="UP"
     assert otc["strategy"]==OTC_STRATEGY
     assert otc["expiry_minutes"]==1
     assert otc["self_strategy_version"]=="OTC_STRUCTURE_V1"
