@@ -1074,6 +1074,16 @@ MULTI_TF_5S_MIN_COMPLETE_BARS=4
 TICK_RESUB_SEM=asyncio.Semaphore(6)
 TICK_RESUB_TIMEOUT=1.0
 LIVE_TICK_MAX_AGE=5.0
+# Strict proxy for "high volume" when this broker exposes no real traded volume.
+# It is based only on actually received Event-1 ticks and is never labelled as
+# real/traded volume. Final live delivery requires both recent activity and a
+# burst above the same asset's short baseline.
+HIGH_TICK_ACTIVITY_WINDOW=15.0
+HIGH_TICK_ACTIVITY_LOOKBACK=60.0
+HIGH_TICK_ACTIVITY_MIN_RECENT=3
+HIGH_TICK_ACTIVITY_MIN_TOTAL=8
+HIGH_TICK_ACTIVITY_BURST_RATIO=1.10
+HIGH_TICK_ACTIVITY_PIN_TTL=32.0
 # Rolling coverage window for the account-wide rotating live feed. The broker
 # only exposes a small number of simultaneous tick subscriptions, so an asset
 # can be live-covered without having a fresh tick at every one-second audit.
@@ -2724,7 +2734,7 @@ async def refresh_candles(force=False):
         # represented separately by STATE["analyses"] for candidate ranking.
         analyzed_count+=1
         analysis_candles=_prepare_volume_candles(p,closed)
-        an=analyze_asset(a,analysis_candles,price)
+        an=analyze_asset(a,analysis_candles,price,require_high_volume=False)
         if an:
             an["live_price_source"]=STATE["price_source"].get(p,"none")
             an["account_feed_source"]="authenticated_account:event_182+broker_current_candle"
@@ -3166,6 +3176,46 @@ def live_price_age(pair,reference_ts=None):
     ref=time.time() if reference_ts is None else float(reference_ts)
     try:return max(0.0,ref-received)
     except Exception:return None
+
+def _high_tick_activity_status(pair,reference_ts=None):
+    """Measure strict observed Event-1 activity without calling it traded volume."""
+    ref=time.time() if reference_ts is None else float(reference_ts)
+    p=str(pair or "")
+    history=[]
+    for item in list(TICK_HISTORY.get(p,())):
+        try:
+            received=float(item[0]); price=float(item[1])
+        except (TypeError,ValueError):
+            continue
+        if price<=0.0 or received>ref:
+            continue
+        history.append((received,price))
+    recent_cut=ref-HIGH_TICK_ACTIVITY_WINDOW
+    lookback_cut=ref-HIGH_TICK_ACTIVITY_LOOKBACK
+    recent=sum(1 for received,_ in history if recent_cut<=received<=ref)
+    total=sum(1 for received,_ in history if lookback_cut<=received<=ref)
+    baseline_total=max(0,total-recent)
+    baseline_window=max(1.0,HIGH_TICK_ACTIVITY_LOOKBACK-HIGH_TICK_ACTIVITY_WINDOW)
+    baseline_recent_equiv=baseline_total*(HIGH_TICK_ACTIVITY_WINDOW/baseline_window)
+    burst_ratio=(recent/max(1.0,baseline_recent_equiv)) if baseline_recent_equiv>0 else (2.0 if recent>0 else 0.0)
+    strong_recent=recent>=HIGH_TICK_ACTIVITY_MIN_RECENT
+    strong_total=total>=HIGH_TICK_ACTIVITY_MIN_TOTAL
+    burst_ok=(baseline_total==0 and recent>0) or burst_ratio>=HIGH_TICK_ACTIVITY_BURST_RATIO
+    confirmed=bool(strong_recent and strong_total and burst_ok)
+    return {
+        "confirmed":confirmed,
+        "recent_ticks":recent,
+        "total_ticks":total,
+        "baseline_ticks":baseline_total,
+        "burst_ratio":round(burst_ratio,3),
+        "window_seconds":HIGH_TICK_ACTIVITY_WINDOW,
+        "lookback_seconds":HIGH_TICK_ACTIVITY_LOOKBACK,
+        "min_recent_ticks":HIGH_TICK_ACTIVITY_MIN_RECENT,
+        "min_total_ticks":HIGH_TICK_ACTIVITY_MIN_TOTAL,
+        "burst_ratio_required":HIGH_TICK_ACTIVITY_BURST_RATIO,
+        "basis":"authenticated_event1_observed_ticks",
+        "label":"HIGH_TICK_ACTIVITY_PROXY" if confirmed else "INSUFFICIENT",
+    }
 
 def _prune_runtime_caches(now=None):
     global CACHE_PRUNE_LAST_AT
@@ -4290,13 +4340,22 @@ async def cycle_loop():
                 and ((fallback_direction=="UP" and fallback_value_position=="ABOVE_VALUE")
                      or (fallback_direction=="DOWN" and fallback_value_position=="BELOW_VALUE"))
             )
+            # Real traded volume remains the strongest/only true volume source.
+            # When the broker exposes no real volume, allow a separate HIGH_TICK_
+            # ACTIVITY_PROXY only after the authenticated Event-1 stream proves
+            # unusually strong observed activity for this exact candidate.
+            high_tick_activity=_high_tick_activity_status(p,time.time())
+            candidate["high_tick_activity"]=high_tick_activity
+            candidate["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
             proxy_volume_mode=str(ind.get("volume_mode") or "").upper()
             proxy_volume_ok=(
                 ALLOW_PROXY_LIVE_FALLBACK
+                and bool(high_tick_activity.get("confirmed"))
                 and proxy_volume_mode in {
                     "M1_EQUAL_ACTIVITY_PROXY",
                     "M1_TICK_ACTIVITY_PROXY",
                     "TICK_VOLUME",
+                    "",
                 }
                 and (
                     (
@@ -4313,12 +4372,22 @@ async def cycle_loop():
             if not real_volume_ok and not proxy_volume_ok:
                 log.info(
                     "FINAL_LIVE_AVWAP_VP_REJECTED cycle=%s pair=%s direction=%s "
-                    "reason=volume_verification_failed volume_quality=%s coverage=%s proxy_ai_verified=%s next_asset=TRUE",
-                    cycle_id,p,expected,ind.get("volume_quality"),
-                    ind.get("volume_coverage"),
-                    candidate.get("volume_proxy_ai_verified",False)
+                    "reason=volume_verification_failed real_volume=%s volume_quality=%s "
+                    "mode=%s high_tick_activity=%s next_asset=TRUE",
+                    cycle_id,p,expected,real_volume_ok,ind.get("volume_quality"),
+                    proxy_volume_mode,high_tick_activity
                 )
                 return False
+            if not real_volume_ok:
+                ind["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
+                ind["high_tick_activity_recent_ticks"]=int(high_tick_activity.get("recent_ticks") or 0)
+                ind["high_tick_activity_total_ticks"]=int(high_tick_activity.get("total_ticks") or 0)
+                ind["high_tick_activity_burst_ratio"]=float(high_tick_activity.get("burst_ratio") or 0.0)
+                candidate["indicators"]=ind
+                log.info(
+                    "HIGH_TICK_ACTIVITY_VOLUME_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
+                    cycle_id,p,expected,high_tick_activity
+                )
 
         log.info(
             "FINAL_AVWAP_VOLUME_PROFILE_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
@@ -4993,7 +5062,8 @@ async def cycle_loop():
                                     refreshed=analyze_asset(
                                         asset or {"pair":p,"display_name":p},
                                         analysis_closed_1m,
-                                        STATE["prices"].get(p,(None,None))[0]
+                                        STATE["prices"].get(p,(None,None))[0],
+                                        require_high_volume=False,
                                     )
                                     if not refreshed:
                                         reason="avwap_volume_profile_recheck_failed"
@@ -5064,7 +5134,7 @@ async def cycle_loop():
                                     # subscriptions, and requires a real fresh event-1 tick.
                                     # Keep pass-5 tick ownership short; send_cycle_signal()
                                     # refreshes the authenticated broker quote when stale.
-                                    pin_ttl=max(8.0,min(12.0,target-time.time()-45.0))
+                                    pin_ttl=max(12.0,min(HIGH_TICK_ACTIVITY_PIN_TTL,target-time.time()-25.0))
                                     # Broker Event-12 capability/freshness probing is bounded here.
                                     # A stalled subscription must never hold cycle_loop past the
                                     # exact signal boundary. Delivery still performs its authoritative
