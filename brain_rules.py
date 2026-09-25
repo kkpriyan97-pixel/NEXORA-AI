@@ -3,10 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from collections import defaultdict
+import os
 from typing import Any
 from research_brain import research_status, TARGET_DAYS as RESEARCH_TARGET_DAYS
 
 COOLDOWN_SECONDS = 600
+GLOBAL_LOSS_STREAK_LIMIT = max(1, int(os.getenv("GLOBAL_LOSS_STREAK_LIMIT", "3") or 3))
+GLOBAL_LOSS_STREAK_COOLDOWN_SECONDS = max(60, int(os.getenv("GLOBAL_LOSS_STREAK_COOLDOWN_SECONDS", "600") or 600))
 MIN_CONFIDENCE = 90
 CYCLE_SECONDS = 180
 EXPIRIES = (1,)
@@ -69,6 +72,11 @@ class BrainState:
     batch_results:list[dict[str,Any]]=field(default_factory=list)
     learning_batch_no:int=0
     account_cooldown_until:float=0.0
+    # Global risk guard: after a consecutive LOSS streak, pause all new live
+    # signal delivery for a bounded recovery window. This is separate from
+    # the pair-local 10-minute cooldown and survives persistence/restarts.
+    loss_streak:int=0
+    loss_streak_until:float=0.0
     last_batch_summary:dict[str,Any]|None=None
     # Post-result AI lessons are stored separately from raw outcome statistics.
     post_result_lessons:dict[str,dict[str,Any]]=field(default_factory=dict)
@@ -98,6 +106,7 @@ class BrainState:
             self.learning_account_id=account_id
             self.batch_results.clear(); self.last_batch_summary=None
             self.account_cooldown_until=0.0; self.learning_batch_no=0
+            self.loss_streak=0; self.loss_streak_until=0.0
             self.research_start_ts=utc_now(); self.research_day=1; self.research_observations=0
 
     def research_progress(self, now=None):
@@ -109,6 +118,17 @@ class BrainState:
     def is_account_cooldown(self,now=None):
         now=utc_now() if now is None else float(now)
         return self.account_cooldown_until > now
+
+    def is_global_loss_streak_blocked(self,now=None):
+        now=utc_now() if now is None else float(now)
+        if self.loss_streak_until > now:
+            return True
+        # Once the bounded recovery pause expires, start a fresh streak rather
+        # than carrying the old three-loss sequence into a new trading window.
+        if self.loss_streak_until and self.loss_streak_until <= now and self.loss_streak >= GLOBAL_LOSS_STREAK_LIMIT:
+            self.loss_streak=0
+            self.loss_streak_until=0.0
+        return False
 
     def start_telegram_evaluation(self,start_ts=None):
         self.telegram_eval_active=True
@@ -186,6 +206,8 @@ class BrainState:
     def is_signal_blocked(self,pair=None,account_id=None,now=None):
         """Apply only pair cooldown at signal delivery; learning batches never pause the account."""
         now=utc_now() if now is None else float(now)
+        if self.is_global_loss_streak_blocked(now):
+            return True
         # The 10-result learning batch is an analytics/reporting boundary only.
         # It must never suppress all account signals. LOSS cooldown remains pair-local.
         if pair and self.is_in_cooldown(str(pair),now):
@@ -474,6 +496,16 @@ class BrainState:
             "confidence":s.confidence,"result":result,
             "indicator_context":s.indicator_context
         }
+        # Update the global consecutive-loss circuit breaker from completed,
+        # candle-closed results only. A TIE leaves the streak unchanged.
+        if result=="LOSS":
+            self.loss_streak += 1
+            if self.loss_streak >= GLOBAL_LOSS_STREAK_LIMIT:
+                self.loss_streak_until=now+GLOBAL_LOSS_STREAK_COOLDOWN_SECONDS
+        elif result=="WIN":
+            self.loss_streak=0
+            self.loss_streak_until=0.0
+
         self.learn(rec)
         if s.telegram_eval_counted:
             rec["telegram_eval_counted"]=True
@@ -813,6 +845,8 @@ class BrainState:
             "batch_results": self.batch_results[-10:],
             "learning_batch_no": self.learning_batch_no,
             "account_cooldown_until": self.account_cooldown_until,
+            "loss_streak": self.loss_streak,
+            "loss_streak_until": self.loss_streak_until,
             "asset_stats": self.asset_stats,
             "strategy_stats": self.strategy_stats,
             "self_strategy_stats": self.self_strategy_stats,
@@ -852,6 +886,8 @@ class BrainState:
         self.batch_results=list(data.get("batch_results") or [])[-10:]
         self.learning_batch_no=int(data.get("learning_batch_no",0) or 0)
         self.account_cooldown_until=float(data.get("account_cooldown_until",0) or 0)
+        self.loss_streak=max(0,int(data.get("loss_streak",0) or 0))
+        self.loss_streak_until=float(data.get("loss_streak_until",0) or 0)
         self.asset_stats=dict(data.get("asset_stats") or {})
         self.strategy_stats=dict(data.get("strategy_stats") or {})
         self.self_strategy_stats=dict(data.get("self_strategy_stats") or {})

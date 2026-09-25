@@ -1056,6 +1056,11 @@ QUOTE_SNAPSHOT_LAST={}
 AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=90.0
 AI_REVIEW_FAIL_TTL=90.0
+# A zero-volume Volume Profile is an equal-activity price-distribution proxy,
+# not verified real volume. It is opt-in only; production defaults to rejecting
+# proxy live signals rather than converting missing volume into a trade edge.
+ALLOW_PROXY_LIVE_FALLBACK=os.getenv("ALLOW_PROXY_LIVE_FALLBACK","0").strip().lower() in {"1","true","yes","on"}
+AI_DEEP_REVIEW_TOP_N=max(1,min(5,int(os.getenv("AI_DEEP_REVIEW_TOP_N","3") or 3)))
 # Preserve a fully reviewed candidate for the short exact-boundary window.
 # This prevents a transient provider/cache refresh from erasing a valid setup
 # after it has already passed the Brain + live-price gates.
@@ -2716,7 +2721,9 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     # When deep_analysis is enabled, review every currently Brain-qualified setup
     # so one failed candidate can fall through to the next valid asset.
     # Preliminary passes remain intentionally narrow to protect the 3-minute timing window.
-    top=raw if deep_analysis else raw[:5]
+    top=raw if not deep_analysis else raw[:AI_DEEP_REVIEW_TOP_N]
+    if deep_analysis:
+        log.info("AI_DEEP_REVIEW_SCOPE candidates=%d configured_top_n=%d",len(raw),AI_DEEP_REVIEW_TOP_N)
     if require_live_price:
         log.info(            "LIVE_PRICE_SELECTION_MODE source=authenticated_event1 candidates=%d deep=%s",
             len(top),deep_analysis)
@@ -2859,7 +2866,8 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                     # may use this fallback; an actual contradictory AI response above
                     # remains a hard veto. This keeps the local Brain authoritative.
                     strict_local_fallback=(
-                        int(local_confidence)>=90
+                        ALLOW_PROXY_LIVE_FALLBACK
+                        and int(local_confidence)>=90
                         and ind_ctx.get("value_area_acceptance") is True
                         and ind_ctx.get("m1_continuation_ok") is True
                         and ind_ctx.get("slope_persistent") is True
@@ -3459,7 +3467,8 @@ async def cycle_loop():
 
             real_volume_ok=(ind.get("real_volume_verified") is True)
             proxy_volume_ok=(
-                str(ind.get("volume_mode") or "").upper()=="M1_EQUAL_ACTIVITY_PROXY"
+                ALLOW_PROXY_LIVE_FALLBACK
+                and str(ind.get("volume_mode") or "").upper()=="M1_EQUAL_ACTIVITY_PROXY"
                 and (
                     (
                         candidate.get("volume_proxy_ai_verified") is True
