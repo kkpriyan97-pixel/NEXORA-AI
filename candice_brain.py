@@ -277,6 +277,12 @@ def _volume_profile(cs,bins=PROFILE_BINS):
         "volume_coverage":volume_coverage,
         "volume_mode":volume_mode,
         "volume_bars":volume_bars,
+        "real_volume_bars":real_volume_bars,
+        "real_volume_coverage":real_volume_coverage,
+        "tick_volume_bars":tick_volume_bars,
+        "tick_volume_coverage":tick_volume_coverage,
+        "tick_activity_bars":tick_activity_bars,
+        "tick_activity_coverage":tick_activity_coverage,
     }
 
 
