@@ -783,6 +783,7 @@ def analyze_asset(
         volume_quality="TICK_ACTIVITY"
     else:
         volume_quality="LOW"
+    volume_bars=int(profile.get("volume_bars") or 0)
     high_volume_confirmed=bool(
         real_coverage>=HIGH_VOLUME_MIN_COVERAGE
         and volume_bars>=int(PROFILE_LOOKBACK*HIGH_VOLUME_MIN_COVERAGE)
