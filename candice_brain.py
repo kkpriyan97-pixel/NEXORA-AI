@@ -693,93 +693,150 @@ def _otc_15m_bias(blocks):
 
 def _otc_structure_setup(cs,direction):
     """
-    Find a completed M1 BOS -> displacement -> retest -> hold -> confirmation
-    sequence ending at the latest closed candle.
+    Detect a recent, fully closed PRO Structure Continuation sequence.
+
+    The strategy itself is unchanged:
+      15M bias -> 1M BOS -> displacement -> retest -> hold -> confirmation -> entry.
+
+    The old detector required the confirmation candle to be the immediately latest
+    closed candle and allowed only a two-candle BOS/retest spacing. That made valid
+    recent structures disappear between the 3-minute scan boundaries. This version
+    searches a bounded recent window while keeping every structural condition strict.
     """
     if len(cs)<10:
         return None
 
-    d=str(direction).upper()
-    last_idx=len(cs)-1
-    confirmation=cs[last_idx]
+    d=str(direction or "").upper()
+    if d not in {"UP","DOWN"}:
+        return None
 
-    for retest_idx in (last_idx-1,last_idx-2):
-        if retest_idx<2:
-            continue
-        for bos_idx in (retest_idx-1,retest_idx-2):
-            if bos_idx<5:
-                continue
+    latest_idx=len(cs)-1
+    # Confirmation may be one of the most recent 1-minute closed candles. It cannot
+    # be older than four bars, so the setup never becomes a stale historical signal.
+    min_confirmation_idx=max(5,latest_idx-4)
 
-            prior=cs[max(0,bos_idx-5):bos_idx]
-            if len(prior)<3:
-                continue
+    for confirmation_idx in range(latest_idx,min_confirmation_idx-1,-1):
+        confirmation=cs[confirmation_idx]
 
-            bos=cs[bos_idx]
+        # Retest must occur shortly before confirmation.
+        for retest_idx in range(max(5,confirmation_idx-3),confirmation_idx):
             retest=cs[retest_idx]
-            prior_range=[_otc_range(x) for x in prior]
-            baseline=max(_otc_median(prior_range),1e-12)
-            bos_range=_otc_range(bos)
-            bos_body=_otc_body_ratio(bos)
-            displacement=(
-                bos_body>=0.55
-                and bos_range>=baseline*1.15
-            )
 
-            if d=="UP":
-                swing=max(float(x["high"]) for x in prior)
-                bos_ok=(
-                    float(bos["close"])>swing
-                    and float(bos["close"])>float(bos["open"])
-                )
-                touched=(float(retest["low"])<=swing<=float(retest["high"]))
-                hold=(
-                    touched
-                    and float(retest["close"])>=swing
-                    and float(retest["close"])>float(retest["open"])
-                )
-                confirmation_ok=(
-                    float(confirmation["close"])>float(confirmation["open"])
-                    and float(confirmation["close"])>float(retest["close"])
-                    and _otc_body_ratio(confirmation)>=0.40
-                )
-            else:
-                swing=min(float(x["low"]) for x in prior)
-                bos_ok=(
-                    float(bos["close"])<swing
-                    and float(bos["close"])<float(bos["open"])
-                )
-                touched=(float(retest["low"])<=swing<=float(retest["high"]))
-                hold=(
-                    touched
-                    and float(retest["close"])<=swing
-                    and float(retest["close"])<float(retest["open"])
-                )
-                confirmation_ok=(
-                    float(confirmation["close"])<float(confirmation["open"])
-                    and float(confirmation["close"])<float(retest["close"])
-                    and _otc_body_ratio(confirmation)>=0.40
-                )
+            # BOS must occur shortly before retest; no large temporal gaps.
+            for bos_idx in range(max(5,retest_idx-3),retest_idx):
+                if confirmation_idx-bos_idx>7:
+                    continue
 
-            if not (bos_ok and displacement and hold and confirmation_ok):
-                continue
+                prior=cs[bos_idx-5:bos_idx]
+                if len(prior)<5:
+                    continue
 
-            return {
-                "bos_level":float(swing),
-                "bos_candle_ts":int(bos["time"]),
-                "retest_candle_ts":int(retest["time"]),
-                "confirmation_candle_ts":int(confirmation["time"]),
-                "bos_range":float(bos_range),
-                "baseline_range":float(baseline),
-                "bos_body_ratio":float(bos_body),
-                "displacement_confirmed":True,
-                "retest_confirmed":True,
-                "hold_confirmed":True,
-                "confirmation_candle_confirmed":True,
-                "sequence":f"BOS_{d}_DISPLACEMENT_RETEST_HOLD_CONFIRM",
-            }
+                prior_range=[_otc_range(x) for x in prior]
+                baseline=max(_otc_median(prior_range),1e-12)
+                bos=cs[bos_idx]
+                bos_range=_otc_range(bos)
+                bos_body=_otc_body_ratio(bos)
+
+                displacement=(
+                    bos_body>=0.55
+                    and bos_range>=baseline*1.15
+                )
+                if not displacement:
+                    continue
+
+                if d=="UP":
+                    swing=max(float(x["high"]) for x in prior)
+                    bos_ok=(
+                        float(bos["close"])>swing
+                        and float(bos["close"])>float(bos["open"])
+                    )
+                    touched=(
+                        float(retest["low"])<=swing<=float(retest["high"])
+                    )
+                    hold=(
+                        touched
+                        and float(retest["close"])>=swing
+                        and float(retest["close"])>float(retest["open"])
+                    )
+                    confirmation_ok=(
+                        float(confirmation["close"])>float(confirmation["open"])
+                        and float(confirmation["close"])>float(retest["close"])
+                        and _otc_body_ratio(confirmation)>=0.40
+                    )
+                else:
+                    swing=min(float(x["low"]) for x in prior)
+                    bos_ok=(
+                        float(bos["close"])<swing
+                        and float(bos["close"])<float(bos["open"])
+                    )
+                    touched=(
+                        float(retest["low"])<=swing<=float(retest["high"])
+                    )
+                    hold=(
+                        touched
+                        and float(retest["close"])<=swing
+                        and float(retest["close"])<float(retest["open"])
+                    )
+                    confirmation_ok=(
+                        float(confirmation["close"])<float(confirmation["open"])
+                        and float(confirmation["close"])<float(retest["close"])
+                        and _otc_body_ratio(confirmation)>=0.40
+                    )
+
+                if not (bos_ok and confirmation_ok and hold):
+                    continue
+
+                # At the signal decision, the latest closed candle must still be
+                # directionally consistent with the confirmed structure. When the
+                # confirmation itself is latest, this is checked against the
+                # previous closed candle; otherwise the latest candle must continue
+                # beyond the confirmation close without needing a new indicator.
+                latest=cs[latest_idx]
+                if d=="UP":
+                    if confirmation_idx==latest_idx:
+                        entry_continuation=(
+                            float(latest["close"])>=float(latest["open"])
+                            and float(latest["close"])>float(cs[latest_idx-1]["close"])
+                        )
+                    else:
+                        entry_continuation=(
+                            float(latest["close"])>=float(latest["open"])
+                            and float(latest["close"])>=float(confirmation["close"])
+                            and _otc_body_ratio(latest)>=0.20
+                        )
+                else:
+                    if confirmation_idx==latest_idx:
+                        entry_continuation=(
+                            float(latest["close"])<=float(latest["open"])
+                            and float(latest["close"])<float(cs[latest_idx-1]["close"])
+                        )
+                    else:
+                        entry_continuation=(
+                            float(latest["close"])<=float(latest["open"])
+                            and float(latest["close"])<=float(confirmation["close"])
+                            and _otc_body_ratio(latest)>=0.20
+                        )
+
+                if not entry_continuation:
+                    continue
+
+                return {
+                    "bos_level":float(swing),
+                    "bos_candle_ts":int(bos["time"]),
+                    "retest_candle_ts":int(retest["time"]),
+                    "confirmation_candle_ts":int(confirmation["time"]),
+                    "entry_candle_ts":int(latest["time"]),
+                    "bos_range":float(bos_range),
+                    "baseline_range":float(baseline),
+                    "bos_body_ratio":float(bos_body),
+                    "displacement_confirmed":True,
+                    "retest_confirmed":True,
+                    "hold_confirmed":True,
+                    "confirmation_candle_confirmed":True,
+                    "entry_continuation_confirmed":True,
+                    "sequence":f"BOS_{d}_DISPLACEMENT_RETEST_HOLD_CONFIRM",
+                }
     return None
-
-
 def analyze_otc_asset(
     asset,
     candles,
@@ -833,11 +890,9 @@ def analyze_otc_asset(
 
     last=cs[-1]
     previous=cs[-2]
-    m1_continuation_ok=(
-        (direction=="UP" and float(last["close"])>=float(last["open"]) and float(last["close"])>float(previous["close"]))
-        or
-        (direction=="DOWN" and float(last["close"])<=float(last["open"]) and float(last["close"])<float(previous["close"]))
-    )
+    # The structure detector already checked the exact closed-candle continuation
+    # in the same bounded recent window. Keep the flag explicit for final gating.
+    m1_continuation_ok=bool(setup.get("entry_continuation_confirmed"))
 
     # The complete strategy sequence is the authoritative live gate.
     exact_live_setup=bool(
@@ -869,6 +924,8 @@ def analyze_otc_asset(
         "otc_hold_confirmed":True,
         "otc_confirmation_candle_confirmed":True,
         "otc_confirmation_candle_ts":int(setup["confirmation_candle_ts"]),
+        "otc_entry_candle_ts":int(setup.get("entry_candle_ts") or last["time"]),
+        "otc_entry_continuation_confirmed":bool(setup.get("entry_continuation_confirmed")),
         "otc_sequence":setup["sequence"],
         "m1_continuation_ok":m1_continuation_ok,
         "exact_live_setup":True,
