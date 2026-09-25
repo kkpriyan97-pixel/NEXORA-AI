@@ -10,7 +10,7 @@ from olymptrade_ws import OlympTradeClient
 from olymptrade_ws.olympconfig import parameters
 from brain_rules import ActiveSignal,BrainState,rank_signal_candidates
 from candice_brain import analyze_asset
-from ai_engine import snapshot_from_asset
+from ai_engine import snapshot_from_asset,ai_environment_status
 from ai_router import analyze_with_fallback,review_result_with_fallback
 from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot_async, world_learning_loop
 from strategy_knowledge import ensure_tables as ensure_strategy_knowledge_tables, refresh as refresh_strategy_knowledge, refresh_loop as strategy_knowledge_refresh_loop
@@ -6345,6 +6345,8 @@ async def health(reader,writer):
             # keepalive only needs a liveness/read-only status signal.
             lp_status=learning_practice_status()
             m1_status=m1_learning_status()
+            ai_status=ai_environment_status()
+            live_ai_enabled=os.getenv("AI_EXTERNAL_LIVE_ENABLED","true").strip().lower()!="false"
             body_out=json.dumps({
                 "service":"CANDICE-AI","status":STATE["status"],
                 "signal_read_only":True,
@@ -6356,7 +6358,10 @@ async def health(reader,writer):
                 "demo_account":str(STATE.get("account_group") or "").lower()=="demo",
                 "authenticated_feed":str(STATE.get("feed_source") or "").startswith("authenticated_websocket:"),
                 "m1_world_learning_enabled":bool(m1_status.get("enabled")),
-                "live_external_ai":False
+                "live_external_ai":live_ai_enabled,
+                "ai_configured":bool(ai_status.get("configured")),
+                "ai_provider":ai_status.get("provider"),
+                "ai_model":ai_status.get("model"),
             }).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "+str(len(body_out)).encode()+b"\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"+body_out)
             await writer.drain()
