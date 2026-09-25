@@ -1038,6 +1038,10 @@ CANDLE_GOOD_ONCE=set()
 # Bounded local tick history powers a real 5-second micro-candle view. It never
 # fabricates missing ticks; unavailable coverage is reported explicitly.
 TICK_HISTORY=defaultdict(lambda: deque(maxlen=720))
+# Event-1 is the only live market stream available for observed tick activity.
+# This cache never invents traded volume; it only lets the brain use the number
+# of actually received broker ticks when candle volume is absent.
+TICK_ACTIVITY_AUDIT_LAST={}
 MULTI_TF_FRAMES=tuple(range(1,16))
 MULTI_TF_MIN_COMPLETE_BARS=3
 MULTI_TF_5S_SECONDS=5
@@ -1923,6 +1927,71 @@ async def on_tick(message):
             STATE["_tick_state_log_at"]=received_at
             log.info("TICK_STATE_READY updated=%d tracked=%d",updated,len(STATE["prices"]))
 
+def _apply_tick_activity_volume(pair,candles):
+    """Enrich zero-volume candles with observed broker Event-1 tick counts.
+    
+    This is explicitly tick-activity data, not traded/notional volume. It is
+    only used when the broker candle itself has no positive volume field.
+    """
+    source=list(candles or [])
+    if not source:
+        return source
+
+    history=list(TICK_HISTORY.get(str(pair),()))
+    if not history:
+        return source
+
+    minute_counts=defaultdict(int)
+    for received_at,_price in history:
+        try:
+            bucket=int(float(received_at)//60)*60
+            minute_counts[bucket]+=1
+        except (TypeError,ValueError):
+            continue
+
+    enriched=[]
+    enriched_count=0
+    for raw in source:
+        if not isinstance(raw,dict):
+            continue
+        item=dict(raw)
+        existing=0.0
+        for key in ("real_volume","realVolume","trade_volume","tradeVolume",
+                    "traded_volume","tradedVolume","base_volume","baseVolume",
+                    "quote_volume","quoteVolume","volume",
+                    "tick_volume","tickVolume","ticks","tick_count","tickCount","vol","v"):
+            try:
+                value=float(item.get(key,0) or 0)
+            except (TypeError,ValueError):
+                value=0.0
+            if value>0.0:
+                existing=value
+                break
+
+        ts=_candle_epoch(item)
+        if existing<=0.0 and ts is not None:
+            count=int(min(100000,max(0,minute_counts.get(int(ts//60)*60,0))))
+            if count>0:
+                item["tick_volume"]=count
+                item["volume_source"]="TICK_ACTIVITY"
+                enriched_count+=1
+        enriched.append(item)
+
+    now=time.time()
+    last=float(TICK_ACTIVITY_AUDIT_LAST.get(str(pair),0.0) or 0.0)
+    if now-last>=60.0:
+        TICK_ACTIVITY_AUDIT_LAST[str(pair)]=now
+        total=len(enriched)
+        log.info(
+            "TICK_ACTIVITY_VOLUME_AUDIT pair=%s candles=%d enriched=%d coverage=%.3f "
+            "tick_history=%d source=event1_received_ticks",
+            pair,total,enriched_count,
+            (enriched_count/max(1,total)),
+            len(history),
+        )
+    return enriched
+
+
 def tick_received_at(pair):
     rec=STATE["prices"].get(pair)
     if not rec or len(rec)<1:return None
@@ -2128,7 +2197,8 @@ async def refresh_candles(force=False):
             # technical setup does not qualify as a signal. The latter remains
             # represented separately by STATE["analyses"] for candidate ranking.
             analyzed_count+=1
-            an=analyze_asset(a,closed,price)
+            analysis_candles=_apply_tick_activity_volume(p,closed)
+            an=analyze_asset(a,analysis_candles,price)
             if an:
                 an["live_price_source"]=STATE["price_source"].get(p,"none")
                 an["account_feed_source"]="authenticated_account:event_182+broker_current_candle"
@@ -2615,7 +2685,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                 current_candles=_closed_candles(
                     STATE["candles"].get(pair,[]),time.time()
                 )
-                if len(current_candles)<45:
+                if len(current_candles)<60:
                     log.info(
                         "FINAL_RECOVERY_REJECTED pair=%s reason=closed_candles=%s",
                         pair,len(current_candles)
@@ -2624,7 +2694,8 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                 live_price=STATE["prices"].get(
                     pair,(None,None)
                 )[0]
-                refreshed=analyze_asset(asset,current_candles,live_price)
+                analysis_candles=_apply_tick_activity_volume(pair,current_candles)
+                refreshed=analyze_asset(asset,analysis_candles,live_price)
                 if not refreshed:
                     log.info(
                         "FINAL_RECOVERY_REJECTED pair=%s reason=brain_no_setup",
@@ -3481,9 +3552,14 @@ async def cycle_loop():
                 and ((fallback_direction=="UP" and fallback_value_position=="ABOVE_VALUE")
                      or (fallback_direction=="DOWN" and fallback_value_position=="BELOW_VALUE"))
             )
+            proxy_volume_mode=str(ind.get("volume_mode") or "").upper()
             proxy_volume_ok=(
                 ALLOW_PROXY_LIVE_FALLBACK
-                and str(ind.get("volume_mode") or "").upper()=="M1_EQUAL_ACTIVITY_PROXY"
+                and proxy_volume_mode in {
+                    "M1_EQUAL_ACTIVITY_PROXY",
+                    "M1_TICK_ACTIVITY_PROXY",
+                    "TICK_VOLUME",
+                }
                 and (
                     (
                         candidate.get("volume_proxy_ai_verified") is True
@@ -4173,9 +4249,10 @@ async def cycle_loop():
 
                                 if strategy_name=="AVWAP_VOLUME_PROFILE":
                                     asset=next((a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),None)
+                                    analysis_closed_1m=_apply_tick_activity_volume(p,closed_1m)
                                     refreshed=analyze_asset(
                                         asset or {"pair":p,"display_name":p},
-                                        closed_1m,
+                                        analysis_closed_1m,
                                         STATE["prices"].get(p,(None,None))[0]
                                     )
                                     if not refreshed:
