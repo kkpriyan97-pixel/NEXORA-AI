@@ -90,9 +90,10 @@ def main():
     flat=[{"time":start+i*60,"open":100,"high":100.01,"low":99.99,"close":100,"volume":100} for i in range(120)]
     assert analyze_asset({"pair":"TEST_FLAT","display_name":"TEST_FLAT"},flat) is None
 
+    otc_start=(int(time.time())//900)*900-8*900
     otc=analyze_asset(
         {"pair":"EURUSD_OTC","display_name":"EURUSD OTC","mode":"OTC"},
-        otc_structure_candles(start=start),
+        otc_structure_candles(start=otc_start),
     )
     assert otc and otc["direction"]=="UP"
     assert otc["strategy"]==OTC_STRATEGY
