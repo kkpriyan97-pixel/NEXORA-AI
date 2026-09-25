@@ -98,7 +98,7 @@ def build_ai_request(snapshot: MarketSnapshot) -> dict[str, Any]:
 
 def ai_environment_status() -> dict[str, Any]:
     """Report configuration presence without exposing secret values."""
-    provider = os.getenv("AI_PROVIDER", "").strip().upper()
+    provider = os.getenv("AI_PROVIDER", "NARAROUTER").strip().upper() or "NARAROUTER"
     model = os.getenv("AI_MODEL", "").strip()
     nara_key_present = any(
         os.getenv(name, "").strip()
