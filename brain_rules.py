@@ -120,13 +120,13 @@ class BrainState:
         return self.account_cooldown_until > now
 
     def is_global_loss_streak_blocked(self,now=None):
-        now=utc_now() if now is None else float(now)
-        if self.loss_streak_until > now:
-            return True
-        # Once the bounded recovery pause expires, start a fresh streak rather
-        # than carrying the old three-loss sequence into a new trading window.
-        if self.loss_streak_until and self.loss_streak_until <= now and self.loss_streak >= GLOBAL_LOSS_STREAK_LIMIT:
-            self.loss_streak=0
+        """Compatibility/diagnostic hook only; consecutive losses never stop cycles.
+        
+        LOSS streaks remain available for analytics and learning, but there is no
+        account-wide circuit breaker. The 3-minute scheduler must run 24/7.
+        """
+        # Clear legacy persisted pause state so an older deployment cannot revive it.
+        if self.loss_streak_until:
             self.loss_streak_until=0.0
         return False
 
@@ -204,12 +204,14 @@ class BrainState:
                 and not a.get("locked_trading") and not a.get("disabled")]
 
     def is_signal_blocked(self,pair=None,account_id=None,now=None):
-        """Apply only pair cooldown at signal delivery; learning batches never pause the account."""
+        """Apply only pair/account identity guards at signal delivery.
+        
+        Three consecutive losses are analytics state only. They must never stop
+        the 24/7 three-minute scheduler or suppress unrelated assets.
+        """
         now=utc_now() if now is None else float(now)
-        if self.is_global_loss_streak_blocked(now):
-            return True
-        # The 10-result learning batch is an analytics/reporting boundary only.
-        # It must never suppress all account signals. LOSS cooldown remains pair-local.
+        # The 10-result learning batch and loss streak are reporting/learning state
+        # only. LOSS cooldown remains pair-local.
         if pair and self.is_in_cooldown(str(pair),now):
             return True
         if account_id is not None and self.learning_account_id is not None:
