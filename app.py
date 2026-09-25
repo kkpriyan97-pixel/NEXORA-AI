@@ -2942,7 +2942,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                     fallback_value_position=str(ind_fallback.get("value_position") or "").upper()
                     fallback_direction=str(x.get("direction") or "").upper()
                     fallback_setup_ok=(
-                        local_confidence>=95
+                        local_confidence>=90
                         and bool(ind_fallback.get("exact_live_setup"))
                         and ind_fallback.get("slope_persistent") is True
                         and ind_fallback.get("level_reclaim") is False
@@ -3545,7 +3545,7 @@ async def cycle_loop():
             # flags. Recompute the SAME strict deterministic local fallback
             # from the current Brain indicators instead of trusting metadata.
             strict_local_proxy_fallback=(
-                int(confidence or 0)>=95
+                int(confidence or 0)>=90
                 and bool(ind.get("exact_live_setup"))
                 and ind.get("slope_persistent") is True
                 and ind.get("level_reclaim") is False
