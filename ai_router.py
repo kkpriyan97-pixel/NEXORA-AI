@@ -670,6 +670,56 @@ async def review_result_with_fallback(rec:dict[str,Any])->dict[str,Any]:
                         "NARAROUTER_POST_RESULT_TELEGRAM_BIND_REQUIRED cooldown=%.0fs settings_url=%s action=link_telegram_then_auto_retry",
                         NARAROUTER_TELEGRAM_REQUIRED_COOLDOWN_SECONDS,NARAROUTER_SETTINGS_URL
                     )
+                elif (
+                    name=="NARAROUTER"
+                    and status==404
+                    and "model" in detail.lower()
+                ):
+                    discovered=await _discover_nararouter_models(base,key)
+                    log.warning(
+                        "NARAROUTER_POST_RESULT_MODEL_ALIAS_REJECTED fallback_models=%s",
+                        discovered
+                    )
+                    for alternate_model in discovered[:4]:
+                        try:
+                            rr_payload={"model":alternate_model,"temperature":0,"messages":[
+                                {"role":"system","content":"Return only JSON with lesson, reuse, evidence, confidence."},
+                                {"role":"user","content":prompt},
+                            ]}
+                            async with httpx.AsyncClient(
+                                timeout=httpx.Timeout(http_timeout,connect=connect_timeout)
+                            ) as h:
+                                rr=await h.post(
+                                    base+"/chat/completions",
+                                    headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},
+                                    json=rr_payload,
+                                )
+                                rr.raise_for_status()
+                                data=_content_json(rr.json()["choices"][0]["message"]["content"])
+                            lesson=str(data.get("lesson") or "").strip()
+                            if not lesson:
+                                continue
+                            try:
+                                confidence=max(0,min(100,int(float(data.get("confidence") or 0))))
+                            except (TypeError,ValueError):
+                                confidence=0
+                            log.info(
+                                "NARAROUTER_POST_RESULT_MODEL_FAILOVER_OK model=%s pair=%s confidence=%s",
+                                alternate_model,rec.get("pair"),confidence
+                            )
+                            return {
+                                "lesson":lesson[:320],
+                                "reuse":str(data.get("reuse") or "").strip()[:240],
+                                "evidence":str(data.get("evidence") or "").strip()[:320],
+                                "confidence":confidence,
+                                "provider":name,
+                                "model":alternate_model,
+                            }
+                        except Exception as retry_error:
+                            log.info(
+                                "NARAROUTER_POST_RESULT_MODEL_FAILOVER_FAILED model=%s type=%s message=%s",
+                                alternate_model,type(retry_error).__name__,str(retry_error)[:120]
+                            )
                 elif status==429:
                     # Respect provider-side backoff; the durable queue owns retries.
                     retry_after=0.0
