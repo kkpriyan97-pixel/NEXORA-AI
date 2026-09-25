@@ -36,11 +36,17 @@ def main():
     assert up["expiry_minutes"]==1
     assert up["decision_candle_closed"] is True
     assert set(("anchored_vwap","volume_profile_poc","volume_profile_vah","volume_profile_val")) <= set(up["indicators"])
+    assert up["indicators"]["alligator_confirmed"] is True
+    assert up["indicators"]["alligator_periods"] == "13/8,8/5,5/3"
+    assert up["indicators"]["alligator_confirmation"] == "CONFIRMED"
 
     down=analyze_asset({"pair":"TEST_DOWN","display_name":"TEST_DOWN"},down_candles(start=start))
     assert down and down["direction"]=="DOWN"
     assert down["strategy"]==ALLOWED_STRATEGY
     assert down["expiry_minutes"]==1
+    assert down["indicators"]["alligator_confirmed"] is True
+    assert down["indicators"]["alligator_periods"] == "13/8,8/5,5/3"
+    assert down["indicators"]["alligator_confirmation"] == "CONFIRMED"
 
     flat=[{"time":start+i*60,"open":100,"high":100.01,"low":99.99,"close":100,"volume":100} for i in range(120)]
     assert analyze_asset({"pair":"TEST_FLAT","display_name":"TEST_FLAT"},flat) is None
