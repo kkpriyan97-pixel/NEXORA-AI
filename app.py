@@ -1107,7 +1107,9 @@ ACCOUNT_TICK_SUB_DELAY=0.35
 # quote coverage for fallback candidates.
 ACCOUNT_TICK_MAX_SLOTS=2
 ACCOUNT_TICK_PIN_SLOTS=2
-ACCOUNT_TICK_ROTATE_INTERVAL=10.0
+# Hold collector subscriptions long enough to span a complete M1 bar.
+ACCOUNT_TICK_ROTATE_INTERVAL=65.0
+ACCOUNT_TICK_MIN_HOLD_SECONDS=55.0
 ACCOUNT_TICK_COLLECTION_PROBE_LIMIT=6
 # Temporarily back off pairs that the authenticated event-12 channel explicitly
 # rejects, instead of wasting every rotation/final-boundary slot on them.
@@ -2185,7 +2187,7 @@ async def on_tick(message):
                 # Keep only a bounded receipt-time tick history. This is local
                 # market-data history used for 5s confirmation and is read-only.
                 TICK_HISTORY[p].append((received_at,price_value))
-                _record_tick_activity(p,received_at)
+                _record_tick_activity(p,broker_ts if ts is not None else received_at)
                 updated+=1
             except Exception:
                 pass
@@ -4539,7 +4541,9 @@ async def cycle_loop():
                                 if len(prep_items)>=ACCOUNT_TICK_PIN_SLOTS:
                                     break
                             if prep_items:
-                                pin_ttl=max(45.0,target-time.time()+20.0)
+                                # Keep pass-4 tick ownership short so the background
+                                # collector can resume well before the next cycle.
+                                pin_ttl=max(8.0,min(12.0,target-time.time()-45.0))
                                 try:
                                     active_prep=await pin_account_tick_pairs(
                                         [x.get("pair") for x in prep_items],
@@ -4708,7 +4712,9 @@ async def cycle_loop():
                                     # Probe the full prepared fallback set. The tick manager
                                     # keeps only four assets active, skips unusable broker
                                     # subscriptions, and requires a real fresh event-1 tick.
-                                    pin_ttl=max(45.0,target-time.time()+20.0)
+                                    # Keep pass-5 tick ownership short; send_cycle_signal()
+                                    # refreshes the authenticated broker quote when stale.
+                                    pin_ttl=max(8.0,min(12.0,target-time.time()-45.0))
                                     # Broker Event-12 capability/freshness probing is bounded here.
                                     # A stalled subscription must never hold cycle_loop past the
                                     # exact signal boundary. Delivery still performs its authoritative
@@ -4836,11 +4842,11 @@ async def cycle_loop():
                     type(_scan_state_error).__name__,str(_scan_state_error)[:120]
                 )
 
-            # Warm candidate tick subscriptions during passes 1-3 so genuine
-            # 30s buckets can accumulate before the final 1-minute gate.
-            # This is read-only market-data preparation; Brain direction,
-            # strategy, expiry, and the Telegram send rules remain unchanged.
-            if pass_no in (1,2,3) and candidate_pool:
+            # Early candidate pinning is intentionally disabled for the locked
+            # AVWAP+Volume Profile lane. Long warm pins prevent the collector from
+            # observing a complete M1 minute. Final delivery has a direct broker
+            # quote fallback, so early tick ownership is unnecessary.
+            if False and pass_no in (1,2,3) and candidate_pool:
                 warm_pool=sorted(
                     [x for x in candidate_pool.values()
                      if isinstance(x,dict) and x.get("pair")],
