@@ -22,7 +22,7 @@ PROVIDER_LOCKS={}
 try:
     _ai_concurrency=int(os.getenv("AI_ANALYSIS_CONCURRENCY","2"))
 except (TypeError,ValueError):
-    _ai_concurrency=6
+    _ai_concurrency=2
 _ai_concurrency=max(1,min(8,_ai_concurrency))
 ANALYSIS_SEMAPHORE=asyncio.Semaphore(_ai_concurrency)
 REVIEW_SEMAPHORE=asyncio.Semaphore(1)
