@@ -135,9 +135,9 @@ def ai_environment_status() -> dict[str, Any]:
     else:
         provider_model = model
     return {
-        "configured": bool(provider and model and api_key_present),
+        "configured": bool(provider and provider_model and api_key_present),
         "provider": provider or None,
-        "model": model or None,
+        "model": provider_model or None,
         "api_key_present": api_key_present,
     }
 
