@@ -118,8 +118,12 @@ def _norm(raw):
         "volume_present":bool(volume>0.0),
         "volume_source":volume_source,
         # Explicitly distinguish locally enriched tick activity from broker
-        # reported tick volume.
+        # reported tick volume. Partial sampled minutes are never treated as
+        # complete volume observations downstream.
         "tick_activity_proxy":str(raw.get("volume_source") or "").upper()=="TICK_ACTIVITY",
+        "tick_activity_observed_seconds":_f(raw.get("tick_activity_observed_seconds"),0.0),
+        "tick_activity_complete":bool(raw.get("tick_activity_complete")),
+        "tick_activity_source":str(raw.get("tick_activity_source") or "").upper(),
     }
 
 
@@ -188,8 +192,21 @@ def _volume_profile(cs,bins=PROFILE_BINS):
         return None
     low=min(c["low"] for c in sample)
     high=max(c["high"] for c in sample)
-    raw_volumes=[max(float(c.get("volume",0.0) or 0.0),0.0) for c in sample]
-    volume_sources=[str(c.get("volume_source") or "NONE").upper() for c in sample]
+    raw_volumes=[]
+    volume_sources=[]
+    tick_activity_partial_bars=0
+    for c in sample:
+        source=str(c.get("volume_source") or "NONE").upper()
+        value=max(float(c.get("volume",0.0) or 0.0),0.0)
+        # A sampled Event-1 minute may have ticks for only part of its 60s.
+        # It is useful for diagnostics but must not enter the volume profile
+        # as though it were a complete minute of tick activity.
+        if source=="TICK_ACTIVITY" and not bool(c.get("tick_activity_complete")):
+            value=0.0
+            if float(c.get("tick_activity_observed_seconds") or 0.0)>0.0:
+                tick_activity_partial_bars+=1
+        raw_volumes.append(value)
+        volume_sources.append(source)
     volume_bars=sum(1 for v in raw_volumes if v>0.0)
     volume_coverage=volume_bars/max(1,len(sample))
     real_volume_bars=sum(
@@ -232,6 +249,7 @@ def _volume_profile(cs,bins=PROFILE_BINS):
             "tick_volume_coverage":tick_volume_coverage,
             "tick_activity_bars":tick_activity_bars,
             "tick_activity_coverage":tick_activity_coverage,
+            "tick_activity_partial_bars":tick_activity_partial_bars,
         }
 
     step=(high-low)/float(bins)
@@ -295,6 +313,7 @@ def _volume_profile(cs,bins=PROFILE_BINS):
         "tick_volume_coverage":tick_volume_coverage,
         "tick_activity_bars":tick_activity_bars,
         "tick_activity_coverage":tick_activity_coverage,
+        "tick_activity_partial_bars":tick_activity_partial_bars,
     }
 
 
@@ -612,6 +631,7 @@ def analyze_asset(
     real_coverage=float(profile.get("real_volume_coverage") or 0.0)
     tick_coverage=float(profile.get("tick_volume_coverage") or 0.0)
     tick_activity_coverage=float(profile.get("tick_activity_coverage") or 0.0)
+    tick_activity_partial_bars=int(profile.get("tick_activity_partial_bars") or 0)
     # Keep quality semantics truthful. "HIGH" is reserved for broker-reported
     # real/traded volume. Broker tick volume and locally observed tick activity
     # are useful proxies but are never labelled as real volume.
@@ -748,6 +768,7 @@ def analyze_asset(
         "tick_volume_coverage":float(profile.get("tick_volume_coverage") or 0.0),
         "tick_activity_bars":int(profile.get("tick_activity_bars") or 0),
         "tick_activity_coverage":float(profile.get("tick_activity_coverage") or 0.0),
+        "tick_activity_partial_bars":tick_activity_partial_bars,
         "volume_proxy_mode":volume_proxy_mode,
         "m1_continuation_ok":m1_continuation_ok,
         "value_position":value_position,
