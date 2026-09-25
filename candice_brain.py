@@ -56,9 +56,46 @@ def _ts(value, default=-1.0):
         return default
 
 
+def _extract_volume(raw):
+    """Extract broker-supplied real/tick volume without confusing price with volume."""
+    if not isinstance(raw,dict):
+        return 0.0,"NONE"
+
+    # Explicit real/traded-volume field names first.
+    for key in (
+        "real_volume","realVolume","trade_volume","tradeVolume",
+        "traded_volume","tradedVolume","base_volume","baseVolume",
+        "quote_volume","quoteVolume","volume"
+    ):
+        if key in raw:
+            value=_f(raw.get(key),0.0)
+            if value>0.0:
+                return value,"REAL_VOLUME"
+
+    # Common tick-volume field names. Tick volume is useful, but is not the
+    # same thing as traded/notional volume and therefore is not marked real_volume_verified.
+    for key in (
+        "tick_volume","tickVolume","ticks","tick_count","tickCount",
+        "vol","v"
+    ):
+        if key in raw:
+            value=_f(raw.get(key),0.0)
+            if value>0.0:
+                return value,"TICK_VOLUME"
+
+    # A few broker/API variants nest market statistics under a dict.
+    for parent_key in ("data","stats","metrics","meta"):
+        nested=raw.get(parent_key)
+        if isinstance(nested,dict):
+            value,source=_extract_volume(nested)
+            if value>0.0:
+                return value,source
+
+    return 0.0,"NONE"
+
+
 def _norm(raw):
-    volume_raw=raw.get("volume",raw.get("v"))
-    volume=_f(volume_raw,0.0)
+    volume,volume_source=_extract_volume(raw)
     return {
         "time":_ts(raw.get("time",raw.get("t"))),
         "open":_f(raw.get("open",raw.get("o"))),
@@ -67,6 +104,10 @@ def _norm(raw):
         "close":_f(raw.get("close",raw.get("c"))),
         "volume":max(volume,0.0),
         "volume_present":bool(volume>0.0),
+        "volume_source":volume_source,
+        # Explicitly distinguish locally enriched tick activity from broker
+        # reported tick volume.
+        "tick_activity_proxy":str(raw.get("volume_source") or "").upper()=="TICK_ACTIVITY",
     }
 
 
@@ -136,9 +177,32 @@ def _volume_profile(cs,bins=PROFILE_BINS):
     low=min(c["low"] for c in sample)
     high=max(c["high"] for c in sample)
     raw_volumes=[max(float(c.get("volume",0.0) or 0.0),0.0) for c in sample]
+    volume_sources=[str(c.get("volume_source") or "NONE").upper() for c in sample]
     volume_bars=sum(1 for v in raw_volumes if v>0.0)
     volume_coverage=volume_bars/max(1,len(sample))
-    volume_mode="REAL_VOLUME_OR_TICK_VOLUME" if volume_coverage>=0.80 else "M1_EQUAL_ACTIVITY_PROXY"
+    real_volume_bars=sum(
+        1 for v,s in zip(raw_volumes,volume_sources)
+        if v>0.0 and s=="REAL_VOLUME"
+    )
+    tick_volume_bars=sum(
+        1 for v,s in zip(raw_volumes,volume_sources)
+        if v>0.0 and s=="TICK_VOLUME"
+    )
+    tick_activity_bars=sum(
+        1 for v,s in zip(raw_volumes,volume_sources)
+        if v>0.0 and s=="TICK_ACTIVITY"
+    )
+    real_volume_coverage=real_volume_bars/max(1,len(sample))
+    tick_volume_coverage=tick_volume_bars/max(1,len(sample))
+    tick_activity_coverage=tick_activity_bars/max(1,len(sample))
+    if real_volume_coverage>=0.80:
+        volume_mode="REAL_VOLUME"
+    elif tick_volume_coverage>=0.80:
+        volume_mode="TICK_VOLUME"
+    elif tick_activity_coverage>0.0:
+        volume_mode="M1_TICK_ACTIVITY_PROXY"
+    else:
+        volume_mode="M1_EQUAL_ACTIVITY_PROXY"
 
     if high<=low:
         px=sample[-1]["close"]
@@ -150,6 +214,12 @@ def _volume_profile(cs,bins=PROFILE_BINS):
             "volume_coverage":volume_coverage,
             "volume_mode":volume_mode,
             "volume_bars":volume_bars,
+            "real_volume_bars":real_volume_bars,
+            "real_volume_coverage":real_volume_coverage,
+            "tick_volume_bars":tick_volume_bars,
+            "tick_volume_coverage":tick_volume_coverage,
+            "tick_activity_bars":tick_activity_bars,
+            "tick_activity_coverage":tick_activity_coverage,
         }
 
     step=(high-low)/float(bins)
@@ -638,7 +708,15 @@ def analyze_asset(
         "volume_bars":int(profile.get("volume_bars") or 0),
         "volume_mode":profile.get("volume_mode"),
         "volume_quality":volume_quality,
-        "real_volume_verified":not volume_proxy_mode,
+        "real_volume_verified":bool(
+            float(profile.get("real_volume_coverage") or 0.0)>=0.80
+        ),
+        "real_volume_bars":int(profile.get("real_volume_bars") or 0),
+        "real_volume_coverage":float(profile.get("real_volume_coverage") or 0.0),
+        "tick_volume_bars":int(profile.get("tick_volume_bars") or 0),
+        "tick_volume_coverage":float(profile.get("tick_volume_coverage") or 0.0),
+        "tick_activity_bars":int(profile.get("tick_activity_bars") or 0),
+        "tick_activity_coverage":float(profile.get("tick_activity_coverage") or 0.0),
         "volume_proxy_mode":volume_proxy_mode,
         "m1_continuation_ok":m1_continuation_ok,
         "value_position":value_position,
