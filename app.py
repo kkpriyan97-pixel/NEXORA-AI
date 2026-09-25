@@ -278,6 +278,7 @@ AI_REVIEW_QUEUE_POLL_SECONDS=0.5
 AI_REVIEW_QUEUE_STALE_SECONDS=600.0
 AI_REVIEW_QUEUE_RETRY_DELAYS=(5,15,30,60,120,300)
 RESULT_WATCH_QUEUE_STALE_SECONDS=600.0
+RESULT_WATCH_STALE_GRACE_SECONDS=180.0
 ACCOUNT_TICK_CONTROL_LOCK=asyncio.Lock()
 
 # Durable scheduler state. Render can replace the running instance at any time;
@@ -821,7 +822,7 @@ async def mark_result_watch_error(watch_id,error):
                 with db.cursor() as cur:
                     cur.execute("""
                         UPDATE candice_result_watch_queue
-                        SET status='PROCESSING',last_error=%s,updated_at=NOW()
+                        SET status='UNRESOLVED',last_error=%s,updated_at=NOW(),completed_at=NOW()
                         WHERE watch_id=%s
                     """,(str(error)[:500],watch_id))
                 db.commit()
@@ -831,6 +832,44 @@ async def mark_result_watch_error(watch_id,error):
         log.warning("RESULT_WATCH_QUEUE_ERROR_SAVE_FAILED watch_id=%s type=%s message=%s",
                     watch_id,type(e).__name__,str(e)[:160])
         return False
+
+async def expire_stale_result_watches():
+    """Terminally close old result watches that can no longer produce trustworthy data."""
+    if not LEARNING_DB_URL:
+        return 0
+    try:
+        import psycopg
+        grace=float(RESULT_WATCH_STALE_GRACE_SECONDS)
+        def expire():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        UPDATE candice_result_watch_queue
+                        SET status='UNRESOLVED',
+                            last_error='stale_result_watch_expired_without_authoritative_result',
+                            updated_at=NOW(),
+                            completed_at=NOW()
+                        WHERE status IN ('PENDING','PROCESSING')
+                          AND (record->>'entry_ts') ~ '^[0-9]+([.][0-9]+)?$'
+                          AND EXTRACT(EPOCH FROM NOW()) >
+                              (record->>'entry_ts')::double precision
+                              + CASE
+                                  WHEN (record->>'expiry_minutes') ~ '^[0-9]+([.][0-9]+)?$'
+                                  THEN (record->>'expiry_minutes')::double precision
+                                  ELSE 1.0
+                                END * 60.0
+                              + %s
+                    """,(grace,))
+                    count=cur.rowcount
+                db.commit()
+            return count
+        count=await asyncio.to_thread(expire)
+        log.info("RESULT_WATCH_STALE_CLEANUP expired=%d grace_seconds=%.0f",int(count or 0),grace)
+        return int(count or 0)
+    except Exception as e:
+        log.warning("RESULT_WATCH_STALE_CLEANUP_FAILED type=%s message=%s",
+                    type(e).__name__,str(e)[:160])
+        return 0
 
 async def restore_pending_result_watches():
     if not LEARNING_DB_URL or not CLIENT or not CLIENT.connection.is_connected:
@@ -3974,6 +4013,13 @@ async def result_watch(key):
         accepted_trade=_find_broker_trade_for_signal(s,22)
         if accepted_trade:
             break
+        # Some broker sessions expose the opening trade first as Event-21 interim
+        # while Event-22 can be delayed or absent from the callback stream.
+        accepted_trade=_find_broker_trade_for_signal(s,21)
+        if accepted_trade:
+            log.info("BROKER_TRADE_INTERIM_MATCHED cycle=%s pair=%s trade_id=%s",
+                     s.cycle_id,s.pair,accepted_trade.get("trade_id"))
+            break
         # A broker can deliver Event-26 before our Event-22 handler was observed.
         early_close=_find_broker_trade_for_signal(s,26)
         if early_close:
@@ -3982,6 +4028,7 @@ async def result_watch(key):
         await asyncio.sleep(0.50)
 
     if accepted_trade:
+        accepted_event=int(accepted_trade.get("event") or 0)
         trade_id=str(accepted_trade.get("trade_id") or "")
         if trade_id:
             STATE.setdefault("broker_trade_assignments",{})[trade_id]=watch_id
@@ -3994,14 +4041,14 @@ async def result_watch(key):
         s.broker_trade_open_price=accepted_trade.get("open_price")
         s.broker_trade_status=str(accepted_trade.get("status") or "")
         s.broker_trade_profit=accepted_trade.get("profit")
-        s.broker_trade_source="broker_event22" if int(accepted_trade.get("event") or 0)==22 else "broker_event26"
+        s.broker_trade_source=f"broker_event{accepted_event}"
 
         # The actual broker opening quote supersedes the signal reference for
         # the matched manual trade result.
         if accepted_trade.get("open_price") is not None:
             s.entry_price=float(accepted_trade["open_price"])
             s.actual_entry_captured=True
-            s.actual_entry_source="broker_event22"
+            s.actual_entry_source=f"broker_event{accepted_event}"
 
             # A very large quote-scale mismatch is not guessed away. Quarantine
             # the pair so future signals cannot be generated from a potentially
@@ -4070,8 +4117,10 @@ async def result_watch(key):
                 "reason=event26_not_received_bounded_wait",
                 s.cycle_id,s.pair,s.broker_trade_id
             )
-            await mark_result_watch_error(watch_id,"broker_event26_not_received")
-            await _persist_result_watch_snapshot(watch_id,s)
+            await _persist_result_watch_snapshot(
+                watch_id,s,status="UNRESOLVED",
+                last_error="broker_event26_not_received"
+            )
             return
 
         close_price=close_event.get("close_price")
@@ -4082,8 +4131,10 @@ async def result_watch(key):
                 "reason=no_close_quote_or_final_status",
                 s.cycle_id,s.pair,s.broker_trade_id
             )
-            await mark_result_watch_error(watch_id,"broker_event26_missing_result_fields")
-            await _persist_result_watch_snapshot(watch_id,s)
+            await _persist_result_watch_snapshot(
+                watch_id,s,status="UNRESOLVED",
+                last_error="broker_event26_missing_result_fields"
+            )
             return
 
         if close_price is None:
@@ -4170,7 +4221,10 @@ async def result_watch(key):
                 "reason=signal_market_candle_unavailable",
                 s.cycle_id,s.pair
             )
-            await mark_result_watch_error(watch_id,"signal_market_candle_unavailable")
+            await _persist_result_watch_snapshot(
+                watch_id,s,status="UNRESOLVED",
+                last_error="signal_market_candle_unavailable"
+            )
             return
 
         rec=BRAIN.finish_signal(
@@ -6192,14 +6246,35 @@ def _trade_result_from_record(rec):
     return None
 
 
+def _trade_belongs_to_learning_lab(trade_id):
+    """Never let isolated DEMO learning orders become live-signal result matches."""
+    tid=str(trade_id or "").strip()
+    if not tid:
+        return False
+    mod=learning_lab_module
+    try:
+        if tid in getattr(mod,"_open",{}):
+            return True
+        if tid in getattr(mod,"_finalized",set()):
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _broker_trade_matches_signal(signal,event,accepted=False):
     if not signal or not isinstance(event,dict):
+        return False
+    trade_id=str(event.get("trade_id") or "")
+    if _trade_belongs_to_learning_lab(trade_id):
         return False
     pair=str(event.get("pair") or "")
     if pair and pair!=str(signal.pair):
         return False
     direction=str(event.get("direction") or "").upper()
     if direction and direction!=str(signal.direction).upper():
+        return False
+    if not pair and not direction:
         return False
 
     event_account=event.get("account_id")
@@ -6278,7 +6353,7 @@ def _record_broker_trade_event(event_record):
     STATE["broker_trade_events"]=events[-200:]
 
 
-async def _persist_result_watch_snapshot(watch_id,signal):
+async def _persist_result_watch_snapshot(watch_id,signal,status='PROCESSING',last_error=None):
     if not LEARNING_DB_URL:
         return False
     try:
@@ -6289,13 +6364,17 @@ async def _persist_result_watch_snapshot(watch_id,signal):
                 with db.cursor() as cur:
                     cur.execute("""
                         INSERT INTO candice_result_watch_queue(watch_id,record,status,last_error,updated_at)
-                        VALUES(%s,%s::jsonb,'PROCESSING',NULL,NOW())
+                        VALUES(%s,%s::jsonb,%s,%s,NOW())
                         ON CONFLICT(watch_id) DO UPDATE
                         SET record=EXCLUDED.record,
-                            status='PROCESSING',
-                            last_error=NULL,
-                            updated_at=NOW()
-                    """,(watch_id,payload))
+                            status=EXCLUDED.status,
+                            last_error=EXCLUDED.last_error,
+                            updated_at=NOW(),
+                            completed_at=CASE
+                                WHEN EXCLUDED.status='UNRESOLVED' THEN NOW()
+                                ELSE candice_result_watch_queue.completed_at
+                            END
+                    """,(watch_id,payload,status,last_error[:500] if last_error else None))
                 db.commit()
         await asyncio.to_thread(put)
         return True
@@ -6717,6 +6796,7 @@ async def market_worker():
                      client.account_id,len(assets),real_n,otc_n,len(assets))
             log.info("STATIC_ACCOUNT_ASSETS_READY count=%d source=user_pdf_104_assets api_asset_listing=off",len(assets))
             await ensure_account_tick_subscriptions()
+            await expire_stale_result_watches()
             restored=await restore_pending_result_watches()
             if restored:
                 log.info("RESULT_WATCH_RECOVERY_COMPLETE restored=%d",restored)
