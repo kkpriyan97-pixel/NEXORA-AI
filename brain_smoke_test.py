@@ -43,7 +43,7 @@ def main():
     assert down["expiry_minutes"]==1
 
     flat=[{"time":start+i*60,"open":100,"high":100.01,"low":99.99,"close":100,"volume":100} for i in range(120)]
-    assert analyze_asset({"pair":"TEST_FLAT","display_name":"TEST_FLAT"},flat,now=now) is None
+    assert analyze_asset({"pair":"TEST_FLAT","display_name":"TEST_FLAT"},flat) is None
     print("NEXORA_AVWAP_VP_SMOKE_OK")
 
 
