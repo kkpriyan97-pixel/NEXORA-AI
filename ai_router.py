@@ -14,11 +14,13 @@ ACCESS_DENIED_COOLDOWN_SECONDS=3600.0
 # short-circuit subsequent verifier calls so the live 3-minute scheduler does not
 # spend its qualification budget retrying a dead provider chain.
 GLOBAL_CHAIN_COOLDOWN_UNTIL=0.0
-GLOBAL_CHAIN_COOLDOWN_SECONDS=15.0
-DEFAULT_FALLBACKS=("GROQ","NARAROUTER","OPENROUTER","NVIDIA","MISTRAL","GEMINI","OPENAI")
+GLOBAL_CHAIN_COOLDOWN_SECONDS=60.0
+# NaraRouter currently returns a deterministic Telegram-binding 403 in production;
+# keep it available only when explicitly added through AI_FALLBACK_PROVIDERS.
+DEFAULT_FALLBACKS=("GROQ","OPENROUTER","NVIDIA","MISTRAL","GEMINI","OPENAI")
 PROVIDER_LOCKS={}
 try:
-    _ai_concurrency=int(os.getenv("AI_ANALYSIS_CONCURRENCY","6"))
+    _ai_concurrency=int(os.getenv("AI_ANALYSIS_CONCURRENCY","2"))
 except (TypeError,ValueError):
     _ai_concurrency=6
 _ai_concurrency=max(1,min(8,_ai_concurrency))
