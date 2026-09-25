@@ -3472,6 +3472,19 @@ async def cycle_loop():
                 return False
 
             real_volume_ok=(ind.get("real_volume_verified") is True)
+            fallback_value_position=str(ind.get("value_position") or "").upper()
+            fallback_direction=str(expected or "").upper()
+            # Recovery/reranking can rebuild a candidate and drop bookkeeping
+            # flags. Recompute the SAME strict deterministic local fallback
+            # from the current Brain indicators instead of trusting metadata.
+            strict_local_proxy_fallback=(
+                int(confidence or 0)>=95
+                and bool(ind.get("exact_live_setup"))
+                and ind.get("slope_persistent") is True
+                and ind.get("level_reclaim") is False
+                and ((fallback_direction=="UP" and fallback_value_position=="ABOVE_VALUE")
+                     or (fallback_direction=="DOWN" and fallback_value_position=="BELOW_VALUE"))
+            )
             proxy_volume_ok=(
                 ALLOW_PROXY_LIVE_FALLBACK
                 and str(ind.get("volume_mode") or "").upper()=="M1_EQUAL_ACTIVITY_PROXY"
@@ -3484,6 +3497,7 @@ async def cycle_loop():
                         candidate.get("volume_proxy_local_fallback") is True
                         and int(candidate.get("volume_proxy_local_fallback_confidence") or 0)>=90
                     )
+                    or strict_local_proxy_fallback
                 )
             )
             if not real_volume_ok and not proxy_volume_ok:
