@@ -52,12 +52,22 @@ def _cfg(name):
     if not key and name=="GEMINI":key=os.getenv("GEMINI_API_KEY","").strip()
     if not key and name=="GROQ":key=os.getenv("GROQ_API_KEY","").strip()
     if not key and name=="NVIDIA":key=os.getenv("NVIDIA_API_KEY","").strip() or os.getenv("NVIDIA_NIM_API_KEY","").strip()
+    if not key and name=="NARAROUTER":
+        # Accept the common environment names used for the ByNara/NaraRouter key.
+        key=(os.getenv("BYNARA_API_KEY","").strip()
+             or os.getenv("NARA_API_KEY","").strip()
+             or os.getenv("NARA_ROUTER_API_KEY","").strip())
     base=os.getenv(f"{name}_BASE_URL","").strip().rstrip("/")
+    if not base and name=="NARAROUTER":
+        base=(os.getenv("BYNARA_BASE_URL","").strip().rstrip("/")
+              or os.getenv("NARA_BASE_URL","").strip().rstrip("/"))
     if not base:
         base={"OPENAI":"https://api.openai.com/v1","GEMINI":"https://generativelanguage.googleapis.com/v1beta/openai","GROQ":"https://api.groq.com/openai/v1","NVIDIA":"https://integrate.api.nvidia.com/v1","OPENROUTER":"https://openrouter.ai/api/v1","MISTRAL":"https://api.mistral.ai/v1","NARAROUTER":"https://router.bynara.id/v1"}.get(name,"")
     # Provider-specific models must override the global AI_MODEL. A global model
     # such as gpt-5.6 is not valid for Gemini/Groq/etc.
     model=os.getenv(f"{name}_MODEL","").strip()
+    if not model and name=="NARAROUTER":
+        model=(os.getenv("BYNARA_MODEL","").strip() or os.getenv("NARA_MODEL","").strip())
     if not model:
         model={"GEMINI":"gemini-3.8-flash","GROQ":"openai/gpt-oss-20b","NVIDIA":"openai/gpt-oss-20b","NARAROUTER":"auto/bynara"}.get(name,"")
     if not model:
