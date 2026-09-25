@@ -3725,8 +3725,20 @@ async def cycle_loop():
             recovery_signal_in=max(0.0,signal_at-time.time())
             can_resume_recovered=bool(
                 recovered
-                and resume_completed_pass < len(SCAN_OFFSETS)
-                and recovery_signal_in >= 20.0
+                and (
+                    (
+                        resume_completed_pass < len(SCAN_OFFSETS)
+                        and recovery_signal_in >= 20.0
+                    )
+                    or (
+                        # Pass 5 is already complete, so no additional analysis
+                        # window is required. Preserve the exact original signal
+                        # timestamp even when a Render restart leaves <20s.
+                        resume_completed_pass >= len(SCAN_OFFSETS)
+                        and recovery_signal_in >= 1.0
+                        and bool(candidate_pool)
+                    )
+                )
             )
             if can_resume_recovered:
                 log.info(
@@ -3785,12 +3797,25 @@ async def cycle_loop():
             time.strftime("%H:%M:%S",time.gmtime(signal_at))
         )
         if signal_in < 20.0:
-            log.warning(
-                "CYCLE_SKIPPED_LATE_START cycle=%s signal_utc=%s signal_in=%.2f "
-                "reason=insufficient_window_for_account_and_five_passes",
-                cycle_id,time.strftime("%H:%M:%S",time.gmtime(signal_at)),signal_in
+            final_recovery_ready=bool(
+                recovered
+                and resume_completed_pass >= len(SCAN_OFFSETS)
+                and signal_in >= 1.0
+                and candidate_pool
+                and account_ready_now()
             )
-            continue
+            if not final_recovery_ready:
+                log.warning(
+                    "CYCLE_SKIPPED_LATE_START cycle=%s signal_utc=%s signal_in=%.2f "
+                    "reason=insufficient_window_for_account_and_five_passes",
+                    cycle_id,time.strftime("%H:%M:%S",time.gmtime(signal_at)),signal_in
+                )
+                continue
+            log.info(
+                "CYCLE_RECOVERY_FINAL_WINDOW cycle=%s completed_pass=%s "
+                "signal_in=%.2f candidates=%s reason=pass5_already_complete",
+                cycle_id,resume_completed_pass,signal_in,len(candidate_pool)
+            )
 
         if not account_ready_now():
             ready_deadline=signal_at-20.0
