@@ -10,7 +10,7 @@ import httpx
 from olymptrade_ws import OlympTradeClient
 from olymptrade_ws.olympconfig import parameters
 from brain_rules import ActiveSignal,BrainState,rank_signal_candidates
-from candice_brain import analyze_asset
+from candice_brain import analyze_asset,OTC_STRATEGY,ALLOWED_STRATEGY
 from ai_engine import snapshot_from_asset,ai_environment_status
 from ai_router import analyze_with_fallback,review_result_with_fallback
 from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot_async, world_learning_loop
@@ -4268,7 +4268,7 @@ async def cycle_loop():
         # multi-timeframe/volume/body delivery gates to this strategy.
         # Fresh authenticated price + closed-candle decision + confidence remain
         # mandatory.
-        if not prepared_ok and str(candidate.get("strategy") or "").upper()!="AVWAP_VOLUME_PROFILE":
+        if not prepared_ok and str(candidate.get("strategy") or "").upper() not in {ALLOWED_STRATEGY,OTC_STRATEGY}:
             log.info(
                 "FINAL_DELIVERY_CONFIRMATION_REJECTED cycle=%s pair=%s strategy=%s reason=%s diagnostic=%s next_asset=TRUE",
                 cycle_id,p,str(candidate.get("strategy") or ""),
@@ -4281,11 +4281,11 @@ async def cycle_loop():
         strategy_name=str(candidate.get("strategy") or "").upper()
         trend_name=str(candidate.get("trend_15m") or "").upper()
 
-        # Exact-entry market-state gate: the closed M1 setup must still be
-        # aligned with the live authenticated quote at the instant of delivery.
-        # This uses only the AVWAP + Volume Profile levels already produced by
-        # the locked technical Brain; it does not introduce another indicator.
-        if strategy_name=="AVWAP_VOLUME_PROFILE":
+        # Exact-entry market-state gate is strategy-specific:
+        # REAL -> AVWAP + POC live alignment.
+        # OTC -> the locked BOS level must still hold at the live entry and
+        # the final Event-1 activity gate must be confirmed.
+        if strategy_name==ALLOWED_STRATEGY:
             ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
             avwap=float(ind.get("anchored_vwap") or candidate.get("avwap") or 0.0)
             poc=float(ind.get("volume_profile_poc") or candidate.get("poc") or 0.0)
@@ -4307,16 +4307,6 @@ async def cycle_loop():
                     cycle_id,p,expected,entry,vah,val
                 )
                 return False
-
-            # The 1-minute continuation check is part of the exact setup. At the
-            # delivery boundary, the authenticated live quote must not have fallen
-            # below the closed candle that qualified the setup.
-            # The Brain already validates M1 continuation on CLOSED candles.
-            # At the delivery boundary, AVWAP/POC alignment plus value-area
-            # acceptance are the live-state guards. Requiring the live quote to
-            # remain beyond the old confirmation-candle close is redundant and
-            # incorrectly rejects normal retest/hold behavior before a 1-minute
-            # entry. Keep the Brain's closed-candle continuation evidence.
             continuation_ok=bool(ind.get("m1_continuation_ok"))
             if not continuation_ok:
                 log.info(
@@ -4329,9 +4319,6 @@ async def cycle_loop():
             real_volume_ok=(ind.get("real_volume_verified") is True)
             fallback_value_position=str(ind.get("value_position") or "").upper()
             fallback_direction=str(expected or "").upper()
-            # Recovery/reranking can rebuild a candidate and drop bookkeeping
-            # flags. Recompute the SAME strict deterministic local fallback
-            # from the current Brain indicators instead of trusting metadata.
             strict_local_proxy_fallback=(
                 int(confidence or 0)>=90
                 and bool(ind.get("exact_live_setup"))
@@ -4340,10 +4327,6 @@ async def cycle_loop():
                 and ((fallback_direction=="UP" and fallback_value_position=="ABOVE_VALUE")
                      or (fallback_direction=="DOWN" and fallback_value_position=="BELOW_VALUE"))
             )
-            # Real traded volume remains the strongest/only true volume source.
-            # When the broker exposes no real volume, allow a separate HIGH_TICK_
-            # ACTIVITY_PROXY only after the authenticated Event-1 stream proves
-            # unusually strong observed activity for this exact candidate.
             high_tick_activity=_high_tick_activity_status(p,time.time())
             candidate["high_tick_activity"]=high_tick_activity
             candidate["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
@@ -4388,10 +4371,65 @@ async def cycle_loop():
                     "HIGH_TICK_ACTIVITY_VOLUME_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
                     cycle_id,p,expected,high_tick_activity
                 )
+        elif strategy_name==OTC_STRATEGY:
+            ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
+            bos_level=float(ind.get("otc_bos_level") or 0.0)
+            if bos_level<=0.0:
+                log.info(
+                    "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s reason=bos_level_missing next_asset=TRUE",
+                    cycle_id,p,expected
+                )
+                return False
+            structure_holds=(entry>bos_level) if expected=="UP" else (entry<bos_level)
+            if not structure_holds:
+                log.info(
+                    "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=live_quote_below_or_above_bos_level entry=%s bos_level=%s next_asset=TRUE",
+                    cycle_id,p,expected,entry,bos_level
+                )
+                return False
+            required_flags=(
+                "otc_strategy","otc_bos_confirmed","otc_displacement_confirmed",
+                "otc_retest_confirmed","otc_hold_confirmed",
+                "otc_confirmation_candle_confirmed","m1_continuation_ok",
+                "exact_live_setup"
+            )
+            if any(ind.get(flag) is not True for flag in required_flags):
+                log.info(
+                    "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=structure_confirmation_missing next_asset=TRUE",
+                    cycle_id,p,expected
+                )
+                return False
+            high_tick_activity=_high_tick_activity_status(p,time.time())
+            candidate["high_tick_activity"]=high_tick_activity
+            candidate["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
+            if not bool(high_tick_activity.get("confirmed")):
+                log.info(
+                    "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=high_tick_activity_not_confirmed diagnostic=%s next_asset=TRUE",
+                    cycle_id,p,expected,high_tick_activity
+                )
+                return False
+            ind["high_tick_activity_confirmed"]=True
+            ind["high_tick_activity_recent_ticks"]=int(high_tick_activity.get("recent_ticks") or 0)
+            ind["high_tick_activity_total_ticks"]=int(high_tick_activity.get("total_ticks") or 0)
+            ind["high_tick_activity_burst_ratio"]=float(high_tick_activity.get("burst_ratio") or 0.0)
+            candidate["indicators"]=ind
+            log.info(
+                "HIGH_TICK_ACTIVITY_OTC_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
+                cycle_id,p,expected,high_tick_activity
+            )
+        else:
+            log.info(
+                "FINAL_STRATEGY_REJECTED cycle=%s pair=%s strategy=%s reason=unsupported_live_strategy",
+                cycle_id,p,strategy_name
+            )
+            return False
 
         log.info(
-            "FINAL_AVWAP_VOLUME_PROFILE_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
-            cycle_id,p,expected,candidate.get("final_delivery_diagnostic") or {}
+            "FINAL_LIVE_STRATEGY_CONFIRMED cycle=%s pair=%s strategy=%s direction=%s diagnostic=%s",
+            cycle_id,p,strategy_name,expected,candidate.get("final_delivery_diagnostic") or {}
         )
         if confidence < 90:
             log.info(
@@ -4410,7 +4448,7 @@ async def cycle_loop():
 
         # Only a candidate that survived pass 5 is eligible for final delivery.
         if (
-            str(candidate.get("strategy") or "").upper()!="AVWAP_VOLUME_PROFILE"
+            str(candidate.get("strategy") or "").upper() not in {ALLOWED_STRATEGY,OTC_STRATEGY}
             and (
                 int(candidate.get("qualified_pass") or 0) < 4
                 or not bool(candidate.get("deep_verified"))
@@ -4449,7 +4487,8 @@ async def cycle_loop():
         key=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
         indicator_check=format_live_indicator_check(
             s.indicator_context,
-            STATE["price_source"].get(s.pair,"authenticated_broker_live_candle")
+            STATE["price_source"].get(s.pair,"authenticated_broker_live_candle"),
+            s.strategy
         )
         log.info(
             "LIVE_INDICATOR_SNAPSHOT cycle=%s pair=%s source=%s indicators=%s",
@@ -6248,8 +6287,22 @@ async def handle_telegram_command(msg):
 
 
 
-def format_live_indicator_check(indicators, price_source="authenticated_broker_live_candle"):
+def format_live_indicator_check(indicators, price_source="authenticated_broker_live_candle", strategy=""):
     d=dict(indicators or {})
+    if str(strategy or "").upper()==OTC_STRATEGY:
+        bias=str(d.get("otc_market_bias") or "UNKNOWN")
+        bos=d.get("otc_bos_level")
+        return (
+            "🔎 <b>LIVE OTC STRUCTURE CHECK</b>\n"
+            f"📡 Feed → {price_source}\n"
+            "🕯️ Data → closed M1 + complete closed 15M blocks\n"
+            f"📈 15M Bias → <b>{bias}</b>\n"
+            f"🔓 1M BOS → <b>{bos}</b>\n"
+            f"💥 Displacement → <b>{'CONFIRMED' if d.get('otc_displacement_confirmed') else 'NO'}</b>\n"
+            f"🔁 Retest → <b>{'CONFIRMED' if d.get('otc_retest_confirmed') else 'NO'}</b>\n"
+            f"🛡️ Hold → <b>{'CONFIRMED' if d.get('otc_hold_confirmed') else 'NO'}</b>\n"
+            f"🕯️ Confirmation → <b>{'CONFIRMED' if d.get('otc_confirmation_candle_confirmed') else 'NO'}</b>\n"
+        )
     av=float(d.get("anchored_vwap") or 0.0)
     poc=float(d.get("volume_profile_poc") or 0.0)
     vah=float(d.get("volume_profile_vah") or 0.0)
@@ -6268,26 +6321,31 @@ def format_live_indicator_check(indicators, price_source="authenticated_broker_l
     )
 
 def format_candice_signal_message(s, indicator_check, ts, target):
-    """Canonical Telegram signal template.
-
-    The live engine is locked to AVWAP + Volume Profile. The formatter therefore
-    uses a fixed engine label and never prints a legacy strategy name.
-    """
-    direction = str(s.direction or "").upper()
-    arrow = "🟢 UP" if direction == "UP" else "🔴 DOWN"
-    trend = str(s.trend_15m or "").upper()
-    trend_label = "BULLISH" if "BULL" in trend else "BEARISH" if "BEAR" in trend else "—"
-    structure = str(s.structure_1m or "").upper()
-    structure_label = (
-        "ABOVE AVWAP + POC" if "ABOVE_AVWAP_POC" in structure
-        else "BELOW AVWAP + POC" if "BELOW_AVWAP_POC" in structure
+    """Canonical Telegram signal template with asset-class-specific engine labels."""
+    direction=str(s.direction or "").upper()
+    trend=str(s.trend_15m or "").upper()
+    trend_label=(
+        "BULLISH" if "BULL" in trend
+        else "BEARISH" if "BEAR" in trend
         else "—"
     )
-    # Telegram HTML has no font-size control, so use Unicode bold glyphs
-    # and isolated lines to make the direction and entry time visually dominant.
-    direction_focus = "🟢 𝗨𝗣" if direction == "UP" else "🔴 𝗗𝗢𝗪𝗡"
-    bold_digits = str.maketrans("0123456789", "𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵")
-    entry_time = uae_time(target).translate(bold_digits)
+    structure=str(s.structure_1m or "").upper()
+    is_otc=str(s.strategy or "").upper()==OTC_STRATEGY
+    if is_otc:
+        structure_label="BOS → DISPLACEMENT → RETEST → HOLD → CONFIRM"
+        engine_label="PRO OTC STRUCTURE CONTINUATION"
+        confluence_label="15M BIAS + 1M STRUCTURE CONFIRMED"
+    else:
+        structure_label=(
+            "ABOVE AVWAP + POC" if "ABOVE_AVWAP_POC" in structure
+            else "BELOW AVWAP + POC" if "BELOW_AVWAP_POC" in structure
+            else "—"
+        )
+        engine_label="AVWAP + VOLUME PROFILE"
+        confluence_label="AVWAP + POC ALIGNED"
+    direction_focus="🟢 𝗨𝗣" if direction=="UP" else "🔴 𝗗𝗢𝗪𝗡"
+    bold_digits=str.maketrans("0123456789","𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵")
+    entry_time=uae_time(target).translate(bold_digits)
     return (
         "🚨 <b>CANDICE AI</b>\n"
         "💎 <b>PRO SIGNAL</b>\n\n"
@@ -6299,9 +6357,9 @@ def format_candice_signal_message(s, indicator_check, ts, target):
         f"💰 Reference → <code>{s.entry_price}</code>\n"
         f"⚡ Confidence → <b>{s.confidence}%</b>\n\n"
         f"📈 15M Bias → <b>{trend_label}</b>\n"
-        f"🕯️ 1M Close → <b>{structure_label}</b>\n"
-        "🧠 Engine → <b>AVWAP + VOLUME PROFILE</b>\n"
-        "✓ Confluence → <b>AVWAP + POC ALIGNED</b>\n\n"
+        f"🕯️ 1M Structure → <b>{structure_label}</b>\n"
+        f"🧠 Engine → <b>{engine_label}</b>\n"
+        f"✓ Confluence → <b>{confluence_label}</b>\n\n"
         "🟣 <b>DEMO • MANUAL ENTRY</b>\n"
         "🤖 <b>CANDICE BRAIN • LIVE</b>"
     )
@@ -6339,8 +6397,8 @@ async def build_live_analysis_payload():
         "authenticated_account_feed":str(STATE.get("feed_source") or "").startswith("authenticated_websocket:"),
         "asset_count":len(rows),
         "qualified_count":len(STATE.get("analyses") or {}),
-        "strategy_families_checked":1,
-        "strategy_families":["AVWAP_VOLUME_PROFILE"],
+        "strategy_families_checked":2,
+        "strategy_families":[ALLOWED_STRATEGY,OTC_STRATEGY],
         "five_scan_cycle":dict(STATE.get("cycle_scan_status") or {}),
         "protocol":"FLEX_MANUAL",
         "signal_expiry_minutes":1,
