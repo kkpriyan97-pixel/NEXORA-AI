@@ -682,6 +682,17 @@ async def ensure_result_watch_queue_table():
                         SET status='PENDING',updated_at=NOW()
                         WHERE status='PROCESSING'
                     """)
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candice_asset_integrity_quarantine (
+                            pair TEXT PRIMARY KEY,
+                            reason TEXT NOT NULL,
+                            signal_price DOUBLE PRECISION,
+                            broker_price DOUBLE PRECISION,
+                            ratio DOUBLE PRECISION,
+                            active BOOLEAN NOT NULL DEFAULT TRUE,
+                            observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                    """)
                 db.commit()
         await asyncio.to_thread(init)
         log.info("RESULT_WATCH_QUEUE_READY")
@@ -714,6 +725,14 @@ def _result_watch_payload(s):
         "indicator_context":dict(s.indicator_context or {}),
         "actual_entry_captured":bool(getattr(s,"actual_entry_captured",False)),
         "actual_entry_source":str(getattr(s,"actual_entry_source","") or ""),
+        "signal_reference_price":getattr(s,"signal_reference_price",None),
+        "broker_trade_id":str(getattr(s,"broker_trade_id","") or ""),
+        "broker_trade_open_ts":getattr(s,"broker_trade_open_ts",None),
+        "broker_trade_open_price":getattr(s,"broker_trade_open_price",None),
+        "broker_trade_close_price":getattr(s,"broker_trade_close_price",None),
+        "broker_trade_status":str(getattr(s,"broker_trade_status","") or ""),
+        "broker_trade_profit":getattr(s,"broker_trade_profit",None),
+        "broker_trade_source":str(getattr(s,"broker_trade_source","") or ""),
     }
 
 async def enqueue_result_watch(watch_id,s):
@@ -859,6 +878,14 @@ async def restore_pending_result_watches():
                         indicator_context=dict(record.get("indicator_context") or {}),
                         actual_entry_captured=bool(record.get("actual_entry_captured",False)),
                         actual_entry_source=str(record.get("actual_entry_source") or ""),
+                        signal_reference_price=(float(record.get("signal_reference_price")) if record.get("signal_reference_price") is not None else None),
+                        broker_trade_id=str(record.get("broker_trade_id") or ""),
+                        broker_trade_open_ts=(float(record.get("broker_trade_open_ts")) if record.get("broker_trade_open_ts") is not None else None),
+                        broker_trade_open_price=(float(record.get("broker_trade_open_price")) if record.get("broker_trade_open_price") is not None else None),
+                        broker_trade_close_price=(float(record.get("broker_trade_close_price")) if record.get("broker_trade_close_price") is not None else None),
+                        broker_trade_status=str(record.get("broker_trade_status") or ""),
+                        broker_trade_profit=(float(record.get("broker_trade_profit")) if record.get("broker_trade_profit") is not None else None),
+                        broker_trade_source=str(record.get("broker_trade_source") or ""),
                     )
                 if start_result_watch(key):
                     restored+=1
@@ -1028,6 +1055,16 @@ def uae_time(ts):
     return datetime.fromtimestamp(float(ts),tz=UAE_TZ).strftime("%H:%M:%S")
 
 STATE={"status":"starting","assets":[],"prices":{},"price_source":{},"candles":{},"analyses":{},"network":{},"read_only":True,"cycle":0,"last_cycle":None,"account_id":None,"account_group":"demo","feed_source":"authenticated_websocket","live_orders":{},"live_order_events":[],"live_order_monitor":{"connected":False,"updated_at":None,"last_query_at":None,"last_error":None,"source":"authenticated_broker_event21_22_26+event31_poll"}}
+# Broker-trade reconciliation is authoritative when a manual DEMO trade can be
+# matched to a signal. Market-candle outcome remains only the fallback for a
+# signal with no matched user trade.
+RESULT_TRADE_MATCH_BEFORE=15.0
+RESULT_TRADE_MATCH_AFTER=90.0
+RESULT_BROKER_CLOSE_WAIT=300.0
+BROKER_PRICE_SCALE_MISMATCH_RATIO=1.75
+STATE["broker_trade_events"]=[]
+STATE["broker_trade_assignments"]={}
+STATE["asset_integrity_blocks"]={}
 CANDLE_FETCH_SEM=asyncio.Semaphore(24)
 CANDLE_FETCH_LAST={}
 CANDLE_FETCH_INTERVAL=60.0
@@ -1334,6 +1371,16 @@ def build_assets(client=None,raw=None):
 
         seen.add(key)
         verified=verified_by_pair[key]
+        if key=="MCI_X":
+            safe_identity={
+                k:x.get(k) for k in (
+                    "pair","p","symbol","instrument","name","title","display_name",
+                    "displayName","asset_name","assetName","product","product_code","code"
+                )
+                if x.get(k) is not None
+            }
+            log.info("ASSET_IDENTITY_AUDIT pair=MCI_X raw_identity=%s canonical_name=%s",
+                     safe_identity,verified.get("display_name"))
         unavailable_reason=broker_unavailable_reason(x)
         closure_reason=known_broker_closure_reason(p)
         if unavailable_reason:
@@ -1378,7 +1425,12 @@ def build_assets(client=None,raw=None):
             "mode":"OTC" if "_OTC" in p.upper() else "REAL",
             "trading_mode":"FLEX_TIME",
             "market_group":verified.get("market_group"),
-            "signal_eligible":not quickler and not bool(closure_reason)
+            "signal_eligible":not quickler and not bool(closure_reason) and not _asset_integrity_blocked(p),
+            "asset_integrity_blocked":_asset_integrity_blocked(p),
+            "asset_integrity_reason":(
+                (STATE.get("asset_integrity_blocks",{}).get(p) or {}).get("reason")
+                if _asset_integrity_blocked(p) else ""
+            )
         })
 
     log.info(
@@ -3893,238 +3945,254 @@ def _exact_expiry_candle(candles,target_ts,reference_ts=None):
 
 async def result_watch(key):
     s=BRAIN.active_signals.get(key)
-    if not s:return
+    if not s:
+        return
     watch_id=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
 
-    # The alert is sent 30s before the entry boundary. The old code incorrectly
-    # used that pre-entry reference as the actual entry price, which could
-    # reverse the WIN/LOSS classification and then poison persistent learning.
+    # Preserve the signal reference separately. A manual broker trade may be
+    # opened later and at a different quote; its broker quote is authoritative
+    # for that actual trade result.
+    if getattr(s,"signal_reference_price",None) is None:
+        try:
+            s.signal_reference_price=float(s.entry_price)
+        except (TypeError,ValueError):
+            s.signal_reference_price=None
+
     await asyncio.sleep(max(0,s.entry_ts-time.time()))
 
-    entry_price=None
-    entry_source=""
-    entry_boundary_delta=None
-    # A previously persisted actual entry is authoritative after a Render restart.
-    # Never overwrite it with a later fallback quote.
-    if bool(getattr(s,"actual_entry_captured",False)) and float(getattr(s,"entry_price",0.0) or 0.0)>0.0:
-        entry_price=float(s.entry_price)
-        entry_source=str(getattr(s,"actual_entry_source","") or "persisted-actual-entry")
-        log.info(
-            "ACTUAL_ENTRY_RESTORED pair=%s entry=%.12g source=%s entry_ts=%s",
-            s.pair,entry_price,entry_source,
-            datetime.fromtimestamp(s.entry_ts,tz=timezone.utc).strftime("%H:%M:%S")
-        )
-    # First preference: exact-boundary broker-timestamped tick already captured
-    # by the authenticated Event-1 stream. Only use it when no actual entry was
-    # previously persisted.
-    if entry_price is None:
-        boundary=boundary_entry_tick(s.pair,s.entry_ts,window_seconds=3.0)
-        if boundary is not None:
-            entry_price,boundary_ts,_,entry_boundary_delta=boundary
-            entry_source=f"tick-boundary:{entry_boundary_delta:.3f}s"
-            log.info(
-                "ACTUAL_ENTRY_BOUNDARY_TICK pair=%s entry=%.12g broker_ts=%s delta=%.3fs",
-                s.pair,entry_price,
-                datetime.fromtimestamp(boundary_ts,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
-                entry_boundary_delta
-            )
-    entry_deadline=time.time()+8.0
-    while time.time()<entry_deadline and entry_price is None:
-        # Give the boundary tick a moment to arrive if the websocket was a little
-        # late, then refresh the candidate quote as a fallback.
-        boundary=boundary_entry_tick(s.pair,s.entry_ts,window_seconds=3.0)
-        if boundary is not None:
-            entry_price,boundary_ts,_,entry_boundary_delta=boundary
-            entry_source=f"tick-boundary:{entry_boundary_delta:.3f}s"
-            log.info(
-                "ACTUAL_ENTRY_BOUNDARY_TICK pair=%s entry=%.12g broker_ts=%s delta=%.3fs",
-                s.pair,entry_price,
-                datetime.fromtimestamp(boundary_ts,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
-                entry_boundary_delta
-            )
+    signal_reference=float(
+        s.signal_reference_price
+        if getattr(s,"signal_reference_price",None) is not None
+        else s.entry_price
+    )
+
+    # Reconcile an actual manual DEMO trade from broker Event-22. The matching
+    # window is deliberately bounded around the signal's entry boundary.
+    accepted_trade=None
+    accepted_deadline=float(s.entry_ts)+RESULT_TRADE_MATCH_AFTER
+    while time.time()<accepted_deadline:
+        accepted_trade=_find_broker_trade_for_signal(s,22)
+        if accepted_trade:
             break
-        rec=STATE["prices"].get(s.pair)
-        if rec and rec[0] is not None and has_fresh_live_price(s.pair,time.time(),LIVE_TICK_MAX_AGE):
-            try:
-                entry_price=float(rec[0])
-                entry_source=STATE["price_source"].get(s.pair,"tick-late-fallback")
-                log.warning(
-                    "ACTUAL_ENTRY_LATE_TICK_FALLBACK pair=%s entry=%.12g source=%s target=%s",
-                    s.pair,entry_price,entry_source,
-                    datetime.fromtimestamp(s.entry_ts,tz=timezone.utc).strftime("%H:%M:%S")
-                )
-                break
-            except (TypeError,ValueError):
-                pass
-        try:
-            await ensure_candidate_quotes([s.pair])
-        except Exception as e:
-            log.warning("ACTUAL_ENTRY_REFRESH_FAILED pair=%s type=%s message=%s",
-                        s.pair,type(e).__name__,str(e)[:120])
-        await asyncio.sleep(0.10)
+        # A broker can deliver Event-26 before our Event-22 handler was observed.
+        early_close=_find_broker_trade_for_signal(s,26)
+        if early_close:
+            accepted_trade=early_close
+            break
+        await asyncio.sleep(0.50)
 
-    if entry_price is None:
-        # Never feed a 30s-old reference price back into Brain learning.
-        log.warning("ACTUAL_ENTRY_UNAVAILABLE pair=%s target=%s reason=no_fresh_authenticated_price durable_watch=%s",
-                    s.pair,s.entry_ts,watch_id)
-        await mark_result_watch_error(watch_id,"actual_entry_unavailable")
-        return
-
-    s.entry_price=entry_price
-    s.actual_entry_captured=True
-    s.actual_entry_source=entry_source
-    if LEARNING_DB_URL:
-        try:
-            import psycopg
-            updated_payload=_result_watch_payload(s)
-            updated_payload["actual_entry_source"]=entry_source
-            updated_payload["actual_entry_captured"]=True
-            def _persist_entry():
-                payload=json.dumps(updated_payload,separators=(",",":"),ensure_ascii=False,default=str)
-                with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
-                    with db.cursor() as cur:
-                        cur.execute("""
-                            INSERT INTO candice_result_watch_queue(watch_id,record,status,last_error,updated_at)
-                            VALUES(%s,%s::jsonb,'PROCESSING',NULL,NOW())
-                            ON CONFLICT(watch_id) DO UPDATE
-                            SET record=EXCLUDED.record,
-                                updated_at=NOW(),
-                                last_error=NULL,
-                                status='PROCESSING'
-                        """,(watch_id,payload))
-                    db.commit()
-            await asyncio.to_thread(_persist_entry)
-            log.info("RESULT_WATCH_ENTRY_PERSISTED watch_id=%s pair=%s entry=%.12g",watch_id,s.pair,s.entry_price)
-        except Exception as e:
-            log.warning("RESULT_WATCH_ENTRY_PERSIST_FAILED watch_id=%s type=%s message=%s",watch_id,type(e).__name__,str(e)[:160])
-    log.info("ACTUAL_ENTRY_CAPTURED pair=%s entry=%.12g source=%s boundary_delta=%s entry_ts=%s",
-             s.pair,s.entry_price,entry_source,
-             f"{entry_boundary_delta:.3f}s" if entry_boundary_delta is not None else "NA",
-             datetime.fromtimestamp(s.entry_ts,tz=timezone.utc).strftime("%H:%M:%S"))
-
-    await asyncio.sleep(max(0,s.expiry_minutes*60-(time.time()-s.entry_ts)))
-
-    # Result verification is based only on a completed candle.
-    expiry_price=None
-    expiry_source=""
-    client=CLIENT
-    for attempt in range(1,5):
-        try:
-            if client and getattr(client.connection,"is_connected",False):
-                raw=await asyncio.wait_for(
-                    client.market.get_candles(s.pair,size=60,count=60),
-                    timeout=2.0
-                )
-                normalized=[]
-                if isinstance(raw,list):
-                    for item in raw:
-                        if isinstance(item,dict) and isinstance(item.get("candles"),list):
-                            normalized.extend(x for x in item["candles"] if isinstance(x,dict))
-                        elif isinstance(item,dict) and any(k in item for k in ("open","o","high","h","low","l","close","c")):
-                            normalized.append(item)
-                if normalized:
-                    try:normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
-                    except Exception:pass
-                    exact=_exact_expiry_candle(normalized,s.entry_ts,time.time())
-                    if exact:
-                        _,expiry_price=exact
-                        STATE["candles"][s.pair]=normalized
-                        expiry_source="candle-closed:exact-entry-minute"
-                        break
-        except Exception as e:
-            log.warning("RESULT_CANDLE_READ_FAILED pair=%s attempt=%d type=%s message=%s",
-                        s.pair,attempt,type(e).__name__,str(e)[:120])
-        if attempt<4:
-            await asyncio.sleep(0.5)
-
-    if expiry_price is None:
-        # Do not recurse: repeated closed-candle misses must not build an
-        # unbounded Python call chain. Retry iteratively for a short bounded window.
-        retry_deadline=time.time()+20.0
-        while expiry_price is None and time.time()<retry_deadline and key in BRAIN.active_signals:
-            await asyncio.sleep(1.0)
-            client=CLIENT
-            for attempt in range(1,5):
-                try:
-                    if client and getattr(client.connection,"is_connected",False):
-                        raw=await asyncio.wait_for(
-                            client.market.get_candles(s.pair,size=60,count=60),
-                            timeout=2.0
-                        )
-                        normalized=[]
-                        if isinstance(raw,list):
-                            for item in raw:
-                                if isinstance(item,dict) and isinstance(item.get("candles"),list):
-                                    normalized.extend(x for x in item["candles"] if isinstance(x,dict))
-                                elif isinstance(item,dict) and any(k in item for k in ("open","o","high","h","low","l","close","c")):
-                                    normalized.append(item)
-                        if normalized:
-                            try:normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
-                            except Exception:pass
-                            exact=_exact_expiry_candle(normalized,s.entry_ts,time.time())
-                            if exact:
-                                _,expiry_price=exact
-                                STATE["candles"][s.pair]=normalized
-                                expiry_source="candle-closed:exact-entry-minute"
-                                break
-                except Exception as e:
-                    log.warning("RESULT_CANDLE_RETRY_FAILED pair=%s attempt=%d type=%s message=%s",
-                                s.pair,attempt,type(e).__name__,str(e)[:120])
-                if expiry_price is not None or attempt>=4:
-                    break
-        if expiry_price is None:
-            log.warning(
-                "RESULT_PENDING_NO_CLOSED_CANDLE_FINAL pair=%s entry=%s durable_watch=%s "
-                "reason=bounded_retry_exhausted",
-                s.pair,s.entry_price,watch_id
-            )
-            await mark_result_watch_error(watch_id,"no_closed_candle_bounded_retry")
-            BRAIN.active_signals.pop(key,None)
-            return
-
-    rec=BRAIN.finish_signal(key,expiry_price)
-
-    # Result classification is complete. Never block result delivery on an external
-    # AI provider; enqueue the full evidence for durable History-AI processing.
-    review_id=f"{rec['cycle_id']}:{rec['pair']}:{rec['entry_ts']}"
-    await enqueue_ai_review(review_id,rec)
-    await save_persistent_learning()
-    # 10-signal learning summaries are intentionally silent. Internal learning
-    # continues unchanged; only the post-admin 100-Telegram-signal evaluation
-    # produces a user-facing report.
-    BRAIN.consume_batch_summary()
-    telegram_eval_report=rec.get("telegram_eval_report")
-    if telegram_eval_report:
-        log.info(
-            "TELEGRAM_100_SIGNAL_EVALUATION_COMPLETE signals=%s wins=%s losses=%s ties=%s "
-            "continue_wins=%s continue_losses=%s win_rate=%s%%",
-            telegram_eval_report.get("signals"),telegram_eval_report.get("wins"),
-            telegram_eval_report.get("losses"),telegram_eval_report.get("ties"),
-            telegram_eval_report.get("continue_wins"),telegram_eval_report.get("continue_losses"),
-            telegram_eval_report.get("win_rate")
+    if accepted_trade:
+        trade_id=str(accepted_trade.get("trade_id") or "")
+        if trade_id:
+            STATE.setdefault("broker_trade_assignments",{})[trade_id]=watch_id
+        s.broker_trade_id=trade_id
+        s.broker_trade_open_ts=(
+            float(accepted_trade.get("open_ts"))
+            if accepted_trade.get("open_ts") is not None
+            else float(accepted_trade.get("event_ts") or accepted_trade.get("received_at") or s.entry_ts)
         )
-        await telegram(
-            "🏁 TELEGRAM SIGNAL EVALUATION — 100 COMPLETE\\n\\n"
-            f"🔢 Signals → {telegram_eval_report.get('signals',0)}/100\\n"
-            f"✅ WIN → {telegram_eval_report.get('wins',0)}\\n"
-            f"❌ LOSS → {telegram_eval_report.get('losses',0)}\\n"
-            f"➡️ Continue WIN → {telegram_eval_report.get('continue_wins',0)}\\n"
-            f"➡️ Continue LOSS → {telegram_eval_report.get('continue_losses',0)}\\n"
-            f"🟡 TIE → {telegram_eval_report.get('ties',0)}\\n"
-            f"🎯 Win Rate → {telegram_eval_report.get('win_rate',0):.2f}%\\n\\n"
-            "📌 Count source → successfully delivered Telegram signals only\\n"
-            "🚫 DEMO trades / old signals / 10-signal updates are excluded.",
-            chat_id=STATE.get("telegram_chat_id") or None
+        s.broker_trade_open_price=accepted_trade.get("open_price")
+        s.broker_trade_status=str(accepted_trade.get("status") or "")
+        s.broker_trade_profit=accepted_trade.get("profit")
+        s.broker_trade_source="broker_event22" if int(accepted_trade.get("event") or 0)==22 else "broker_event26"
+
+        # The actual broker opening quote supersedes the signal reference for
+        # the matched manual trade result.
+        if accepted_trade.get("open_price") is not None:
+            s.entry_price=float(accepted_trade["open_price"])
+            s.actual_entry_captured=True
+            s.actual_entry_source="broker_event22"
+
+            # A very large quote-scale mismatch is not guessed away. Quarantine
+            # the pair so future signals cannot be generated from a potentially
+            # mis-mapped instrument feed until the mapping is revalidated.
+            try:
+                ratio=max(
+                    float(accepted_trade["open_price"])/max(signal_reference,1e-12),
+                    signal_reference/max(float(accepted_trade["open_price"]),1e-12)
+                )
+            except (TypeError,ValueError,ZeroDivisionError):
+                ratio=1.0
+            if ratio>=BROKER_PRICE_SCALE_MISMATCH_RATIO:
+                reason="broker_trade_quote_scale_mismatch"
+                _quarantine_asset_in_memory(
+                    s.pair,reason,signal_reference,
+                    float(accepted_trade["open_price"]),ratio
+                )
+                asyncio.create_task(
+                    persist_asset_integrity_quarantine(
+                        s.pair,reason,signal_reference,
+                        float(accepted_trade["open_price"]),ratio
+                    )
+                )
+
+        await _persist_result_watch_snapshot(watch_id,s)
+        log.info(
+            "BROKER_TRADE_MATCHED cycle=%s pair=%s trade_id=%s event=%s "
+            "signal_reference=%s broker_open=%s broker_open_ts=%s source=%s",
+            s.cycle_id,s.pair,s.broker_trade_id,accepted_trade.get("event"),
+            signal_reference,s.broker_trade_open_price,s.broker_trade_open_ts,
+            s.broker_trade_source
         )
     else:
-        snap=BRAIN.telegram_eval_snapshot()
-        if snap.get("active") and rec.get("telegram_eval_counted"):
-            log.info(
-                "TELEGRAM_EVALUATION_PROGRESS signals=%s/100 wins=%s losses=%s ties=%s "
-                "continue_wins=%s continue_losses=%s win_rate=%s%%",
-                snap.get("signals"),snap.get("wins"),snap.get("losses"),snap.get("ties"),
-                snap.get("continue_wins"),snap.get("continue_losses"),snap.get("win_rate")
+        # No actual user trade matched. Preserve the signal reference; this path
+        # is a signal-outcome measurement, not a claim about a user's manual trade.
+        s.entry_price=signal_reference
+        log.info(
+            "BROKER_TRADE_NOT_MATCHED cycle=%s pair=%s signal_reference=%s "
+            "window_after=%.1fs fallback=signal_market_outcome",
+            s.cycle_id,s.pair,signal_reference,RESULT_TRADE_MATCH_AFTER
+        )
+
+    actual_entry_ts=float(
+        s.broker_trade_open_ts
+        if getattr(s,"broker_trade_id","")
+        and getattr(s,"broker_trade_open_ts",None) is not None
+        else s.entry_ts
+    )
+    expiry_at=actual_entry_ts+float(s.expiry_minutes*60)
+    await asyncio.sleep(max(0,expiry_at-time.time()))
+
+    if getattr(s,"broker_trade_id",""):
+        # For a matched broker trade, Event-26 is the only authoritative final
+        # result. Never replace a missing broker close with a market candle.
+        close_deadline=time.time()+RESULT_BROKER_CLOSE_WAIT
+        close_event=None
+        while time.time()<close_deadline:
+            close_event=_find_broker_trade_for_signal(s,26)
+            if close_event:
+                break
+            await asyncio.sleep(0.50)
+
+        if not close_event:
+            log.warning(
+                "RESULT_PENDING_BROKER_CLOSE_FINAL cycle=%s pair=%s trade_id=%s "
+                "reason=event26_not_received_bounded_wait",
+                s.cycle_id,s.pair,s.broker_trade_id
             )
+            await mark_result_watch_error(watch_id,"broker_event26_not_received")
+            await _persist_result_watch_snapshot(watch_id,s)
+            return
+
+        close_price=close_event.get("close_price")
+        explicit_result=_trade_result_from_record(close_event)
+        if close_price is None and explicit_result is None:
+            log.warning(
+                "RESULT_PENDING_BROKER_CLOSE_DATA cycle=%s pair=%s trade_id=%s "
+                "reason=no_close_quote_or_final_status",
+                s.cycle_id,s.pair,s.broker_trade_id
+            )
+            await mark_result_watch_error(watch_id,"broker_event26_missing_result_fields")
+            await _persist_result_watch_snapshot(watch_id,s)
+            return
+
+        if close_price is None:
+            # Override is authoritative when the broker's final event explicitly
+            # reports WIN/LOSS/TIE through status or balance change.
+            close_price=float(s.entry_price)
+        else:
+            close_price=float(close_price)
+
+        s.broker_trade_close_price=close_price
+        s.broker_trade_status=str(close_event.get("status") or s.broker_trade_status or "")
+        s.broker_trade_profit=close_event.get("profit") if close_event.get("profit") is not None else s.broker_trade_profit
+        s.broker_trade_source="broker_event26"
+
+        rec=BRAIN.finish_signal(
+            key,close_price,
+            result_ts=(
+                float(close_event.get("close_ts"))
+                if close_event.get("close_ts") is not None
+                else time.time()
+            ),
+            result_source="broker_event26",
+            broker_trade_id=s.broker_trade_id,
+            broker_status=s.broker_trade_status,
+            broker_profit=s.broker_trade_profit,
+            result_override=explicit_result,
+        )
+        await enqueue_ai_review(
+            f"{rec['cycle_id']}:{rec['pair']}:{rec['entry_ts']}",rec
+        )
+        await save_persistent_learning()
+        BRAIN.consume_batch_summary()
+        log.info(
+            "RESULT_BROKER_AUTHORITY pair=%s trade_id=%s result=%s "
+            "open=%s close=%s profit=%s status=%s source=broker_event26",
+            rec["pair"],rec.get("broker_trade_id"),rec["result"],
+            rec["entry_price"],rec["exit_price"],
+            rec.get("broker_trade_profit"),rec.get("broker_trade_status")
+        )
+    else:
+        # No user trade was matched: measure the signal itself with the exact
+        # broker-market candle that starts at the signal entry boundary.
+        expiry_price=None
+        expiry_source=""
+        client=CLIENT
+        candle_deadline=time.time()+60.0
+        while expiry_price is None and time.time()<candle_deadline:
+            try:
+                if client and getattr(client.connection,"is_connected",False):
+                    raw=await asyncio.wait_for(
+                        client.market.get_candles(s.pair,size=60,count=60),
+                        timeout=2.0
+                    )
+                    normalized=[]
+                    if isinstance(raw,list):
+                        for item in raw:
+                            if isinstance(item,dict) and isinstance(item.get("candles"),list):
+                                normalized.extend(x for x in item["candles"] if isinstance(x,dict))
+                            elif isinstance(item,dict) and any(
+                                k in item for k in ("open","o","high","h","low","l","close","c")
+                            ):
+                                normalized.append(item)
+                    if normalized:
+                        try:
+                            normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
+                        except Exception:
+                            pass
+                        exact=_exact_expiry_candle(normalized,s.entry_ts,time.time())
+                        if exact:
+                            _,expiry_price=exact
+                            STATE["candles"][s.pair]=normalized
+                            expiry_source="signal-market:candle-closed:exact-entry-minute"
+                            break
+            except Exception as e:
+                log.warning(
+                    "RESULT_SIGNAL_CANDLE_READ_FAILED pair=%s type=%s message=%s",
+                    s.pair,type(e).__name__,str(e)[:120]
+                )
+            await asyncio.sleep(0.75)
+
+        if expiry_price is None:
+            log.warning(
+                "RESULT_PENDING_NO_CLOSED_CANDLE_FINAL cycle=%s pair=%s "
+                "reason=signal_market_candle_unavailable",
+                s.cycle_id,s.pair
+            )
+            await mark_result_watch_error(watch_id,"signal_market_candle_unavailable")
+            return
+
+        rec=BRAIN.finish_signal(
+            key,expiry_price,
+            result_ts=time.time(),
+            result_source=expiry_source,
+            broker_trade_id="",
+            broker_status="",
+            broker_profit=None,
+        )
+        await enqueue_ai_review(
+            f"{rec['cycle_id']}:{rec['pair']}:{rec['entry_ts']}",rec
+        )
+        await save_persistent_learning()
+        BRAIN.consume_batch_summary()
+        log.info(
+            "RESULT_SIGNAL_MARKET_OUTCOME pair=%s result=%s entry=%s exit=%s source=%s",
+            rec["pair"],rec["result"],rec["entry_price"],rec["exit_price"],expiry_source
+        )
+
+    # User-facing result notification is deliberately generated only after the
+    # authoritative broker result or the explicit no-user-trade signal outcome.
     label=rec["display_name"]
     direction_icon="🟢" if rec["direction"]=="UP" else "🔴"
     result_icon={"WIN":"✅","LOSS":"❌","TIE":"🟡"}[rec["result"]]
@@ -4134,32 +4202,53 @@ async def result_watch(key):
     structure_label=(
         "ABOVE AVWAP + POC" if "ABOVE_AVWAP_POC" in structure
         else "BELOW AVWAP + POC" if "BELOW_AVWAP_POC" in structure
+        else "PRO OTC STRUCTURE CONTINUATION" if "PRO_OTC_STRUCTURE" in structure
         else "—"
+    )
+    is_otc=str(rec.get("strategy") or "").upper()==OTC_STRATEGY
+    engine_label="PRO OTC STRUCTURE CONTINUATION" if is_otc else "AVWAP + VOLUME PROFILE"
+    verification_label=(
+        "BROKER EVENT 26 • ACTUAL DEMO TRADE" if rec.get("result_source")=="broker_event26"
+        else "candle-closed • signal market outcome"
+    )
+    trade_line=(
+        f"🆔 Trade ID → <code>{rec.get('broker_trade_id')}</code>\n"
+        if rec.get("broker_trade_id") else ""
     )
     await telegram(
         "📊 <b>CANDICE RESULT</b>\n"
         "\n"
         f"📈 <b>{label}</b>\n"
         f"{direction_icon} <b>{rec['direction']}</b>  •  <b>{rec['expiry_minutes']} MIN</b>\n"
+        f"{trade_line}"
         f"💰 Entry → <code>{rec['entry_price']}</code>\n"
         f"🏁 Exit → <code>{rec['exit_price']}</code>\n"
         f"{result_icon} <b>{rec['result']}</b>\n"
         "\n"
         f"📈 15M Bias → <b>{trend_label}</b>\n"
-        f"🕯️ 1M Close → <b>{structure_label}</b>\n"
-        "📐 Engine → <b>AVWAP + VOLUME PROFILE</b>\n"
+        f"🕯️ 1M Structure → <b>{structure_label}</b>\n"
+        f"📐 Engine → <b>{engine_label}</b>\n"
         f"🎯 Confidence → <b>{rec['confidence']}%</b>\n"
-        f"🔎 Verification → <b>candle-closed</b>\n\n"
+        f"🔎 Verification → <b>{verification_label}</b>\n\n"
         "🟣 <b>DEMO • MANUAL ENTRY</b>\n"
         "🤖 <b>CANDICE BRAIN • LIVE</b>"
     )
-    await complete_result_watch(watch_id)
+    if rec.get("result_source")=="broker_event26":
+        await complete_result_watch(watch_id)
+    else:
+        await complete_result_watch(watch_id)
     log.info(
-        "RESULT pair=%s result=%s strategy=%s self_strategy=%s self_version=%s confidence=%s trend=%s structure=%s pattern=%s expiry=%s entry=%s exit=%s source=%s cooldown=%s",
-        rec["pair"],rec["result"],rec["strategy"],rec.get("self_strategy",""),rec.get("self_strategy_version",""),rec["confidence"],rec["trend_15m"],
-        rec["structure_1m"],rec["pattern"],rec["expiry_minutes"],rec["entry_price"],rec["exit_price"],
-        expiry_source,rec["result"]=="LOSS"
+        "RESULT pair=%s result=%s strategy=%s self_strategy=%s self_version=%s confidence=%s "
+        "trend=%s structure=%s pattern=%s expiry=%s entry=%s exit=%s source=%s "
+        "broker_trade_id=%s broker_profit=%s broker_status=%s signal_reference=%s",
+        rec["pair"],rec["result"],rec["strategy"],rec.get("self_strategy",""),
+        rec.get("self_strategy_version",""),rec["confidence"],rec["trend_15m"],
+        rec["structure_1m"],rec["pattern"],rec["expiry_minutes"],rec["entry_price"],
+        rec["exit_price"],rec.get("result_source",""),rec.get("broker_trade_id",""),
+        rec.get("broker_trade_profit"),rec.get("broker_trade_status"),
+        rec.get("signal_reference_price")
     )
+
 
 async def cycle_loop():
     # Fast 3-minute signal scheduler, active 24/7.
@@ -4493,7 +4582,7 @@ async def cycle_loop():
                 account_id=STATE.get("account_id"),
                 pair=p,display_name=candidate["display_name"],
                 direction=candidate["direction"],expiry_minutes=signal_expiry,
-                entry_price=entry,entry_ts=target,
+                entry_price=entry,signal_reference_price=entry,entry_ts=target,
                 entry_candle_ts=candidate["entry_candle_ts"],
                 strategy=candidate["strategy"],reason=candidate["reason"],confidence=confidence,
                 pattern=str(candidate.get("pattern") or ""),
@@ -5915,6 +6004,411 @@ async def audit_outbound_network():
             raise
         return ""
 
+def _coerce_event_epoch(value, fallback=None):
+    if value is None:
+        return fallback
+    if isinstance(value, (int,float)):
+        try:
+            x=float(value)
+            if x>20_000_000_000:
+                x/=1000.0
+            return x if isfinite(x) else fallback
+        except (TypeError,ValueError):
+            return fallback
+    if isinstance(value,str):
+        s=value.strip()
+        if not s:
+            return fallback
+        try:
+            x=float(s)
+            if x>20_000_000_000:
+                x/=1000.0
+            return x if isfinite(x) else fallback
+        except (TypeError,ValueError):
+            pass
+        try:
+            return datetime.fromisoformat(s.replace("Z","+00:00")).timestamp()
+        except Exception:
+            return fallback
+    return fallback
+
+
+def _trade_pair_from_item(item):
+    if not isinstance(item,dict):
+        return ""
+    for key in ("pair","p","symbol","instrument"):
+        value=item.get(key)
+        if isinstance(value,str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _trade_direction_from_item(item):
+    if not isinstance(item,dict):
+        return ""
+    value=item.get("direction",item.get("dir"))
+    if isinstance(value,str):
+        v=value.strip().upper()
+        if v in {"UP","DOWN"}:
+            return v
+    if isinstance(value,(int,float)):
+        try:
+            iv=int(value)
+            if iv==1:return "UP"
+            if iv==-1:return "DOWN"
+        except (TypeError,ValueError):
+            pass
+    return ""
+
+
+def _trade_price_from_item(item,keys):
+    if not isinstance(item,dict):
+        return None
+    for key in keys:
+        value=item.get(key)
+        if value is None:
+            continue
+        try:
+            x=float(value)
+            if isfinite(x) and x>0:
+                return x
+        except (TypeError,ValueError):
+            continue
+    return None
+
+
+def _trade_profit_from_item(item):
+    if not isinstance(item,dict):
+        return None
+    for key in ("balance_change","balanceChange","profit","pnl","balance_change_amount","interim_balance_change"):
+        value=item.get(key)
+        if value is None:
+            continue
+        try:
+            x=float(value)
+            if isfinite(x):
+                return x
+        except (TypeError,ValueError):
+            continue
+    return None
+
+
+def _trade_status_from_item(item):
+    if not isinstance(item,dict):
+        return ""
+    for key in ("status","state","result","trade_result","interim_status"):
+        value=item.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip().upper()
+    return ""
+
+
+def _trade_event_record(item,event_code,received_at=None):
+    received=float(time.time() if received_at is None else received_at)
+    event=int(event_code) if event_code is not None else 0
+    trade_id=str(
+        item.get("id")
+        or item.get("trade_id")
+        or item.get("order_id")
+        or item.get("orderId")
+        or ""
+    ).strip() if isinstance(item,dict) else ""
+    if not trade_id:
+        return None
+
+    pair=_trade_pair_from_item(item)
+    direction=_trade_direction_from_item(item)
+    account_id=item.get("account_id",item.get("accountId"))
+    try:
+        account_id=int(account_id) if account_id is not None else None
+    except (TypeError,ValueError):
+        account_id=None
+
+    open_price=_trade_price_from_item(
+        item,(
+            "curs_open","open_price","openPrice","open_quote","openQuote",
+            "opening_quote","openingQuote","open_rate","opening_rate"
+        )
+    )
+    # The public API reference example identifies curs_close and balance_change
+    # on final Event-26 records; keep the broader aliases for broker variants.
+    close_price=_trade_price_from_item(
+        item,(
+            "curs_close","close_price","closePrice","close_quote","closeQuote",
+            "closing_quote","closingQuote","expiry_price","expiryPrice"
+        )
+    )
+    open_ts=_coerce_event_epoch(
+        item.get("open_time",item.get("opened_at",item.get("created_at",item.get("open_ts")))),
+        None
+    )
+    close_ts=_coerce_event_epoch(
+        item.get("close_time",item.get("closed_at",item.get("close_ts"))),
+        None
+    )
+    event_ts=_coerce_event_epoch(
+        item.get("timestamp",item.get("time",item.get("t"))),
+        received
+    )
+    status=_trade_status_from_item(item)
+    profit=_trade_profit_from_item(item)
+
+    return {
+        "trade_id":trade_id,
+        "event":event,
+        "pair":pair,
+        "direction":direction,
+        "account_id":account_id,
+        "open_price":open_price,
+        "close_price":close_price,
+        "open_ts":open_ts,
+        "close_ts":close_ts,
+        "event_ts":event_ts,
+        "received_at":received,
+        "status":status,
+        "profit":profit,
+    }
+
+
+def _trade_result_from_record(rec):
+    if not isinstance(rec,dict):
+        return None
+    status=str(rec.get("status") or "").upper()
+    if any(x in status for x in ("WIN","WON","PROFIT","SUCCESS")):
+        return "WIN"
+    if any(x in status for x in ("LOSS","LOST","FAIL")):
+        return "LOSS"
+    if any(x in status for x in ("TIE","DRAW","EQUAL")):
+        return "TIE"
+    profit=rec.get("profit")
+    try:
+        if profit is not None:
+            p=float(profit)
+            if p>0:return "WIN"
+            if p<0:return "LOSS"
+            if p==0:return "TIE"
+    except (TypeError,ValueError):
+        pass
+    return None
+
+
+def _broker_trade_matches_signal(signal,event,accepted=False):
+    if not signal or not isinstance(event,dict):
+        return False
+    pair=str(event.get("pair") or "")
+    if pair and pair!=str(signal.pair):
+        return False
+    direction=str(event.get("direction") or "").upper()
+    if direction and direction!=str(signal.direction).upper():
+        return False
+
+    event_account=event.get("account_id")
+    signal_account=getattr(signal,"account_id",None)
+    if event_account is not None and signal_account is not None:
+        try:
+            if int(event_account)!=int(signal_account):
+                return False
+        except (TypeError,ValueError):
+            return False
+
+    trade_id=str(event.get("trade_id") or "")
+    key=f"{signal.cycle_id}:{signal.pair}:{signal.entry_ts}"
+    assigned_to=STATE.get("broker_trade_assignments",{}).get(trade_id)
+    if trade_id and assigned_to and assigned_to!=key:
+        return False
+
+    target=float(signal.entry_ts)
+    if accepted:
+        ts=event.get("open_ts") or event.get("event_ts") or event.get("received_at")
+        try:
+            delta=float(ts)-target
+        except (TypeError,ValueError):
+            delta=9999.0
+        return -float(RESULT_TRADE_MATCH_BEFORE) <= delta <= float(RESULT_TRADE_MATCH_AFTER)
+    if trade_id and str(getattr(signal,"broker_trade_id","") or "")==trade_id:
+        return True
+
+    ts=event.get("close_ts") or event.get("event_ts") or event.get("received_at")
+    try:
+        delta=float(ts)-target
+    except (TypeError,ValueError):
+        delta=9999.0
+    return -float(RESULT_TRADE_MATCH_BEFORE) <= delta <= (float(RESULT_TRADE_MATCH_AFTER)+float(RESULT_BROKER_CLOSE_WAIT))
+
+
+def _find_broker_trade_for_signal(signal,event_code):
+    events=list(STATE.get("broker_trade_events") or [])
+    accepted=int(event_code)==22
+    best=None
+    best_key=None
+    for event in reversed(events):
+        if int(event.get("event") or 0)!=int(event_code):
+            continue
+        if not _broker_trade_matches_signal(signal,event,accepted=accepted):
+            continue
+        if accepted:
+            ts=event.get("open_ts") or event.get("event_ts") or event.get("received_at")
+        else:
+            ts=event.get("close_ts") or event.get("event_ts") or event.get("received_at")
+        try:
+            delta=abs(float(ts)-float(signal.entry_ts))
+        except (TypeError,ValueError):
+            delta=999999.0
+        priority=0 if (not accepted and str(getattr(signal,"broker_trade_id","") or "")==str(event.get("trade_id") or "")) else 1
+        key=(priority,delta,-float(event.get("received_at") or 0.0))
+        if best is None or key<best_key:
+            best=event
+            best_key=key
+    return best
+
+
+def _record_broker_trade_event(event_record):
+    if not event_record:
+        return
+    events=list(STATE.setdefault("broker_trade_events",[]))
+    trade_id=str(event_record.get("trade_id") or "")
+    event_code=int(event_record.get("event") or 0)
+    # Replace a previous record for the same trade/event with the newest payload.
+    events=[e for e in events if not (
+        str(e.get("trade_id") or "")==trade_id
+        and int(e.get("event") or 0)==event_code
+    )]
+    events.append(event_record)
+    events.sort(key=lambda e:float(e.get("received_at") or 0.0))
+    STATE["broker_trade_events"]=events[-200:]
+
+
+async def _persist_result_watch_snapshot(watch_id,signal):
+    if not LEARNING_DB_URL:
+        return False
+    try:
+        import psycopg
+        payload=json.dumps(_result_watch_payload(signal),separators=(",",":"),ensure_ascii=False,default=str)
+        def put():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO candice_result_watch_queue(watch_id,record,status,last_error,updated_at)
+                        VALUES(%s,%s::jsonb,'PROCESSING',NULL,NOW())
+                        ON CONFLICT(watch_id) DO UPDATE
+                        SET record=EXCLUDED.record,
+                            status='PROCESSING',
+                            last_error=NULL,
+                            updated_at=NOW()
+                    """,(watch_id,payload))
+                db.commit()
+        await asyncio.to_thread(put)
+        return True
+    except Exception as e:
+        log.warning("RESULT_WATCH_SNAPSHOT_UPDATE_FAILED watch_id=%s type=%s message=%s",
+                    watch_id,type(e).__name__,str(e)[:160])
+        return False
+
+
+def _asset_integrity_blocked(pair):
+    return bool(STATE.get("asset_integrity_blocks",{}).get(str(pair)))
+
+
+def _quarantine_asset_in_memory(pair,reason,signal_price=None,broker_price=None,ratio=None):
+    p=str(pair or "")
+    if not p:
+        return
+    STATE.setdefault("asset_integrity_blocks",{})[p]={
+        "reason":str(reason),
+        "signal_price":signal_price,
+        "broker_price":broker_price,
+        "ratio":ratio,
+        "blocked_at":time.time(),
+    }
+    for asset in STATE.get("assets") or []:
+        if str(asset.get("pair") or "")==p:
+            asset["signal_eligible"]=False
+            asset["asset_integrity_blocked"]=True
+            asset["asset_integrity_reason"]=str(reason)
+    STATE.get("analyses",{}).pop(p,None)
+    log.error(
+        "ASSET_INTEGRITY_QUARANTINED pair=%s reason=%s signal_price=%s broker_price=%s ratio=%s",
+        p,reason,signal_price,broker_price,ratio
+    )
+
+
+async def persist_asset_integrity_quarantine(pair,reason,signal_price,broker_price,ratio):
+    if not LEARNING_DB_URL:
+        return False
+    try:
+        import psycopg
+        def put():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candice_asset_integrity_quarantine (
+                            pair TEXT PRIMARY KEY,
+                            reason TEXT NOT NULL,
+                            signal_price DOUBLE PRECISION,
+                            broker_price DOUBLE PRECISION,
+                            ratio DOUBLE PRECISION,
+                            active BOOLEAN NOT NULL DEFAULT TRUE,
+                            observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                    """)
+                    cur.execute("""
+                        INSERT INTO candice_asset_integrity_quarantine(
+                            pair,reason,signal_price,broker_price,ratio,active,observed_at
+                        )
+                        VALUES(%s,%s,%s,%s,%s,TRUE,NOW())
+                        ON CONFLICT(pair) DO UPDATE SET
+                            reason=EXCLUDED.reason,
+                            signal_price=EXCLUDED.signal_price,
+                            broker_price=EXCLUDED.broker_price,
+                            ratio=EXCLUDED.ratio,
+                            active=TRUE,
+                            observed_at=NOW()
+                    """,(pair,reason,signal_price,broker_price,ratio))
+                db.commit()
+        await asyncio.to_thread(put)
+        return True
+    except Exception as e:
+        log.warning("ASSET_INTEGRITY_QUARANTINE_SAVE_FAILED pair=%s type=%s message=%s",
+                    pair,type(e).__name__,str(e)[:160])
+        return False
+
+
+async def load_asset_integrity_quarantine():
+    if not LEARNING_DB_URL:
+        return 0
+    try:
+        import psycopg
+        def read():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candice_asset_integrity_quarantine (
+                            pair TEXT PRIMARY KEY,
+                            reason TEXT NOT NULL,
+                            signal_price DOUBLE PRECISION,
+                            broker_price DOUBLE PRECISION,
+                            ratio DOUBLE PRECISION,
+                            active BOOLEAN NOT NULL DEFAULT TRUE,
+                            observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                    """)
+                    cur.execute("""
+                        SELECT pair,reason,signal_price,broker_price,ratio
+                        FROM candice_asset_integrity_quarantine
+                        WHERE active=TRUE
+                    """)
+                    return cur.fetchall()
+        rows=await asyncio.to_thread(read)
+        for pair,reason,signal_price,broker_price,ratio in rows:
+            _quarantine_asset_in_memory(pair,reason,signal_price,broker_price,ratio)
+        log.info("ASSET_INTEGRITY_QUARANTINE_LOADED active=%d",len(rows))
+        return len(rows)
+    except Exception as e:
+        log.warning("ASSET_INTEGRITY_QUARANTINE_LOAD_FAILED type=%s message=%s",
+                    type(e).__name__,str(e)[:160])
+        return 0
+
+
 async def _account_trade_record(item,event_code=None,source="broker_event"):
     """Normalize broker order/position payloads for read-only live visibility."""
     if not isinstance(item,dict):
@@ -5950,19 +6444,40 @@ async def _account_trade_record(item,event_code=None,source="broker_event"):
     return rec
 
 async def on_account_trade_update(message):
-    """Capture unsolicited order/position lifecycle events without placing trades."""
+    """Capture broker lifecycle events and keep a normalized reconciliation ledger."""
     try:
         event_code=message.get("e") if isinstance(message,dict) else None
         payload=message.get("d") if isinstance(message,dict) else None
         items=payload if isinstance(payload,list) else [payload]
         added=0
+        normalized_count=0
         for item in items:
-            if isinstance(item,dict) and await _account_trade_record(item,event_code,"broker_event"):
+            if not isinstance(item,dict):
+                continue
+            if await _account_trade_record(item,event_code,"broker_event"):
                 added+=1
-        if added:
+            rec=_trade_event_record(item,event_code)
+            if rec:
+                _record_broker_trade_event(rec)
+                normalized_count+=1
+                if int(event_code or 0)==22:
+                    log.info(
+                        "BROKER_TRADE_ACCEPTED_LIVE trade_id=%s pair=%s direction=%s open=%s open_ts=%s status=%s",
+                        rec["trade_id"],rec["pair"] or "UNKNOWN",rec["direction"] or "UNKNOWN",
+                        rec["open_price"],rec["open_ts"],rec["status"] or "UNKNOWN"
+                    )
+                elif int(event_code or 0)==26:
+                    log.info(
+                        "BROKER_TRADE_CLOSED_LIVE trade_id=%s pair=%s direction=%s open=%s close=%s profit=%s status=%s close_ts=%s",
+                        rec["trade_id"],rec["pair"] or "UNKNOWN",rec["direction"] or "UNKNOWN",
+                        rec["open_price"],rec["close_price"],rec["profit"],
+                        rec["status"] or "UNKNOWN",rec["close_ts"]
+                    )
+        if added or normalized_count:
             log.info(
-                "ACCOUNT_ORDER_EVENT_LIVE event=%s records=%s live_orders=%s",
-                event_code,added,len(STATE.get("live_orders") or {})
+                "ACCOUNT_ORDER_EVENT_LIVE event=%s records=%s normalized=%s live_orders=%s broker_events=%s",
+                event_code,added,normalized_count,len(STATE.get("live_orders") or {}),
+                len(STATE.get("broker_trade_events") or {})
             )
     except Exception as e:
         log.warning(
@@ -6750,6 +7265,7 @@ async def main():
     await load_persistent_learning()
     await ensure_ai_review_queue_table()
     await ensure_result_watch_queue_table()
+    await load_asset_integrity_quarantine()
     await ensure_cycle_state_table()
     await ensure_access_table()
     await ensure_tick_volume_table()
