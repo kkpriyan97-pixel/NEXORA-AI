@@ -1043,9 +1043,15 @@ TICK_HISTORY=defaultdict(lambda: deque(maxlen=720))
 # it is never labelled as traded/notional volume.
 VOLUME_M1_CACHE=defaultdict(dict)
 VOLUME_PENDING=defaultdict(dict)
+# Persisted positive volume from the original candle is reused when a later
+# broker refresh returns zero for that same M1 timestamp.
+VOLUME_HISTORY_CACHE=defaultdict(dict)
+VOLUME_HISTORY_PENDING=defaultdict(dict)
 VOLUME_DB_WRITE_LOCK=asyncio.Lock()
 VOLUME_DB_FLUSH_IN_PROGRESS=False
+VOLUME_HISTORY_FLUSH_IN_PROGRESS=False
 VOLUME_LAST_FLUSH_AT=0.0
+VOLUME_HISTORY_LAST_FLUSH_AT=0.0
 VOLUME_LOOKBACK_MINUTES=max(180,min(1440,int(os.getenv("VOLUME_LOOKBACK_MINUTES","720") or 720)))
 VOLUME_FLUSH_INTERVAL=max(2.0,min(15.0,float(os.getenv("VOLUME_FLUSH_INTERVAL","5") or 5)))
 
@@ -2018,6 +2024,24 @@ async def ensure_tick_volume_table():
                         DELETE FROM candice_m1_tick_volume
                         WHERE minute_ts < EXTRACT(EPOCH FROM NOW())::BIGINT - %s
                     """,(VOLUME_LOOKBACK_MINUTES*60,))
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candice_m1_volume_history (
+                            pair TEXT NOT NULL,
+                            minute_ts BIGINT NOT NULL,
+                            volume DOUBLE PRECISION NOT NULL,
+                            volume_source TEXT NOT NULL,
+                            recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            PRIMARY KEY(pair,minute_ts)
+                        )
+                    """)
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_candice_m1_volume_history_recent
+                        ON candice_m1_volume_history(minute_ts)
+                    """)
+                    cur.execute("""
+                        DELETE FROM candice_m1_volume_history
+                        WHERE minute_ts < EXTRACT(EPOCH FROM NOW())::BIGINT - %s
+                    """,(VOLUME_LOOKBACK_MINUTES*60,))
                 db.commit()
         await asyncio.to_thread(init)
         log.info("VOLUME_DB_READY table=candice_m1_tick_volume lookback_minutes=%d",VOLUME_LOOKBACK_MINUTES)
@@ -2025,6 +2049,108 @@ async def ensure_tick_volume_table():
     except Exception as e:
         log.error("VOLUME_DB_INIT_FAILED type=%s message=%s",type(e).__name__,str(e)[:180])
         return False
+
+async def load_persistent_historical_volume():
+    """Load positive historical volume keyed by its original M1 candle."""
+    if not LEARNING_DB_URL:
+        return 0
+    try:
+        import psycopg
+        cutoff=int(time.time())-VOLUME_LOOKBACK_MINUTES*60
+        def read():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        SELECT pair,minute_ts,volume,volume_source
+                        FROM candice_m1_volume_history
+                        WHERE minute_ts >= %s
+                        ORDER BY pair,minute_ts
+                    """,(cutoff,))
+                    return cur.fetchall()
+        rows=await asyncio.to_thread(read)
+        loaded=0
+        for pair,minute_ts,volume,source in rows:
+            try:v=float(volume or 0.0)
+            except (TypeError,ValueError):v=0.0
+            if v<=0.0:continue
+            VOLUME_HISTORY_CACHE[str(pair)][int(minute_ts)]={
+                "volume":v,
+                "source":str(source or "REAL_VOLUME").upper(),
+            }
+            loaded+=1
+        log.info("VOLUME_HISTORY_LOADED rows=%d pairs=%d lookback_minutes=%d",
+                 loaded,len(VOLUME_HISTORY_CACHE),VOLUME_LOOKBACK_MINUTES)
+        return loaded
+    except Exception as e:
+        log.warning("VOLUME_HISTORY_LOAD_FAILED type=%s message=%s",
+                    type(e).__name__,str(e)[:180])
+        return 0
+
+def _queue_historical_volume(pair,candles):
+    """Queue only positive source volume from closed/historical candles."""
+    p=str(pair or "")
+    if not p:return
+    for raw in candles or []:
+        if not isinstance(raw,dict):continue
+        ts=_candle_epoch(raw)
+        if ts is None:continue
+        value=0.0;source=""
+        for key in ("real_volume","realVolume","trade_volume","tradeVolume",
+                    "traded_volume","tradedVolume","base_volume","baseVolume",
+                    "quote_volume","quoteVolume","volume"):
+            try:v=float(raw.get(key,0) or 0.0)
+            except (TypeError,ValueError):v=0.0
+            if v>0.0:
+                value=v;source="REAL_VOLUME";break
+        if value<=0.0:
+            for key in ("tick_volume","tickVolume","ticks","tick_count","tickCount","vol"):
+                try:v=float(raw.get(key,0) or 0.0)
+                except (TypeError,ValueError):v=0.0
+                if v>0.0:
+                    value=v;source="TICK_VOLUME";break
+        if value>0.0 and source:
+            VOLUME_HISTORY_PENDING[p][int(ts//60)*60]={
+                "volume":value,"source":source
+            }
+
+def _apply_historical_volume(pair,candles):
+    """Reattach saved volume to the exact same M1 timestamp when broker returns zero."""
+    p=str(pair or "")
+    out=[];attached=0
+    for raw in candles or []:
+        if not isinstance(raw,dict):continue
+        item=dict(raw)
+        ts=_candle_epoch(item)
+        current=0.0
+        for key in ("real_volume","realVolume","trade_volume","tradeVolume",
+                    "traded_volume","tradedVolume","base_volume","baseVolume",
+                    "quote_volume","quoteVolume","volume",
+                    "tick_volume","tickVolume","ticks","tick_count","tickCount","vol"):
+            try:current=float(item.get(key,0) or 0.0)
+            except (TypeError,ValueError):current=0.0
+            if current>0.0:break
+        if current<=0.0 and ts is not None:
+            rec=VOLUME_HISTORY_CACHE.get(p,{}).get(int(ts//60)*60)
+            if rec and float(rec.get("volume",0.0) or 0.0)>0.0:
+                v=float(rec["volume"]);src=str(rec.get("source") or "REAL_VOLUME").upper()
+                if src=="TICK_VOLUME":item["tick_volume"]=v
+                else:item["volume"]=v
+                item["volume_source"]=src
+                item["historical_volume_attached"]=True
+                item["historical_volume_source"]=src
+                attached+=1
+        out.append(item)
+    last=float(STATE.get("_historical_volume_audit_at",0.0) or 0.0)
+    now=time.time()
+    if now-last>=60.0:
+        STATE["_historical_volume_audit_at"]=now
+        log.info("HISTORICAL_VOLUME_AUDIT pair=%s candles=%d attached=%d coverage=%.3f cache_minutes=%d source=persistent_same_candle_history",
+                 p,len(out),attached,attached/max(1,len(out)),len(VOLUME_HISTORY_CACHE.get(p,{})))
+    return out
+
+def _prepare_volume_candles(pair,candles):
+    # Same-candle saved volume has precedence over sparse partial Event-1 data.
+    return _apply_tick_activity_volume(pair,_apply_historical_volume(pair,candles))
 
 async def load_persistent_tick_volume():
     """Load recent observed-tick M1 history after a Render restart."""
@@ -2156,6 +2282,62 @@ async def flush_tick_volume_pending(force=False):
     finally:
         VOLUME_DB_FLUSH_IN_PROGRESS=False
 
+async def flush_historical_volume_pending(force=False):
+    global VOLUME_HISTORY_FLUSH_IN_PROGRESS,VOLUME_HISTORY_LAST_FLUSH_AT
+    if not LEARNING_DB_URL or VOLUME_HISTORY_FLUSH_IN_PROGRESS:
+        return False
+    now=time.time()
+    if not force and now-VOLUME_HISTORY_LAST_FLUSH_AT<5.0:
+        return False
+    if not any(VOLUME_HISTORY_PENDING.values()):
+        VOLUME_HISTORY_LAST_FLUSH_AT=now
+        return False
+    VOLUME_HISTORY_FLUSH_IN_PROGRESS=True
+    snapshot={p:{m:dict(v) for m,v in buckets.items()} for p,buckets in VOLUME_HISTORY_PENDING.items() if buckets}
+    try:
+        import psycopg
+        def put():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=5) as db:
+                with db.cursor() as cur:
+                    for pair,buckets in snapshot.items():
+                        for minute_ts,rec in buckets.items():
+                            cur.execute("""
+                                INSERT INTO candice_m1_volume_history(pair,minute_ts,volume,volume_source)
+                                VALUES(%s,%s,%s,%s)
+                                ON CONFLICT(pair,minute_ts) DO UPDATE SET
+                                    volume=EXCLUDED.volume,
+                                    volume_source=EXCLUDED.volume_source,
+                                    recorded_at=NOW()
+                            """,(pair,int(minute_ts),float(rec["volume"]),str(rec["source"])))
+                db.commit()
+        async with VOLUME_DB_WRITE_LOCK:
+            await asyncio.to_thread(put)
+        for pair,buckets in snapshot.items():
+            for minute_ts,rec in buckets.items():
+                VOLUME_HISTORY_CACHE[pair][int(minute_ts)]=dict(rec)
+                VOLUME_HISTORY_PENDING[pair].pop(int(minute_ts),None)
+            if not VOLUME_HISTORY_PENDING.get(pair):
+                VOLUME_HISTORY_PENDING.pop(pair,None)
+        VOLUME_HISTORY_LAST_FLUSH_AT=time.time()
+        log.info("HISTORICAL_VOLUME_PERSISTED pairs=%d buckets=%d source=same_candle_broker_history",
+                 len(snapshot),sum(len(v) for v in snapshot.values()))
+        return True
+    except Exception as e:
+        log.warning("HISTORICAL_VOLUME_PERSIST_FAILED type=%s message=%s pending_pairs=%d",
+                    type(e).__name__,str(e)[:180],len(snapshot))
+        return False
+    finally:
+        VOLUME_HISTORY_FLUSH_IN_PROGRESS=False
+
+async def _schedule_historical_volume_flush():
+    try:
+        await flush_historical_volume_pending()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.debug("HISTORICAL_VOLUME_FLUSH_TASK_FAILED type=%s message=%s",
+                  type(e).__name__,str(e)[:120])
+
 async def _schedule_tick_volume_flush():
     try:
         await flush_tick_volume_pending()
@@ -2195,6 +2377,8 @@ async def on_tick(message):
         # Postgres persistence is asynchronous and never awaited by the websocket callback.
         if not VOLUME_DB_FLUSH_IN_PROGRESS:
             asyncio.create_task(_schedule_tick_volume_flush(),name="volume_m1_flush")
+        if not VOLUME_HISTORY_FLUSH_IN_PROGRESS:
+            asyncio.create_task(_schedule_historical_volume_flush(),name="historical_volume_m1_flush")
         last_log=STATE.get("_tick_state_log_at",0.0)
         if received_at-last_log>=10.0:
             STATE["_tick_state_log_at"]=received_at
@@ -2420,6 +2604,10 @@ async def refresh_candles(force=False):
                         closed_at=_candle_closed_at(closed[-1]) if closed else None
                         age=(reference-closed_at) if closed_at is not None else None
                         if newest is not None and age is not None and 0 <= age <= 75.0 and len(closed)>=60:
+                            _queue_historical_volume(p,STATE["candles"].get(p,[]))
+                            _queue_historical_volume(p,normalized)
+                            if not VOLUME_HISTORY_FLUSH_IN_PROGRESS:
+                                asyncio.create_task(_schedule_historical_volume_flush(),name="historical_volume_refresh")
                             STATE["candles"][p]=normalized
                             CANDLE_FETCH_LAST[p]=time.time()
                             CANDLE_GOOD_ONCE.add(p)
@@ -2483,7 +2671,7 @@ async def refresh_candles(force=False):
             # technical setup does not qualify as a signal. The latter remains
             # represented separately by STATE["analyses"] for candidate ranking.
             analyzed_count+=1
-            analysis_candles=_apply_tick_activity_volume(p,closed)
+            analysis_candles=_prepare_volume_candles(p,closed)
             an=analyze_asset(a,analysis_candles,price)
             if an:
                 an["live_price_source"]=STATE["price_source"].get(p,"none")
@@ -3070,7 +3258,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                 live_price=STATE["prices"].get(
                     pair,(None,None)
                 )[0]
-                analysis_candles=_apply_tick_activity_volume(pair,current_candles)
+                analysis_candles=_prepare_volume_candles(pair,current_candles)
                 refreshed=analyze_asset(asset,analysis_candles,live_price)
                 if not refreshed:
                     log.info(
@@ -4639,7 +4827,7 @@ async def cycle_loop():
 
                                 if strategy_name=="AVWAP_VOLUME_PROFILE":
                                     asset=next((a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),None)
-                                    analysis_closed_1m=_apply_tick_activity_volume(p,closed_1m)
+                                    analysis_closed_1m=_prepare_volume_candles(p,closed_1m)
                                     refreshed=analyze_asset(
                                         asset or {"pair":p,"display_name":p},
                                         analysis_closed_1m,
@@ -6224,6 +6412,7 @@ async def main():
     await ensure_access_table()
     await ensure_tick_volume_table()
     await load_persistent_tick_volume()
+    await load_persistent_historical_volume()
     # The knowledge DB is an isolated bridge: learning writes compact validated
     # strategy/technique knowledge; the Signal Brain reads an in-memory snapshot.
     await ensure_strategy_knowledge_tables()
