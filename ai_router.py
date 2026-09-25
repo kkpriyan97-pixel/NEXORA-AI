@@ -742,7 +742,24 @@ async def review_result_with_fallback(rec:dict[str,Any])->dict[str,Any]:
                 last=e
                 log.warning("AI_POST_RESULT_REVIEW_FAILED provider=%s type=%s message=%s",
                             name,type(e).__name__,str(e)[:140])
-    raise RuntimeError(
-        f"Post-result AI review unavailable across configured providers: "
-        f"{type(last).__name__ if last else 'no_provider'}"
+    # External review is enrichment only. Finish locally when providers are unavailable.
+    local_result=str(rec.get("result") or "").upper()
+    local_strategy=str(rec.get("strategy") or "UNKNOWN")
+    local_direction=str(rec.get("direction") or "UNKNOWN")
+    local_trend=str(rec.get("trend_15m") or "UNKNOWN")
+    reason=(
+        f"External review unavailable ({type(last).__name__ if last else 'no_provider'}); "
+        f"preserve local outcome evidence without changing Candice Brain rules."
     )
+    log.warning("AI_POST_RESULT_LOCAL_FALLBACK pair=%s result=%s reason=%s",
+                rec.get("pair"),local_result,reason)
+    return {
+        "lesson":(
+            f"{local_strategy} completed as {local_result} for {local_direction} "
+            f"in {local_trend}. Reuse only the supplied closed-candle context."
+        )[:320],
+        "reuse":"Recheck the same closed-candle context before reuse; external review failure must not alter the strategy.",
+        "evidence":reason,
+        "confidence":75,
+        "provider":"LOCAL_RESULT_AUDIT_FALLBACK",
+    }
