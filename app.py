@@ -2861,33 +2861,20 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                         x.get("pair"),x.get("direction"),ai_confidence,d.get("provider")
                     )
                 else:
-                    # External AI outage/quota exhaustion must not become a hidden
-                    # availability gate. Only exceptionally strong local exact setups
-                    # may use this fallback; an actual contradictory AI response above
-                    # remains a hard veto. This keeps the local Brain authoritative.
-                    strict_local_fallback=(
-                        ALLOW_PROXY_LIVE_FALLBACK
-                        and int(local_confidence)>=90
-                        and ind_ctx.get("value_area_acceptance") is True
-                        and ind_ctx.get("m1_continuation_ok") is True
-                        and ind_ctx.get("slope_persistent") is True
-                        and ind_ctx.get("poc_migration_against") is not True
-                    )
-                    if not strict_local_fallback:
-                        log.info(
-                            "AI_PROXY_VOLUME_VETO pair=%s local_direction=%s "
-                            "reason=no_external_ai_and_local_fallback_threshold_not_met confidence=%s",
-                            x.get("pair"),x.get("direction"),local_confidence
-                        )
-                        CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
-                        return None
-                    local["volume_proxy_local_fallback"]=True
-                    local["volume_proxy_local_fallback_confidence"]=int(local_confidence)
+                    # Volume Profile is part of the locked live strategy, so a
+                    # zero/unknown-volume candidate cannot be promoted on technical
+                    # confidence alone. When the broker exposes only an activity proxy,
+                    # an external verifier must explicitly agree with the Brain before
+                    # the candidate can reach the live-delivery gate. Provider outage,
+                    # timeout, quota exhaustion, or missing AI is therefore a veto for
+                    # proxy-volume setups, not a reason to weaken the evidence standard.
                     log.info(
-                        "AI_PROXY_VOLUME_LOCAL_FALLBACK pair=%s direction=%s confidence=%s "
-                        "reason=external_ai_unavailable_strict_local_gates",
+                        "AI_PROXY_VOLUME_VETO pair=%s local_direction=%s "
+                        "reason=external_ai_unavailable_proxy_volume_not_live_eligible confidence=%s",
                         x.get("pair"),x.get("direction"),local_confidence
                     )
+                    CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
+                    return None
 
         # Weak momentum inside a SIDEWAYS 15m regime produced two of the
         # consecutive losses. Keep this as a local zero-latency qualification
