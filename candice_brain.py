@@ -24,6 +24,7 @@ CLOSE_GRACE_SECONDS=1
 PROFILE_LOOKBACK=60
 PROFILE_BINS=24
 VALUE_AREA_FRACTION=0.70
+HIGH_VOLUME_MIN_COVERAGE=0.80
 ALLOWED_STRATEGY="AVWAP_VOLUME_PROFILE"
 
 # Bill Williams Alligator confirmation settings, matching the terminal:
@@ -782,7 +783,23 @@ def analyze_asset(
         volume_quality="TICK_ACTIVITY"
     else:
         volume_quality="LOW"
-    volume_proxy_mode=real_coverage<0.80
+    high_volume_confirmed=bool(
+        real_coverage>=HIGH_VOLUME_MIN_COVERAGE
+        and volume_bars>=int(PROFILE_LOOKBACK*HIGH_VOLUME_MIN_COVERAGE)
+    )
+    # Live signals are allowed only when broker-reported real/traded volume is
+    # sufficiently complete. Tick-volume and locally observed activity remain
+    # diagnostics/filters but cannot qualify a "HIGH VOLUME" live signal.
+    if not high_volume_confirmed:
+        _diag(
+            pair,"high_volume_required",
+            real_volume_coverage=round(real_coverage,3),
+            volume_bars=int(profile.get("volume_bars") or 0),
+            required_bars=int(PROFILE_LOOKBACK*HIGH_VOLUME_MIN_COVERAGE),
+            volume_mode=profile.get("volume_mode"),
+        )
+        return None
+
     if volume_proxy_mode:
         _diag(
             pair,"volume_proxy_candidate",
@@ -854,12 +871,8 @@ def analyze_asset(
         score+=alligator_bonus
     if bb_bonus:
         score+=bb_bonus
-    if coverage>=0.80:
-        score+=1
-    elif volume_proxy_mode:
-        # Proxy-volume candidates need independent verification and therefore
-        # start below true-volume candidates in ranking.
-        score-=3
+    if high_volume_confirmed:
+        score+=2
 
     confidence=min(99,max(0,int(score)))
 
@@ -911,6 +924,9 @@ def analyze_asset(
         "profile_bins":profile["bins"],
         "volume_coverage":coverage,
         "volume_bars":int(profile.get("volume_bars") or 0),
+        "high_volume_confirmed":high_volume_confirmed,
+        "high_volume_min_coverage":HIGH_VOLUME_MIN_COVERAGE,
+        "high_volume_required_bars":int(PROFILE_LOOKBACK*HIGH_VOLUME_MIN_COVERAGE),
         "volume_mode":profile.get("volume_mode"),
         "volume_quality":volume_quality,
         "volume_data_class":(
@@ -971,7 +987,7 @@ def analyze_asset(
             f"VAH={vah:.8f}; VAL={val:.8f}; AVWAP_slope={slope:.8f}; "
             f"slope_persistence={slope_aligned_steps}/3; value={value_position}; "
             f"reclaim={level_reclaim}; POC_migration={migration_norm:.4f}; "
-            f"volume_quality={volume_quality}; AVWAP+POC aligned; "
+            f"volume_quality={volume_quality}; HIGH_VOLUME=CONFIRMED; AVWAP+POC aligned; "
             f"Alligator(13/8,8/5,5/3)=CONFIRMED; "
             f"BB(18,2)={bb.get('bb_confirmation','UNAVAILABLE')}."
         ),
