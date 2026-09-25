@@ -3,6 +3,7 @@
 Live signal direction is generated ONLY from:
 1) Anchored VWAP
 2) Volume Profile (POC / VAH / VAL)
+3) Bill Williams Alligator confirmation (13/8, 8/5, 5/3)
 
 The production scheduler, Telegram delivery and DEMO result watcher live in
 app.py. This module intentionally contains no legacy EMA/RSI/MACD/Donchian/
@@ -24,6 +25,18 @@ PROFILE_LOOKBACK=60
 PROFILE_BINS=24
 VALUE_AREA_FRACTION=0.70
 ALLOWED_STRATEGY="AVWAP_VOLUME_PROFILE"
+
+# Bill Williams Alligator confirmation settings, matching the terminal:
+# Jaw 13 / shift 8, Teeth 8 / shift 5, Lips 5 / shift 3.
+# The Alligator never creates or flips direction; it only confirms the
+# authoritative AVWAP + Volume Profile direction.
+ALLIGATOR_JAW_PERIOD=13
+ALLIGATOR_JAW_SHIFT=8
+ALLIGATOR_TEETH_PERIOD=8
+ALLIGATOR_TEETH_SHIFT=5
+ALLIGATOR_LIPS_PERIOD=5
+ALLIGATOR_LIPS_SHIFT=3
+ALLIGATOR_MIN_SEPARATION=0.0
 log=logging.getLogger("candice.brain")
 _DIAG_LAST={}
 
@@ -428,6 +441,108 @@ def _decision_time_bucket(ts):
 
 
 
+def _smma_series(values,period):
+    """Return a Wilder-style SMMA sequence without using future candles."""
+    n=int(period)
+    if n<=0 or len(values)<n:
+        return []
+    out=[None]*len(values)
+    smma=sum(float(x) for x in values[:n])/float(n)
+    out[n-1]=smma
+    for i in range(n,len(values)):
+        smma=((smma*(n-1))+float(values[i]))/float(n)
+        out[i]=smma
+    return out
+
+
+def _alligator_confirmation(cs,direction):
+    """Confirm AVWAP+VP direction with the configured Alligator.
+    
+    The terminal shift is a plot shift, not future data. At closed candle t,
+    the visible Jaw/Teeth/Lips values correspond to the SMMA values from
+    t-8/t-5/t-3 respectively. Only closed M1 candles are used.
+    """
+    direction=str(direction or "").upper()
+    if direction not in {"UP","DOWN"}:
+        return {"ready":False,"confirmed":False,"direction":direction}
+
+    medians=[
+        (float(c["high"])+float(c["low"]))/2.0
+        for c in cs if isinstance(c,dict)
+    ]
+    required=max(
+        ALLIGATOR_JAW_PERIOD+ALLIGATOR_JAW_SHIFT,
+        ALLIGATOR_TEETH_PERIOD+ALLIGATOR_TEETH_SHIFT,
+        ALLIGATOR_LIPS_PERIOD+ALLIGATOR_LIPS_SHIFT
+    )+2
+    if len(medians)<required:
+        return {
+            "ready":False,
+            "confirmed":False,
+            "direction":direction,
+            "reason":"insufficient_closed_m1_history"
+        }
+
+    jaw_series=_smma_series(medians,ALLIGATOR_JAW_PERIOD)
+    teeth_series=_smma_series(medians,ALLIGATOR_TEETH_PERIOD)
+    lips_series=_smma_series(medians,ALLIGATOR_LIPS_PERIOD)
+    idx=len(medians)-1
+
+    def shifted(series,shift,at_idx):
+        pos=int(at_idx)-int(shift)
+        if pos<0 or pos>=len(series) or series[pos] is None:
+            return None
+        return float(series[pos])
+
+    jaw=shifted(jaw_series,ALLIGATOR_JAW_SHIFT,idx)
+    teeth=shifted(teeth_series,ALLIGATOR_TEETH_SHIFT,idx)
+    lips=shifted(lips_series,ALLIGATOR_LIPS_SHIFT,idx)
+    prev_jaw=shifted(jaw_series,ALLIGATOR_JAW_SHIFT,idx-1)
+    prev_teeth=shifted(teeth_series,ALLIGATOR_TEETH_SHIFT,idx-1)
+    prev_lips=shifted(lips_series,ALLIGATOR_LIPS_SHIFT,idx-1)
+
+    if None in (jaw,teeth,lips,prev_jaw,prev_teeth,prev_lips):
+        return {
+            "ready":False,
+            "confirmed":False,
+            "direction":direction,
+            "reason":"alligator_not_ready"
+        }
+
+    last_close=float(cs[-1]["close"])
+    if direction=="UP":
+        aligned=(
+            lips>teeth+ALLIGATOR_MIN_SEPARATION
+            and teeth>jaw+ALLIGATOR_MIN_SEPARATION
+        )
+        sloping=(lips>=prev_lips and teeth>=prev_teeth and jaw>=prev_jaw)
+        price_position=last_close>=lips
+    else:
+        aligned=(
+            lips<teeth-ALLIGATOR_MIN_SEPARATION
+            and teeth<jaw-ALLIGATOR_MIN_SEPARATION
+        )
+        sloping=(lips<=prev_lips and teeth<=prev_teeth and jaw<=prev_jaw)
+        price_position=last_close<=lips
+
+    return {
+        "ready":True,
+        "confirmed":bool(aligned and sloping and price_position),
+        "direction":direction,
+        "jaw":jaw,
+        "teeth":teeth,
+        "lips":lips,
+        "prev_jaw":prev_jaw,
+        "prev_teeth":prev_teeth,
+        "prev_lips":prev_lips,
+        "aligned":bool(aligned),
+        "sloping":bool(sloping),
+        "price_position":bool(price_position),
+        "periods":"13/8,8/5,5/3",
+        "confirmation":"CONFIRMED" if (aligned and sloping and price_position) else "REJECTED",
+    }
+
+
 def _bollinger_confirmation(candles, direction, period=18, multiplier=2.0):
     """Return a zero-network M1 Bollinger 18/2 confirmation layer.
     
@@ -607,6 +722,22 @@ def analyze_asset(
         "LOWER_VALUE" if px<poc else "AT_POC"
     )
 
+    # Alligator confirmation is mandatory for the live candidate.
+    # It validates the AVWAP+VP direction; it never creates or flips direction.
+    alligator=_alligator_confirmation(cs,direction)
+    if not bool(alligator.get("ready")):
+        _diag(pair,"alligator_not_ready",details=alligator.get("reason"))
+        return None
+    if not bool(alligator.get("confirmed")):
+        _diag(
+            pair,"alligator_confirmation_rejected",
+            direction=direction,
+            aligned=alligator.get("aligned"),
+            sloping=alligator.get("sloping"),
+            price_position=alligator.get("price_position"),
+        )
+        return None
+
     # LIVE EXACT-SETUP FILTER:
     # Only the exact point identified by the current result analysis enters the
     # live selector: ABOVE_VALUE + no level reclaim + persistent AVWAP slope.
@@ -691,6 +822,10 @@ def analyze_asset(
         _diag(pair,"poc_migration_against",direction=direction,migration_norm=round(migration_norm,4))
         return None
 
+    # Alligator is already a mandatory gate; add a small confluence
+    # bonus because it is fully aligned with the authoritative direction.
+    alligator_bonus=3
+
     # Bollinger 18/2 confirmation affects confluence/ranking only.
     # It is deliberately soft so an isolated BB disagreement cannot suppress
     # otherwise valid AVWAP+VP setups or disturb the 3-minute signal cadence.
@@ -707,6 +842,8 @@ def analyze_asset(
         score+=1
     if migration_aligned:
         score+=2
+    if alligator_bonus:
+        score+=alligator_bonus
     if bb_bonus:
         score+=bb_bonus
     if coverage>=0.80:
@@ -735,6 +872,19 @@ def analyze_asset(
         "profile_poc_migration_norm":migration_norm,
         "profile_previous_poc":(migration or {}).get("previous_poc"),
         "profile_migration_available":bool((migration or {}).get("available")),
+        "alligator_confirmed":True,
+        "alligator_confirmation":"CONFIRMED",
+        "alligator_periods":alligator.get("periods","13/8,8/5,5/3"),
+        "alligator_jaw":alligator.get("jaw"),
+        "alligator_teeth":alligator.get("teeth"),
+        "alligator_lips":alligator.get("lips"),
+        "alligator_prev_jaw":alligator.get("prev_jaw"),
+        "alligator_prev_teeth":alligator.get("prev_teeth"),
+        "alligator_prev_lips":alligator.get("prev_lips"),
+        "alligator_aligned":True,
+        "alligator_sloping":True,
+        "alligator_price_position":True,
+        "alligator_bonus":alligator_bonus,
         "bb_period":bb.get("bb_period",18),
         "bb_multiplier":bb.get("bb_multiplier",2.0),
         "bb_ready":bb.get("bb_ready",False),
@@ -814,6 +964,7 @@ def analyze_asset(
             f"slope_persistence={slope_aligned_steps}/3; value={value_position}; "
             f"reclaim={level_reclaim}; POC_migration={migration_norm:.4f}; "
             f"volume_quality={volume_quality}; AVWAP+POC aligned; "
+            f"Alligator(13/8,8/5,5/3)=CONFIRMED; "
             f"BB(18,2)={bb.get('bb_confirmation','UNAVAILABLE')}."
         ),
         "indicator_features":features,
@@ -844,7 +995,7 @@ def analyze_asset(
             "down_qualified":bool(down),
         }],
         "strategy_audit_count":1,
-        "indicator_audit_scope":"AVWAP_VOLUME_PROFILE_WITH_BB18_2_CONFIRMATION",
+        "indicator_audit_scope":"AVWAP_VOLUME_PROFILE_WITH_ALLIGATOR_13_8_8_5_5_3_AND_BB18_2_CONFIRMATION",
         "m1_sequence_signature":features["m1_sequence_signature"],
         "market_regime":features["market_regime"],
         "decision_time_bucket":features["decision_time_bucket"],
