@@ -712,6 +712,8 @@ def _result_watch_payload(s):
         "self_strategy":s.self_strategy,
         "self_strategy_version":s.self_strategy_version,
         "indicator_context":dict(s.indicator_context or {}),
+        "actual_entry_captured":bool(getattr(s,"actual_entry_captured",False)),
+        "actual_entry_source":str(getattr(s,"actual_entry_source","") or ""),
     }
 
 async def enqueue_result_watch(watch_id,s):
@@ -855,6 +857,8 @@ async def restore_pending_result_watches():
                         self_strategy=str(record.get("self_strategy") or ""),
                         self_strategy_version=str(record.get("self_strategy_version") or ""),
                         indicator_context=dict(record.get("indicator_context") or {}),
+                        actual_entry_captured=bool(record.get("actual_entry_captured",False)),
+                        actual_entry_source=str(record.get("actual_entry_source") or ""),
                     )
                 if start_result_watch(key):
                     restored+=1
@@ -3826,6 +3830,16 @@ async def result_watch(key):
     entry_price=None
     entry_source=""
     entry_boundary_delta=None
+    # A previously persisted actual entry is authoritative after a Render restart.
+    # Never overwrite it with a later fallback quote.
+    if bool(getattr(s,"actual_entry_captured",False)) and float(getattr(s,"entry_price",0.0) or 0.0)>0.0:
+        entry_price=float(s.entry_price)
+        entry_source=str(getattr(s,"actual_entry_source","") or "persisted-actual-entry")
+        log.info(
+            "ACTUAL_ENTRY_RESTORED pair=%s entry=%.12g source=%s entry_ts=%s",
+            s.pair,entry_price,entry_source,
+            datetime.fromtimestamp(s.entry_ts,tz=timezone.utc).strftime("%H:%M:%S")
+        )
     # First preference: exact-boundary broker-timestamped tick already captured
     # by the authenticated Event-1 stream.
     boundary=boundary_entry_tick(s.pair,s.entry_ts,window_seconds=3.0)
@@ -3881,11 +3895,14 @@ async def result_watch(key):
         return
 
     s.entry_price=entry_price
+    s.actual_entry_captured=True
+    s.actual_entry_source=entry_source
     if LEARNING_DB_URL:
         try:
             import psycopg
             updated_payload=_result_watch_payload(s)
             updated_payload["actual_entry_source"]=entry_source
+            updated_payload["actual_entry_captured"]=True
             def _persist_entry():
                 payload=json.dumps(updated_payload,separators=(",",":"),ensure_ascii=False,default=str)
                 with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
