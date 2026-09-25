@@ -1057,10 +1057,11 @@ AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=90.0
 AI_REVIEW_FAIL_TTL=90.0
 # A zero-volume Volume Profile is an equal-activity price-distribution proxy,
-# not verified real volume. It is opt-in only; production defaults to rejecting
-# proxy live signals rather than converting missing volume into a trade edge.
-ALLOW_PROXY_LIVE_FALLBACK=os.getenv("ALLOW_PROXY_LIVE_FALLBACK","0").strip().lower() in {"1","true","yes","on"}
-AI_DEEP_REVIEW_TOP_N=max(1,min(5,int(os.getenv("AI_DEEP_REVIEW_TOP_N","3") or 3)))
+# not verified real volume. Proxy live signals remain clearly marked and are
+# admitted only after strict Brain setup gates; external AI is a verifier, not
+# a hard scheduler dependency when every provider is unavailable.
+ALLOW_PROXY_LIVE_FALLBACK=os.getenv("ALLOW_PROXY_LIVE_FALLBACK","1").strip().lower() in {"1","true","yes","on"}
+AI_DEEP_REVIEW_TOP_N=max(1,min(5,int(os.getenv("AI_DEEP_REVIEW_TOP_N","5") or 5)))
 # Preserve a fully reviewed candidate for the short exact-boundary window.
 # This prevents a transient provider/cache refresh from erasing a valid setup
 # after it has already passed the Brain + live-price gates.
@@ -1089,8 +1090,8 @@ ACCOUNT_TICK_SUB_DELAY=0.35
 # keep multiple independent candidates live at the exact signal boundary.
 # This does not change Brain direction/quality gates; it only preserves live
 # quote coverage for fallback candidates.
-ACCOUNT_TICK_MAX_SLOTS=2
-ACCOUNT_TICK_PIN_SLOTS=2
+ACCOUNT_TICK_MAX_SLOTS=4
+ACCOUNT_TICK_PIN_SLOTS=4
 ACCOUNT_TICK_ROTATE_INTERVAL=15.0
 # Temporarily back off pairs that the authenticated event-12 channel explicitly
 # rejects, instead of wasting every rotation/final-boundary slot on them.
@@ -2861,20 +2862,38 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                         x.get("pair"),x.get("direction"),ai_confidence,d.get("provider")
                     )
                 else:
-                    # Volume Profile is part of the locked live strategy, so a
-                    # zero/unknown-volume candidate cannot be promoted on technical
-                    # confidence alone. When the broker exposes only an activity proxy,
-                    # an external verifier must explicitly agree with the Brain before
-                    # the candidate can reach the live-delivery gate. Provider outage,
-                    # timeout, quota exhaustion, or missing AI is therefore a veto for
-                    # proxy-volume setups, not a reason to weaken the evidence standard.
-                    log.info(
-                        "AI_PROXY_VOLUME_VETO pair=%s local_direction=%s "
-                        "reason=external_ai_unavailable_proxy_volume_not_live_eligible confidence=%s",
-                        x.get("pair"),x.get("direction"),local_confidence
+                    # The external verifier is a confirmation layer, not a scheduler
+                    # dependency. Provider outage/quota exhaustion must not erase every
+                    # otherwise-qualified local setup from the 3-minute cycle. Fall back
+                    # only when the locked Brain setup remains exceptionally strong and
+                    # all exact AVWAP/VP gates have already passed.
+                    ind_fallback=dict(x.get("indicators") or x.get("indicator_context") or {})
+                    fallback_value_position=str(ind_fallback.get("value_position") or "").upper()
+                    fallback_direction=str(x.get("direction") or "").upper()
+                    fallback_setup_ok=(
+                        local_confidence>=95
+                        and bool(ind_fallback.get("exact_live_setup"))
+                        and ind_fallback.get("slope_persistent") is True
+                        and ind_fallback.get("level_reclaim") is False
+                        and ((fallback_direction=="UP" and fallback_value_position=="ABOVE_VALUE")
+                             or (fallback_direction=="DOWN" and fallback_value_position=="BELOW_VALUE"))
                     )
-                    CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
-                    return None
+                    if fallback_setup_ok:
+                        local["volume_proxy_local_fallback"]=True
+                        local["volume_proxy_local_fallback_confidence"]=local_confidence
+                        log.info(
+                            "AI_PROXY_VOLUME_LOCAL_FALLBACK pair=%s direction=%s local_confidence=%s "
+                            "reason=external_ai_unavailable_strict_local_setup",
+                            x.get("pair"),x.get("direction"),local_confidence
+                        )
+                    else:
+                        log.info(
+                            "AI_PROXY_VOLUME_VETO pair=%s local_direction=%s "
+                            "reason=external_ai_unavailable_proxy_volume_not_live_eligible confidence=%s",
+                            x.get("pair"),x.get("direction"),local_confidence
+                        )
+                        CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
+                        return None
 
         # Weak momentum inside a SIDEWAYS 15m regime produced two of the
         # consecutive losses. Keep this as a local zero-latency qualification
@@ -3946,7 +3965,7 @@ async def cycle_loop():
                             require_live_price=False,
                             deep_analysis=(pass_no==4),
                             use_cached_only=False,
-                            return_ranked=(pass_no==4)
+                            return_ranked=(pass_no in (1,2,3,4))
                         ),
                         timeout=max(1.0,remaining-0.50)
                     )
