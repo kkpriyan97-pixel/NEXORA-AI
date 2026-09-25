@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from candice_brain import ALLOWED_STRATEGY, analyze_asset
+from candice_brain import ALLOWED_STRATEGY, OTC_STRATEGY, analyze_asset
 
 
 def up_candles(n=120, start=1_000_000):
@@ -23,6 +23,45 @@ def down_candles(n=120, start=1_000_000):
         o=base
         c=o-0.08
         out.append({"time":t,"open":o,"high":o+0.03,"low":c-0.03,"close":c,"volume":100})
+    return out
+
+
+
+
+def otc_structure_candles(n=120,start=1_000_000):
+    out=[]
+    for i in range(n):
+        t=start+i*60
+        base=100.0+(i*0.025)
+        o=base
+        c=o+0.04
+        out.append({
+            "time":t,"open":o,"high":c+0.02,"low":o-0.02,
+            "close":c,"volume":0
+        })
+
+    # Final closed-M1 sequence: BOS -> displacement -> retest/hold -> confirmation.
+    for i in range(112,117):
+        t=start+i*60
+        o=103.85+(i-112)*0.03
+        c=o+0.02
+        out[i]={"time":t,"open":o,"high":104.50,"low":o-0.02,"close":c,"volume":0}
+
+    t=start+117*60
+    out[117]={
+        "time":t,"open":104.00,"high":106.20,"low":103.80,
+        "close":105.70,"volume":0
+    }
+    t=start+118*60
+    out[118]={
+        "time":t,"open":104.90,"high":105.90,"low":104.30,
+        "close":105.30,"volume":0
+    }
+    t=start+119*60
+    out[119]={
+        "time":t,"open":105.30,"high":106.00,"low":105.20,
+        "close":105.85,"volume":0
+    }
     return out
 
 
@@ -50,6 +89,23 @@ def main():
 
     flat=[{"time":start+i*60,"open":100,"high":100.01,"low":99.99,"close":100,"volume":100} for i in range(120)]
     assert analyze_asset({"pair":"TEST_FLAT","display_name":"TEST_FLAT"},flat) is None
+
+    otc=analyze_asset(
+        {"pair":"EURUSD_OTC","display_name":"EURUSD OTC","mode":"OTC"},
+        otc_structure_candles(start=start),
+    )
+    assert otc and otc["direction"]=="UP"
+    assert otc["strategy"]==OTC_STRATEGY
+    assert otc["expiry_minutes"]==1
+    assert otc["self_strategy_version"]=="OTC_STRUCTURE_V1"
+    assert otc["indicators"]["otc_strategy"] is True
+    assert otc["indicators"]["otc_market_bias"]=="BULLISH"
+    assert otc["indicators"]["otc_bos_confirmed"] is True
+    assert otc["indicators"]["otc_displacement_confirmed"] is True
+    assert otc["indicators"]["otc_retest_confirmed"] is True
+    assert otc["indicators"]["otc_hold_confirmed"] is True
+    assert otc["indicators"]["otc_confirmation_candle_confirmed"] is True
+    assert otc["indicators"]["exact_live_setup"] is True
 
     # A structurally valid setup with no broker-reported volume must be rejected
     # by the strict HIGH-volume live gate rather than being labelled HIGH.
