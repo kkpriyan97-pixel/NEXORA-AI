@@ -1133,6 +1133,8 @@ ACCOUNT_TICK_REJECT_UNTIL={}
 ACCOUNT_TICK_PINNED={}
 ACCOUNT_TICK_ROTATE_CURSOR=0
 ACCOUNT_TICK_LAST_ROTATION=0.0
+CACHE_PRUNE_INTERVAL=60.0
+CACHE_PRUNE_LAST_AT=0.0
 CLIENT=None
 LOCK=asyncio.Lock()
 
@@ -2688,6 +2690,9 @@ async def refresh_candles(force=False):
         elif a.get("signal_eligible",True):
             STATE["analyses"].pop(p,None)
 
+        if analyzed_count % 5 == 0:
+            await asyncio.sleep(0)
+
     stale_count=sum(1 for a in assets if _candle_data_stale(a["pair"],reference))
     log.info(
         "LIVE_ANALYSIS_REFRESH assets=%d analyzed=%d live_quote=%d signal_eligible=%d fetched=%d stale=%d qualified=%d",
@@ -3118,7 +3123,37 @@ def live_price_age(pair,reference_ts=None):
     try:return max(0.0,ref-received)
     except Exception:return None
 
+def _prune_runtime_caches(now=None):
+    global CACHE_PRUNE_LAST_AT
+    now=time.time() if now is None else float(now)
+    if now-CACHE_PRUNE_LAST_AT < CACHE_PRUNE_INTERVAL:
+        return
+    CACHE_PRUNE_LAST_AT=now
+    for key,value in list(AI_REVIEW_CACHE.items()):
+        try:
+            created=float(value[0] or 0.0)
+        except (TypeError,ValueError,IndexError):
+            created=0.0
+        if now-created > max(AI_REVIEW_TTL,AI_REVIEW_FAIL_TTL):
+            AI_REVIEW_CACHE.pop(key,None)
+    for key,value in list(CANDIDATE_CACHE.items()):
+        try:
+            created=float(value[0] or 0.0)
+        except (TypeError,ValueError,IndexError):
+            created=0.0
+        if now-created > CANDIDATE_CACHE_TTL:
+            CANDIDATE_CACHE.pop(key,None)
+    for key,created in list(CANDIDATE_CACHE_HARD_REJECTED.items()):
+        try:
+            age=now-float(created or 0.0)
+        except (TypeError,ValueError):
+            age=CANDIDATE_CACHE_TTL+1.0
+        if age > CANDIDATE_CACHE_TTL:
+            CANDIDATE_CACHE_HARD_REJECTED.pop(key,None)
+
+
 async def final_candidate(use_cached_only=False,require_live_price=False,deep_analysis=False,seed_candidates=None,return_ranked=False):
+    _prune_runtime_caches()
     BRAIN.prune_expired_cooldowns()
 
     # Hard account boundary: Brain may select/analyze an asset only after the
