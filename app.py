@@ -2652,49 +2652,49 @@ async def refresh_candles(force=False):
     analyzed_count=0
     live_price_count=0
     for a in assets:
-            p=a["pair"]
-            price=STATE["prices"].get(p,(None,None))[0]
-            if price is not None:
-                live_price_count+=1
-            closed=_closed_candles(STATE["candles"].get(p,[]),reference)
-            if len(closed)<60:
-                if a.get("signal_eligible",True):
-                    STATE["analyses"].pop(p,None)
-                continue
-            # Feed only completed 1-minute candles into the isolated forward-learning lab.
-            # The lab predicts candle t+1 using information available at candle t close;
-            # it never changes this live technical analysis path.
-            try:
-                # M1 learning writes are deliberately moved off the trading event
-                # loop. They use a dedicated single-worker executor inside the lab,
-                # so slow database writes cannot delay pass timing or Telegram delivery.
-                asyncio.create_task(
-                    record_market_snapshot_async(p,closed,reference)
-                )
-            except Exception as e:
-                log.debug("M1_WORLD_SNAPSHOT_FAILED pair=%s type=%s message=%s",p,type(e).__name__,str(e)[:120])
-            # Count every successfully analyzed account asset, even when its
-            # technical setup does not qualify as a signal. The latter remains
-            # represented separately by STATE["analyses"] for candidate ranking.
-            analyzed_count+=1
-            analysis_candles=_prepare_volume_candles(p,closed)
-            an=analyze_asset(a,analysis_candles,price)
-            if an:
-                an["live_price_source"]=STATE["price_source"].get(p,"none")
-                an["account_feed_source"]="authenticated_account:event_182+broker_current_candle"
-            if an and a.get("signal_eligible",True):
-                an["profitability"]=a["profitability"]
-                STATE["analyses"][p]=an
-            elif a.get("signal_eligible",True):
+        p=a["pair"]
+        price=STATE["prices"].get(p,(None,None))[0]
+        if price is not None:
+            live_price_count+=1
+        closed=_closed_candles(STATE["candles"].get(p,[]),reference)
+        if len(closed)<60:
+            if a.get("signal_eligible",True):
                 STATE["analyses"].pop(p,None)
+            continue
+        # Feed only completed 1-minute candles into the isolated forward-learning lab.
+        # The lab predicts candle t+1 using information available at candle t close;
+        # it never changes this live technical analysis path.
+        try:
+            # M1 learning writes are deliberately moved off the trading event
+            # loop. They use a dedicated single-worker executor inside the lab,
+            # so slow database writes cannot delay pass timing or Telegram delivery.
+            asyncio.create_task(
+                record_market_snapshot_async(p,closed,reference)
+            )
+        except Exception as e:
+            log.debug("M1_WORLD_SNAPSHOT_FAILED pair=%s type=%s message=%s",p,type(e).__name__,str(e)[:120])
+        # Count every successfully analyzed account asset, even when its
+        # technical setup does not qualify as a signal. The latter remains
+        # represented separately by STATE["analyses"] for candidate ranking.
+        analyzed_count+=1
+        analysis_candles=_prepare_volume_candles(p,closed)
+        an=analyze_asset(a,analysis_candles,price)
+        if an:
+            an["live_price_source"]=STATE["price_source"].get(p,"none")
+            an["account_feed_source"]="authenticated_account:event_182+broker_current_candle"
+        if an and a.get("signal_eligible",True):
+            an["profitability"]=a["profitability"]
+            STATE["analyses"][p]=an
+        elif a.get("signal_eligible",True):
+            STATE["analyses"].pop(p,None)
 
-        stale_count=sum(1 for a in assets if _candle_data_stale(a["pair"],reference))
-        log.info(
-            "LIVE_ANALYSIS_REFRESH assets=%d analyzed=%d live_quote=%d signal_eligible=%d fetched=%d stale=%d qualified=%d",
-            len(assets),analyzed_count,live_price_count,
-            sum(1 for a in assets if a.get("signal_eligible",True)),
-            len(due),stale_count,len(STATE["analyses"])
-        )
+    stale_count=sum(1 for a in assets if _candle_data_stale(a["pair"],reference))
+    log.info(
+        "LIVE_ANALYSIS_REFRESH assets=%d analyzed=%d live_quote=%d signal_eligible=%d fetched=%d stale=%d qualified=%d",
+        len(assets),analyzed_count,live_price_count,
+        sum(1 for a in assets if a.get("signal_eligible",True)),
+        len(due),stale_count,len(STATE["analyses"])
+    )
 
 
 def has_fresh_live_price(pair,reference_ts=None,max_age=LIVE_TICK_MAX_AGE):
