@@ -1777,23 +1777,19 @@ async def _rotate_account_tick_collection_once(fill_all=False):
         # Fill missing slots using only a small probe window. Rejected broker
         # capabilities are already put on cooldown, so this cannot hammer all
         # 100 account assets in one scheduler pass.
-        while len(ACCOUNT_TICK_SUBSCRIBED)<ACCOUNT_TICK_MAX_SLOTS:
-            attempts=0
-            progressed=False
-            while attempts<probe_limit:
-                p=pairs[ACCOUNT_TICK_ROTATE_CURSOR % len(pairs)]
-                ACCOUNT_TICK_ROTATE_CURSOR=(ACCOUNT_TICK_ROTATE_CURSOR+1)%max(1,len(pairs))
-                attempts+=1
-                if p in ACCOUNT_TICK_SUBSCRIBED:
-                    continue
-                if float(ACCOUNT_TICK_REJECT_UNTIL.get(p) or 0.0)>now:
-                    continue
-                progressed=True
-                if await _subscribe_account_tick(p):
-                    accepted+=1
-                    break
-            if len(ACCOUNT_TICK_SUBSCRIBED)>=ACCOUNT_TICK_MAX_SLOTS or not progressed:
-                break
+        needed=max(0,ACCOUNT_TICK_MAX_SLOTS-len(ACCOUNT_TICK_SUBSCRIBED))
+        fill_attempts=0
+        while fill_attempts<probe_limit and needed>0:
+            p=pairs[ACCOUNT_TICK_ROTATE_CURSOR % len(pairs)]
+            ACCOUNT_TICK_ROTATE_CURSOR=(ACCOUNT_TICK_ROTATE_CURSOR+1)%max(1,len(pairs))
+            fill_attempts+=1
+            if p in ACCOUNT_TICK_SUBSCRIBED:
+                continue
+            if float(ACCOUNT_TICK_REJECT_UNTIL.get(p) or 0.0)>now:
+                continue
+            if await _subscribe_account_tick(p):
+                accepted+=1
+                needed-=1
 
         if (
             not fill_all
