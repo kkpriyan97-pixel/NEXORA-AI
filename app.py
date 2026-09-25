@@ -2902,33 +2902,57 @@ def _latest_closed_30s_candle(pair,reference_ts=None):
     return _latest_closed_candle_direction(candles)
 
 def _final_delivery_precheck(candidate,reference_ts=None):
-    """Score final delivery readiness using only the locked AVWAP + Volume Profile brain.
-
-    This is a zero-network scheduling aid. It must never use the legacy 1m/2m/5s/
-    multi-timeframe confirmation stack for the production AVWAP+VP strategy.
-    """
+    """Score final delivery readiness using the candidate's locked strategy."""
     try:
         pair=str((candidate or {}).get("pair") or "")
         expected=str((candidate or {}).get("direction") or "").upper()
         strategy=str((candidate or {}).get("strategy") or "").upper()
-        if not pair or expected not in {"UP","DOWN"} or strategy!= "AVWAP_VOLUME_PROFILE":
+        if not pair or expected not in {"UP","DOWN"}:
             return -1000.0
 
         ind=dict((candidate or {}).get("indicators") or (candidate or {}).get("indicator_context") or {})
         px=float((candidate or {}).get("price") or 0.0)
+        if px<=0:
+            return -900.0
+
+        if strategy==OTC_STRATEGY:
+            bos=float(ind.get("otc_bos_level") or 0.0)
+            if bos<=0:
+                return -900.0
+            aligned=(px>bos) if expected=="UP" else (px<bos)
+            if not aligned:
+                return -800.0
+            required=(
+                "otc_strategy","otc_bos_confirmed","otc_displacement_confirmed",
+                "otc_retest_confirmed","otc_hold_confirmed",
+                "otc_confirmation_candle_confirmed","m1_continuation_ok",
+                "exact_live_setup"
+            )
+            if any(ind.get(k) is not True for k in required):
+                return -850.0
+            score=100.0
+            score+=10.0 if bool(ind.get("otc_displacement_confirmed")) else 0.0
+            score+=10.0 if bool(ind.get("otc_retest_confirmed")) else 0.0
+            score+=10.0 if bool(ind.get("otc_hold_confirmed")) else 0.0
+            score+=10.0 if bool(ind.get("otc_confirmation_candle_confirmed")) else 0.0
+            score+=min(20.0,float(candidate.get("confidence") or 0.0)*0.20)
+            return round(score,3)
+
+        if strategy!=ALLOWED_STRATEGY:
+            return -1000.0
+
         avwap=float(ind.get("anchored_vwap") or candidate.get("avwap") or 0.0)
         poc=float(ind.get("volume_profile_poc") or candidate.get("poc") or 0.0)
         vah=float(ind.get("volume_profile_vah") or candidate.get("vah") or 0.0)
         val=float(ind.get("volume_profile_val") or candidate.get("val") or 0.0)
-        if px<=0 or avwap<=0 or poc<=0:
+        if avwap<=0 or poc<=0:
             return -900.0
 
         aligned=(px>avwap and px>poc) if expected=="UP" else (px<avwap and px<poc)
         if not aligned:
             return -800.0
 
-        score=0.0
-        score+=100.0
+        score=100.0
         if bool(ind.get("value_area_acceptance")):
             score+=35.0
         if bool(ind.get("level_reclaim")):
@@ -5095,7 +5119,7 @@ async def cycle_loop():
                                 reason=None
                                 diag={}
 
-                                if strategy_name=="AVWAP_VOLUME_PROFILE":
+                                if strategy_name in {ALLOWED_STRATEGY,OTC_STRATEGY}:
                                     asset=next((a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),None)
                                     analysis_closed_1m=_prepare_volume_candles(p,closed_1m)
                                     refreshed=analyze_asset(
@@ -5105,18 +5129,27 @@ async def cycle_loop():
                                         require_high_volume=False,
                                     )
                                     if not refreshed:
-                                        reason="avwap_volume_profile_recheck_failed"
-                                        diag={"closed_1m":len(closed_1m)}
+                                        reason=(
+                                            "otc_structure_recheck_failed"
+                                            if strategy_name==OTC_STRATEGY
+                                            else "avwap_volume_profile_recheck_failed"
+                                        )
+                                        diag={"closed_1m":len(closed_1m),"strategy":strategy_name}
+                                    elif str(refreshed.get("strategy") or "").upper()!=strategy_name:
+                                        reason="asset_class_strategy_mismatch"
+                                        diag={
+                                            "expected_strategy":strategy_name,
+                                            "actual_strategy":refreshed.get("strategy"),
+                                            "closed_1m":len(closed_1m),
+                                        }
                                     elif str(refreshed.get("direction") or "").upper()!=expected:
-                                        reason="avwap_volume_profile_direction_changed"
+                                        reason="strategy_direction_changed"
                                         diag={
                                             "expected":expected,
                                             "actual":refreshed.get("direction"),
                                             "closed_1m":len(closed_1m),
                                         }
                                     else:
-                                        # Replace stale candidate features with the fresh
-                                        # closed-candle AVWAP+VP calculation before delivery.
                                         _item.update(refreshed)
                                         _item["expiry_minutes"]=1
                                         _item["qualified_pass"]=pass_no
@@ -5125,23 +5158,37 @@ async def cycle_loop():
                                             _item,final_reference
                                         )
                                         diag={
-                                            "engine":"AVWAP_VOLUME_PROFILE",
+                                            "engine":strategy_name,
                                             "direction":refreshed.get("direction"),
                                             "confidence":refreshed.get("confidence"),
-                                            "value_area_acceptance":refreshed.get("value_area_acceptance"),
-                                            "level_reclaim":(refreshed.get("indicators") or {}).get("level_reclaim"),
-                                            "slope_persistent":(refreshed.get("indicators") or {}).get("slope_persistent"),
-                                            "poc_migration":(refreshed.get("indicators") or {}).get("profile_poc_migration_norm"),
-                                            "volume_quality":(refreshed.get("indicators") or {}).get("volume_quality"),
-                                            "volume_coverage":(refreshed.get("indicators") or {}).get("volume_coverage"),
                                             "closed_1m":len(closed_1m),
                                         }
+                                        if strategy_name==OTC_STRATEGY:
+                                            otc_ind=dict(refreshed.get("indicators") or {})
+                                            diag.update({
+                                                "otc_market_bias":otc_ind.get("otc_market_bias"),
+                                                "bos_level":otc_ind.get("otc_bos_level"),
+                                                "displacement":otc_ind.get("otc_displacement_confirmed"),
+                                                "retest":otc_ind.get("otc_retest_confirmed"),
+                                                "hold":otc_ind.get("otc_hold_confirmed"),
+                                                "confirmation":otc_ind.get("otc_confirmation_candle_confirmed"),
+                                            })
+                                        else:
+                                            otc_ind=dict(refreshed.get("indicators") or {})
+                                            diag.update({
+                                                "value_area_acceptance":refreshed.get("value_area_acceptance"),
+                                                "level_reclaim":otc_ind.get("level_reclaim"),
+                                                "slope_persistent":otc_ind.get("slope_persistent"),
+                                                "poc_migration":otc_ind.get("profile_poc_migration_norm"),
+                                                "volume_quality":otc_ind.get("volume_quality"),
+                                                "volume_coverage":otc_ind.get("volume_coverage"),
+                                            })
                                 else:
                                     reason="legacy_strategy_not_allowed"
                                     diag={"strategy":strategy_name}
 
                                 _item["final_delivery_confirmed"]=not bool(reason)
-                                _item["final_delivery_confirmation_reason"]=reason or "avwap_volume_profile_confirmed"
+                                _item["final_delivery_confirmation_reason"]=reason or ("otc_structure_confirmed" if strategy_name==OTC_STRATEGY else "avwap_volume_profile_confirmed")
                                 _item["final_delivery_diagnostic"]=diag
                                 _item["final_delivery_prepared_at"]=final_reference
 
