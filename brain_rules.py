@@ -43,6 +43,15 @@ class ActiveSignal:
     actual_entry_captured:bool=False
     actual_entry_source:str=""
     telegram_eval_counted:bool=False
+    # Keep the signal's pre-entry reference separate from any actual DEMO trade quote.
+    signal_reference_price:float|None=None
+    broker_trade_id:str=""
+    broker_trade_open_ts:float|None=None
+    broker_trade_open_price:float|None=None
+    broker_trade_close_price:float|None=None
+    broker_trade_status:str=""
+    broker_trade_profit:float|None=None
+    broker_trade_source:str=""
 
 @dataclass
 class BrainState:
@@ -255,7 +264,9 @@ class BrainState:
             pattern=str(kw.get("pattern","")),trend_15m=str(kw.get("trend_15m","")),
             structure_1m=str(kw.get("structure_1m","")),self_strategy=str(kw.get("self_strategy","")),self_strategy_version=str(kw.get("self_strategy_version","")),
             indicator_context=dict(kw.get("indicator_context") or {}),
-            telegram_eval_counted=bool(self.telegram_eval_active and not self.telegram_eval_completed))
+            telegram_eval_counted=bool(self.telegram_eval_active and not self.telegram_eval_completed),
+            signal_reference_price=float(kw.get("signal_reference_price", kw.get("entry_price", 0.0)) or 0.0) or None
+        )
         self.active_signals[f"{s.cycle_id}:{s.pair}:{s.entry_ts}"]=s
         return s
 
@@ -487,19 +498,27 @@ class BrainState:
         if n<=0: return 0.0
         return max(-3.0,min(3.0,(float(b.get("weighted",0) or 0)/n)*3.0))
 
-    def finish_signal(self,key,exit_price,result_ts=None):
+    def finish_signal(self,key,exit_price,result_ts=None, result_source="", broker_trade_id="", broker_status="", broker_profit=None):
         s=self.active_signals.pop(key)
         result=self.classify_result(s.direction,s.entry_price,float(exit_price))
         now=utc_now() if result_ts is None else float(result_ts)
         rec={
             "cycle_id":s.cycle_id,"account_id":s.account_id,"pair":s.pair,"display_name":s.display_name,
             "direction":s.direction,"expiry_minutes":s.expiry_minutes,
-            "entry_price":s.entry_price,"exit_price":float(exit_price),
+            "entry_price":s.entry_price,"signal_reference_price":s.signal_reference_price,
+            "exit_price":float(exit_price),
             "entry_ts":s.entry_ts,"result_ts":now,"strategy":s.strategy,
             "pattern":s.pattern,"trend_15m":s.trend_15m,
             "structure_1m":s.structure_1m,"self_strategy":s.self_strategy,
             "self_strategy_version":s.self_strategy_version,"reason":s.reason,
             "confidence":s.confidence,"result":result,
+            "result_source":str(result_source or getattr(s,"broker_trade_source","") or ""),
+            "broker_trade_id":str(broker_trade_id or getattr(s,"broker_trade_id","") or ""),
+            "broker_trade_status":str(broker_status or getattr(s,"broker_trade_status","") or ""),
+            "broker_trade_profit":(float(broker_profit) if broker_profit is not None else getattr(s,"broker_trade_profit",None)),
+            "broker_trade_open_ts":getattr(s,"broker_trade_open_ts",None),
+            "broker_trade_open_price":getattr(s,"broker_trade_open_price",None),
+            "broker_trade_close_price":getattr(s,"broker_trade_close_price",None),
             "indicator_context":s.indicator_context
         }
         # Update the global consecutive-loss circuit breaker from completed,
