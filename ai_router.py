@@ -53,21 +53,69 @@ def _cfg(name):
     if not key and name=="GROQ":key=os.getenv("GROQ_API_KEY","").strip()
     if not key and name=="NVIDIA":key=os.getenv("NVIDIA_API_KEY","").strip() or os.getenv("NVIDIA_NIM_API_KEY","").strip()
     if not key and name=="NARAROUTER":
-        # Accept the common environment names used for the ByNara/NaraRouter key.
-        key=(os.getenv("BYNARA_API_KEY","").strip()
-             or os.getenv("NARA_API_KEY","").strip()
-             or os.getenv("NARA_ROUTER_API_KEY","").strip())
+        # Accept the environment aliases commonly used by ByNara/NaraRouter
+        # deployments. AI_API_KEY is accepted only for NaraRouter so a generic
+        # AI key configured by an existing Render service is not silently applied
+        # to unrelated providers.
+        for env_name in (
+            "BYNARA_API_KEY",
+            "NARA_API_KEY",
+            "NARA_ROUTER_API_KEY",
+            "NARAROUTER_API_TOKEN",
+            "NARA_ROUTER_TOKEN",
+            "NARAROUTER_TOKEN",
+            "BYNARA_API_TOKEN",
+            "BYNARA_TOKEN",
+            "BYNARA_KEY",
+            "NARA_TOKEN",
+            "NARA_KEY",
+            "NARA_ROUTER_KEY",
+            "AI_API_KEY",
+        ):
+            candidate=os.getenv(env_name,"").strip()
+            if candidate:
+                key=candidate
+                break
+
     base=os.getenv(f"{name}_BASE_URL","").strip().rstrip("/")
     if not base and name=="NARAROUTER":
-        base=(os.getenv("BYNARA_BASE_URL","").strip().rstrip("/")
-              or os.getenv("NARA_BASE_URL","").strip().rstrip("/"))
+        for env_name in (
+            "BYNARA_BASE_URL",
+            "NARA_BASE_URL",
+            "NARA_ROUTER_BASE_URL",
+            "NARAROUTER_URL",
+            "BYNARA_URL",
+            "NARA_URL",
+            "NARA_ROUTER_URL",
+            "AI_BASE_URL",
+        ):
+            candidate=os.getenv(env_name,"").strip().rstrip("/")
+            if candidate:
+                base=candidate
+                break
+    if name=="NARAROUTER" and base:
+        # /keys is the provider key-management page, not the OpenAI-compatible
+        # inference endpoint. Normalize this common configuration mistake.
+        base_path=base.rstrip("/").lower()
+        if base_path.endswith("/keys"):
+            base=base[:-(len("/keys"))].rstrip("/")+"/v1"
+            log.warning("NARAROUTER_BASE_NORMALIZED source=/keys target=%s",base)
     if not base:
         base={"OPENAI":"https://api.openai.com/v1","GEMINI":"https://generativelanguage.googleapis.com/v1beta/openai","GROQ":"https://api.groq.com/openai/v1","NVIDIA":"https://integrate.api.nvidia.com/v1","OPENROUTER":"https://openrouter.ai/api/v1","MISTRAL":"https://api.mistral.ai/v1","NARAROUTER":"https://router.bynara.id/v1"}.get(name,"")
     # Provider-specific models must override the global AI_MODEL. A global model
     # such as gpt-5.6 is not valid for Gemini/Groq/etc.
     model=os.getenv(f"{name}_MODEL","").strip()
     if not model and name=="NARAROUTER":
-        model=(os.getenv("BYNARA_MODEL","").strip() or os.getenv("NARA_MODEL","").strip())
+        for env_name in (
+            "BYNARA_MODEL",
+            "NARA_MODEL",
+            "NARA_ROUTER_MODEL",
+            "NARAROUTER_MODEL",
+        ):
+            candidate=os.getenv(env_name,"").strip()
+            if candidate:
+                model=candidate
+                break
     if not model:
         model={"GEMINI":"gemini-3.8-flash","GROQ":"openai/gpt-oss-20b","NVIDIA":"openai/gpt-oss-20b","NARAROUTER":"auto/bynara"}.get(name,"")
     if not model:
