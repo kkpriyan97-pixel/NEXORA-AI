@@ -1038,6 +1038,17 @@ CANDLE_GOOD_ONCE=set()
 # Bounded local tick history powers a real 5-second micro-candle view. It never
 # fabricates missing ticks; unavailable coverage is reported explicitly.
 TICK_HISTORY=defaultdict(lambda: deque(maxlen=720))
+
+# Persistent M1 tick-activity ledger. This is observed broker tick activity only;
+# it is never labelled as traded/notional volume.
+VOLUME_M1_CACHE=defaultdict(dict)
+VOLUME_PENDING=defaultdict(dict)
+VOLUME_DB_WRITE_LOCK=asyncio.Lock()
+VOLUME_DB_FLUSH_IN_PROGRESS=False
+VOLUME_LAST_FLUSH_AT=0.0
+VOLUME_LOOKBACK_MINUTES=max(180,min(1440,int(os.getenv("VOLUME_LOOKBACK_MINUTES","720") or 720)))
+VOLUME_FLUSH_INTERVAL=max(2.0,min(15.0,float(os.getenv("VOLUME_FLUSH_INTERVAL","5") or 5)))
+
 # Event-1 is the only live market stream available for observed tick activity.
 # This cache never invents traded volume; it only lets the brain use the number
 # of actually received broker ticks when candle volume is absent.
@@ -1893,6 +1904,181 @@ def _tick_records(value):
             if isinstance(v,(dict,list)):
                 yield from _tick_records(v)
 
+async def ensure_tick_volume_table():
+    """Create the durable per-minute observed-tick ledger."""
+    if not LEARNING_DB_URL:
+        log.error("VOLUME_DB_REQUIRED")
+        return False
+    try:
+        import psycopg
+        def init():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS candice_m1_tick_volume (
+                            pair TEXT NOT NULL,
+                            minute_ts BIGINT NOT NULL,
+                            tick_count BIGINT NOT NULL DEFAULT 0,
+                            first_tick_ts DOUBLE PRECISION,
+                            last_tick_ts DOUBLE PRECISION,
+                            observed_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
+                            source TEXT NOT NULL DEFAULT 'event1_received_ticks',
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            PRIMARY KEY(pair,minute_ts)
+                        )
+                    """)
+                    cur.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_candice_m1_tick_volume_recent
+                        ON candice_m1_tick_volume(minute_ts)
+                    """)
+                    cur.execute("""
+                        DELETE FROM candice_m1_tick_volume
+                        WHERE minute_ts < EXTRACT(EPOCH FROM NOW())::BIGINT - %s
+                    """,(VOLUME_LOOKBACK_MINUTES*60,))
+                db.commit()
+        await asyncio.to_thread(init)
+        log.info("VOLUME_DB_READY table=candice_m1_tick_volume lookback_minutes=%d",VOLUME_LOOKBACK_MINUTES)
+        return True
+    except Exception as e:
+        log.error("VOLUME_DB_INIT_FAILED type=%s message=%s",type(e).__name__,str(e)[:180])
+        return False
+
+async def load_persistent_tick_volume():
+    """Load recent observed-tick M1 history after a Render restart."""
+    if not LEARNING_DB_URL:
+        return 0
+    try:
+        import psycopg
+        cutoff=int(time.time())-VOLUME_LOOKBACK_MINUTES*60
+        def read():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        SELECT pair,minute_ts,tick_count,first_tick_ts,last_tick_ts,observed_seconds,source
+                        FROM candice_m1_tick_volume
+                        WHERE minute_ts >= %s
+                        ORDER BY pair,minute_ts
+                    """,(cutoff,))
+                    return cur.fetchall()
+        rows=await asyncio.to_thread(read)
+        loaded=0
+        for pair,minute_ts,tick_count,first_tick_ts,last_tick_ts,observed_seconds,source in rows:
+            VOLUME_M1_CACHE[str(pair)][int(minute_ts)]={
+                "tick_count":int(tick_count or 0),
+                "first_tick_ts":float(first_tick_ts) if first_tick_ts is not None else None,
+                "last_tick_ts":float(last_tick_ts) if last_tick_ts is not None else None,
+                "observed_seconds":float(observed_seconds or 0.0),
+                "source":str(source or "event1_received_ticks"),
+            }
+            loaded+=1
+        log.info("VOLUME_DB_LOADED rows=%d pairs=%d",loaded,len(VOLUME_M1_CACHE))
+        return loaded
+    except Exception as e:
+        log.warning("VOLUME_DB_LOAD_FAILED type=%s message=%s",type(e).__name__,str(e)[:180])
+        return 0
+
+def _record_tick_activity(pair,received_at):
+    """Accumulate one observed Event-1 tick into its exact M1 bucket."""
+    p=str(pair or "").strip()
+    if not p:
+        return
+    minute=int(float(received_at)//60)*60
+    rec=VOLUME_PENDING[p].get(minute)
+    if rec is None:
+        rec={"tick_count":0,"first_tick_ts":float(received_at),"last_tick_ts":float(received_at)}
+        VOLUME_PENDING[p][minute]=rec
+    rec["tick_count"]=int(rec.get("tick_count",0))+1
+    rec["first_tick_ts"]=min(float(rec.get("first_tick_ts") or received_at),float(received_at))
+    rec["last_tick_ts"]=max(float(rec.get("last_tick_ts") or received_at),float(received_at))
+
+async def flush_tick_volume_pending(force=False):
+    """Persist pending observed ticks in small batches; never blocks the signal path."""
+    global VOLUME_DB_FLUSH_IN_PROGRESS,VOLUME_LAST_FLUSH_AT
+    if not LEARNING_DB_URL or VOLUME_DB_FLUSH_IN_PROGRESS:
+        return False
+    now=time.time()
+    if not force and now-VOLUME_LAST_FLUSH_AT < VOLUME_FLUSH_INTERVAL:
+        return False
+    if not any(VOLUME_PENDING.values()):
+        VOLUME_LAST_FLUSH_AT=now
+        return False
+    VOLUME_DB_FLUSH_IN_PROGRESS=True
+    snapshot={p:{m:dict(v) for m,v in buckets.items()} for p,buckets in VOLUME_PENDING.items() if buckets}
+    try:
+        import psycopg
+        def put():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=5) as db:
+                with db.cursor() as cur:
+                    for pair,buckets in snapshot.items():
+                        for minute_ts,rec in buckets.items():
+                            first_ts=float(rec["first_tick_ts"])
+                            last_ts=float(rec["last_tick_ts"])
+                            cur.execute("""
+                                INSERT INTO candice_m1_tick_volume(
+                                    pair,minute_ts,tick_count,first_tick_ts,last_tick_ts,
+                                    observed_seconds,source
+                                )
+                                VALUES(%s,%s,%s,%s,%s,%s,'event1_received_ticks')
+                                ON CONFLICT(pair,minute_ts) DO UPDATE SET
+                                    tick_count=candice_m1_tick_volume.tick_count+EXCLUDED.tick_count,
+                                    first_tick_ts=LEAST(candice_m1_tick_volume.first_tick_ts,EXCLUDED.first_tick_ts),
+                                    last_tick_ts=GREATEST(candice_m1_tick_volume.last_tick_ts,EXCLUDED.last_tick_ts),
+                                    observed_seconds=LEAST(
+                                        60.0,
+                                        GREATEST(
+                                            0.0,
+                                            GREATEST(candice_m1_tick_volume.last_tick_ts,EXCLUDED.last_tick_ts)
+                                            - LEAST(candice_m1_tick_volume.first_tick_ts,EXCLUDED.first_tick_ts)
+                                        )
+                                    ),
+                                    source='event1_received_ticks',
+                                    updated_at=NOW()
+                            """,(pair,int(minute_ts),int(rec["tick_count"]),first_ts,last_ts,
+                                  max(0.0,min(60.0,last_ts-first_ts))))
+                db.commit()
+        async with VOLUME_DB_WRITE_LOCK:
+            await asyncio.to_thread(put)
+        for pair,buckets in snapshot.items():
+            for minute_ts,rec in buckets.items():
+                cache=VOLUME_M1_CACHE[pair].get(int(minute_ts))
+                if cache is None:
+                    cache={"tick_count":0,"first_tick_ts":None,"last_tick_ts":None,
+                           "observed_seconds":0.0,"source":"event1_received_ticks"}
+                    VOLUME_M1_CACHE[pair][int(minute_ts)]=cache
+                cache["tick_count"]=int(cache.get("tick_count",0))+int(rec["tick_count"])
+                first=float(rec["first_tick_ts"]); last=float(rec["last_tick_ts"])
+                cache["first_tick_ts"]=first if cache.get("first_tick_ts") is None else min(float(cache["first_tick_ts"]),first)
+                cache["last_tick_ts"]=last if cache.get("last_tick_ts") is None else max(float(cache["last_tick_ts"]),last)
+                cache["observed_seconds"]=min(60.0,max(0.0,float(cache["last_tick_ts"])-float(cache["first_tick_ts"])))
+                current=VOLUME_PENDING.get(pair,{}).get(int(minute_ts))
+                if current is not None:
+                    pending_count=int(current.get("tick_count",0))
+                    snap_count=int(rec["tick_count"])
+                    if pending_count<=snap_count:
+                        VOLUME_PENDING[pair].pop(int(minute_ts),None)
+                    else:
+                        current["tick_count"]=pending_count-snap_count
+            if not VOLUME_PENDING.get(pair):
+                VOLUME_PENDING.pop(pair,None)
+        flushed_buckets=sum(len(v) for v in snapshot.values())
+        flushed_ticks=sum(int(x.get("tick_count",0)) for v in snapshot.values() for x in v.values())
+        VOLUME_LAST_FLUSH_AT=time.time()
+        log.info("VOLUME_M1_PERSISTED pairs=%d buckets=%d ticks=%d source=event1_received_ticks",
+                 len(snapshot),flushed_buckets,flushed_ticks)
+        return True
+    except Exception as e:
+        log.warning("VOLUME_M1_PERSIST_FAILED type=%s message=%s pending_pairs=%d",
+                    type(e).__name__,str(e)[:180],len(snapshot))
+        return False
+    finally:
+        VOLUME_DB_FLUSH_IN_PROGRESS=False
+
+async def _schedule_tick_volume_flush():
+    try:
+        await flush_tick_volume_pending()
+    except Exception as e:
+        log.debug("VOLUME_M1_FLUSH_TASK_FAILED type=%s message=%s",type(e).__name__,str(e)[:120])
+
 async def on_tick(message):
     received_at=time.time()
     updated=0
@@ -1918,39 +2104,52 @@ async def on_tick(message):
                 # Keep only a bounded receipt-time tick history. This is local
                 # market-data history used for 5s confirmation and is read-only.
                 TICK_HISTORY[p].append((received_at,price_value))
+                _record_tick_activity(p,received_at)
                 updated+=1
             except Exception:
                 pass
     if updated:
+        # Postgres persistence is asynchronous and never awaited by the websocket callback.
+        if not VOLUME_DB_FLUSH_IN_PROGRESS:
+            asyncio.create_task(_schedule_tick_volume_flush(),name="volume_m1_flush")
         last_log=STATE.get("_tick_state_log_at",0.0)
         if received_at-last_log>=10.0:
             STATE["_tick_state_log_at"]=received_at
             log.info("TICK_STATE_READY updated=%d tracked=%d",updated,len(STATE["prices"]))
 
+def _volume_cache_record(pair,minute_ts):
+    p=str(pair or "")
+    m=int(minute_ts)
+    base=VOLUME_M1_CACHE.get(p,{}).get(m)
+    pending=VOLUME_PENDING.get(p,{}).get(m)
+    if base is None and pending is None:
+        return None
+    out={"tick_count":0,"first_tick_ts":None,"last_tick_ts":None,
+         "observed_seconds":0.0,"source":"event1_received_ticks"}
+    for rec in (base,pending):
+        if not rec:
+            continue
+        out["tick_count"]+=int(rec.get("tick_count",0) or 0)
+        ft=rec.get("first_tick_ts"); lt=rec.get("last_tick_ts")
+        if ft is not None:
+            out["first_tick_ts"]=float(ft) if out["first_tick_ts"] is None else min(out["first_tick_ts"],float(ft))
+        if lt is not None:
+            out["last_tick_ts"]=float(lt) if out["last_tick_ts"] is None else max(out["last_tick_ts"],float(lt))
+    if out["first_tick_ts"] is not None and out["last_tick_ts"] is not None:
+        out["observed_seconds"]=min(60.0,max(0.0,out["last_tick_ts"]-out["first_tick_ts"]))
+    return out
+
 def _apply_tick_activity_volume(pair,candles):
-    """Enrich zero-volume candles with observed broker Event-1 tick counts.
-    
-    This is explicitly tick-activity data, not traded/notional volume. It is
-    only used when the broker candle itself has no positive volume field.
+    """Enrich zero-volume candles from the durable Event-1 M1 tick ledger.
+
+    The resulting value is observed tick activity, never claimed traded volume.
+    Partial-minute coverage is explicitly marked in the candle metadata.
     """
     source=list(candles or [])
     if not source:
         return source
-
     history=list(TICK_HISTORY.get(str(pair),()))
-    if not history:
-        return source
-
-    minute_counts=defaultdict(int)
-    for received_at,_price in history:
-        try:
-            bucket=int(float(received_at)//60)*60
-            minute_counts[bucket]+=1
-        except (TypeError,ValueError):
-            continue
-
-    enriched=[]
-    enriched_count=0
+    enriched=[]; enriched_count=0; complete_count=0
     for raw in source:
         if not isinstance(raw,dict):
             continue
@@ -1959,7 +2158,7 @@ def _apply_tick_activity_volume(pair,candles):
         for key in ("real_volume","realVolume","trade_volume","tradeVolume",
                     "traded_volume","tradedVolume","base_volume","baseVolume",
                     "quote_volume","quoteVolume","volume",
-                    "tick_volume","tickVolume","ticks","tick_count","tickCount","vol","v"):
+                    "tick_volume","tickVolume","ticks","tick_count","tickCount","vol"):
             try:
                 value=float(item.get(key,0) or 0)
             except (TypeError,ValueError):
@@ -1967,27 +2166,31 @@ def _apply_tick_activity_volume(pair,candles):
             if value>0.0:
                 existing=value
                 break
-
         ts=_candle_epoch(item)
         if existing<=0.0 and ts is not None:
-            count=int(min(100000,max(0,minute_counts.get(int(ts//60)*60,0))))
-            if count>0:
-                item["tick_volume"]=count
+            rec=_volume_cache_record(pair,int(ts//60)*60)
+            if rec and int(rec.get("tick_count",0))>0:
+                observed=float(rec.get("observed_seconds") or 0.0)
+                item["tick_volume"]=int(min(100000,max(0,rec["tick_count"])))
                 item["volume_source"]="TICK_ACTIVITY"
+                item["tick_activity_observed_seconds"]=round(observed,3)
+                item["tick_activity_complete"]=bool(observed>=45.0)
+                item["tick_activity_source"]="event1_received_ticks"
                 enriched_count+=1
+                if observed>=45.0:
+                    complete_count+=1
         enriched.append(item)
-
     now=time.time()
     last=float(TICK_ACTIVITY_AUDIT_LAST.get(str(pair),0.0) or 0.0)
     if now-last>=60.0:
         TICK_ACTIVITY_AUDIT_LAST[str(pair)]=now
         total=len(enriched)
         log.info(
-            "TICK_ACTIVITY_VOLUME_AUDIT pair=%s candles=%d enriched=%d coverage=%.3f "
-            "tick_history=%d source=event1_received_ticks",
-            pair,total,enriched_count,
-            (enriched_count/max(1,total)),
-            len(history),
+            "TICK_ACTIVITY_VOLUME_AUDIT pair=%s candles=%d enriched=%d complete=%d coverage=%.3f "
+            "complete_coverage=%.3f tick_history=%d cache_minutes=%d source=event1_received_ticks",
+            pair,total,enriched_count,complete_count,
+            enriched_count/max(1,total),complete_count/max(1,total),
+            len(history),len(VOLUME_M1_CACHE.get(str(pair),{}))
         )
     return enriched
 
@@ -5927,6 +6130,8 @@ async def main():
     await ensure_result_watch_queue_table()
     await ensure_cycle_state_table()
     await ensure_access_table()
+    await ensure_tick_volume_table()
+    await load_persistent_tick_volume()
     # The knowledge DB is an isolated bridge: learning writes compact validated
     # strategy/technique knowledge; the Signal Brain reads an in-memory snapshot.
     await ensure_strategy_knowledge_tables()
