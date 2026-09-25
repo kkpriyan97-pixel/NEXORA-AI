@@ -1039,6 +1039,9 @@ CANDLE_GOOD_ONCE=set()
 # Bounded local tick history powers a real 5-second micro-candle view. It never
 # fabricates missing ticks; unavailable coverage is reported explicitly.
 TICK_HISTORY=defaultdict(lambda: deque(maxlen=720))
+# Exact entry-boundary broker ticks. Kept separate so legacy 5s/30s
+# micro-candle aggregation remains backward-compatible.
+ENTRY_TICK_HISTORY=defaultdict(lambda: deque(maxlen=720))
 
 # Persistent M1 tick-activity ledger. This is observed broker tick activity only;
 # it is never labelled as traded/notional volume.
@@ -2372,7 +2375,11 @@ async def on_tick(message):
                 # Keep only a bounded receipt-time tick history. This is local
                 # market-data history used for 5s confirmation and is read-only.
                 TICK_HISTORY[p].append((received_at,price_value))
-                _record_tick_activity(p,broker_ts if ts is not None else received_at)
+                boundary_ts=broker_ts
+                if boundary_ts>20_000_000_000:
+                    boundary_ts/=1000.0
+                ENTRY_TICK_HISTORY[p].append((boundary_ts,received_at,price_value))
+                _record_tick_activity(p,boundary_ts if ts is not None else received_at)
                 updated+=1
             except Exception:
                 pass
@@ -2464,6 +2471,39 @@ def _apply_tick_activity_volume(pair,candles):
         )
     return enriched
 
+
+def boundary_entry_tick(pair,target_ts,window_seconds=3.0):
+    """Return the broker tick nearest the requested entry boundary.
+    
+    The live signal is defined at an exact minute boundary. Using the latest
+    received quote several seconds after that boundary can turn a borderline
+    trade into a false WIN/LOSS. Prefer a broker-timestamped tick nearest the
+    boundary and report the observed delta for audit.
+    """
+    try:
+        target=float(target_ts)
+    except (TypeError,ValueError):
+        return None
+    best=None
+    best_key=None
+    for item in list(ENTRY_TICK_HISTORY.get(str(pair),())):
+        if not isinstance(item,(tuple,list)) or len(item)<3:
+            continue
+        try:
+            broker_ts=float(item[0])
+            received_at=float(item[1])
+            price=float(item[2])
+        except (TypeError,ValueError):
+            continue
+        delta=abs(broker_ts-target)
+        if delta>float(window_seconds):
+            continue
+        # Nearest broker timestamp wins; receipt time is only a deterministic tie-break.
+        key=(delta,abs(received_at-time.time()))
+        if best is None or key<best_key:
+            best=(price,broker_ts,received_at,delta)
+            best_key=key
+    return best
 
 def tick_received_at(pair):
     rec=STATE["prices"].get(pair)
@@ -3785,13 +3825,44 @@ async def result_watch(key):
 
     entry_price=None
     entry_source=""
+    entry_boundary_delta=None
+    # First preference: exact-boundary broker-timestamped tick already captured
+    # by the authenticated Event-1 stream.
+    boundary=boundary_entry_tick(s.pair,s.entry_ts,window_seconds=3.0)
+    if boundary is not None:
+        entry_price,boundary_ts,_,entry_boundary_delta=boundary
+        entry_source=f"tick-boundary:{entry_boundary_delta:.3f}s"
+        log.info(
+            "ACTUAL_ENTRY_BOUNDARY_TICK pair=%s entry=%.12g broker_ts=%s delta=%.3fs",
+            s.pair,entry_price,
+            datetime.fromtimestamp(boundary_ts,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
+            entry_boundary_delta
+        )
     entry_deadline=time.time()+8.0
     while time.time()<entry_deadline and entry_price is None:
+        # Give the boundary tick a moment to arrive if the websocket was a little
+        # late, then refresh the candidate quote as a fallback.
+        boundary=boundary_entry_tick(s.pair,s.entry_ts,window_seconds=3.0)
+        if boundary is not None:
+            entry_price,boundary_ts,_,entry_boundary_delta=boundary
+            entry_source=f"tick-boundary:{entry_boundary_delta:.3f}s"
+            log.info(
+                "ACTUAL_ENTRY_BOUNDARY_TICK pair=%s entry=%.12g broker_ts=%s delta=%.3fs",
+                s.pair,entry_price,
+                datetime.fromtimestamp(boundary_ts,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
+                entry_boundary_delta
+            )
+            break
         rec=STATE["prices"].get(s.pair)
         if rec and rec[0] is not None and has_fresh_live_price(s.pair,time.time(),LIVE_TICK_MAX_AGE):
             try:
                 entry_price=float(rec[0])
-                entry_source=STATE["price_source"].get(s.pair,"tick")
+                entry_source=STATE["price_source"].get(s.pair,"tick-late-fallback")
+                log.warning(
+                    "ACTUAL_ENTRY_LATE_TICK_FALLBACK pair=%s entry=%.12g source=%s target=%s",
+                    s.pair,entry_price,entry_source,
+                    datetime.fromtimestamp(s.entry_ts,tz=timezone.utc).strftime("%H:%M:%S")
+                )
                 break
             except (TypeError,ValueError):
                 pass
@@ -3833,8 +3904,9 @@ async def result_watch(key):
             log.info("RESULT_WATCH_ENTRY_PERSISTED watch_id=%s pair=%s entry=%.12g",watch_id,s.pair,s.entry_price)
         except Exception as e:
             log.warning("RESULT_WATCH_ENTRY_PERSIST_FAILED watch_id=%s type=%s message=%s",watch_id,type(e).__name__,str(e)[:160])
-    log.info("ACTUAL_ENTRY_CAPTURED pair=%s entry=%.12g source=%s entry_ts=%s",
+    log.info("ACTUAL_ENTRY_CAPTURED pair=%s entry=%.12g source=%s boundary_delta=%s entry_ts=%s",
              s.pair,s.entry_price,entry_source,
+             f"{entry_boundary_delta:.3f}s" if entry_boundary_delta is not None else "NA",
              datetime.fromtimestamp(s.entry_ts,tz=timezone.utc).strftime("%H:%M:%S"))
 
     await asyncio.sleep(max(0,s.expiry_minutes*60-(time.time()-s.entry_ts)))
