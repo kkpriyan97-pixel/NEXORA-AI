@@ -95,7 +95,19 @@ def _extract_volume(raw):
 
 
 def _norm(raw):
-    volume,volume_source=_extract_volume(raw)
+    explicit_source=str(raw.get("volume_source") or "").upper()
+    if explicit_source=="TICK_ACTIVITY":
+        tick_value=0.0
+        for key in ("tick_volume","tickVolume","ticks","tick_count","tickCount"):
+            tick_value=_f(raw.get(key),0.0)
+            if tick_value>0.0:
+                volume_source="TICK_ACTIVITY"
+                volume=tick_value
+                break
+        else:
+            volume,volume_source=_extract_volume(raw)
+    else:
+        volume,volume_source=_extract_volume(raw)
     return {
         "time":_ts(raw.get("time",raw.get("t"))),
         "open":_f(raw.get("open",raw.get("o"))),
@@ -597,12 +609,21 @@ def analyze_asset(
         return None
 
     coverage=float(profile.get("volume_coverage") or 0.0)
-    # Broker candle feeds may expose no usable volume (coverage=0). In that case
-    # Volume Profile is computed from equal-activity bars as a clearly labelled
-    # proxy. The proxy is NEVER treated as real volume: live delivery requires
-    # strict external-AI verification later in app.py.
-    volume_quality="HIGH" if coverage>=0.80 else "MEDIUM" if coverage>=0.50 else "LOW"
-    volume_proxy_mode=coverage<0.80
+    real_coverage=float(profile.get("real_volume_coverage") or 0.0)
+    tick_coverage=float(profile.get("tick_volume_coverage") or 0.0)
+    tick_activity_coverage=float(profile.get("tick_activity_coverage") or 0.0)
+    # Keep quality semantics truthful. "HIGH" is reserved for broker-reported
+    # real/traded volume. Broker tick volume and locally observed tick activity
+    # are useful proxies but are never labelled as real volume.
+    if real_coverage>=0.80:
+        volume_quality="HIGH"
+    elif tick_coverage>=0.80:
+        volume_quality="TICK_VOLUME"
+    elif tick_activity_coverage>=0.80:
+        volume_quality="TICK_ACTIVITY"
+    else:
+        volume_quality="LOW"
+    volume_proxy_mode=real_coverage<0.80
     if volume_proxy_mode:
         _diag(
             pair,"volume_proxy_candidate",
@@ -714,9 +735,13 @@ def analyze_asset(
         "volume_bars":int(profile.get("volume_bars") or 0),
         "volume_mode":profile.get("volume_mode"),
         "volume_quality":volume_quality,
-        "real_volume_verified":bool(
-            float(profile.get("real_volume_coverage") or 0.0)>=0.80
+        "volume_data_class":(
+            "REAL_VOLUME" if real_coverage>=0.80
+            else "TICK_VOLUME" if tick_coverage>=0.80
+            else "TICK_ACTIVITY_PROXY" if tick_activity_coverage>0.0
+            else "NO_BROKER_VOLUME"
         ),
+        "real_volume_verified":bool(real_coverage>=0.80),
         "real_volume_bars":int(profile.get("real_volume_bars") or 0),
         "real_volume_coverage":float(profile.get("real_volume_coverage") or 0.0),
         "tick_volume_bars":int(profile.get("tick_volume_bars") or 0),
