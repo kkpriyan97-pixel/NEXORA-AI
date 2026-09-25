@@ -14,6 +14,8 @@ MIN_CONFIDENCE = 90
 CYCLE_SECONDS = 180
 EXPIRIES = (1,)
 ALLOWED_STRATEGY = "AVWAP_VOLUME_PROFILE"
+OTC_STRATEGY = "PRO_OTC_STRUCTURE_CONTINUATION"
+ALLOWED_STRATEGIES = (ALLOWED_STRATEGY, OTC_STRATEGY)
 
 def utc_now():
     return datetime.now(timezone.utc).timestamp()
@@ -579,8 +581,8 @@ class BrainState:
     def choose_expiry(self,pair,strategy,direction,live_quality=0,allow_5m=False):
         """Choose expiry from strategy-local evidence."""
         strategy=str(strategy).upper().strip()
-        # Live signal expiry is fixed at 1 minute for the two-indicator brain.
-        if strategy==ALLOWED_STRATEGY:
+        # Both production live strategies use the fixed 1-minute signal expiry.
+        if strategy in ALLOWED_STRATEGIES:
             return 1
         direction=str(direction).upper()
         base={
@@ -748,9 +750,9 @@ class BrainState:
         x=dict(c)
         pair=str(x.get("pair",""))
         strategy=str(x.get("strategy","")).upper().strip()
-        if strategy!=ALLOWED_STRATEGY:
+        if strategy not in ALLOWED_STRATEGIES:
             return {}
-        x["strategy"]=ALLOWED_STRATEGY
+        x["strategy"]=strategy
         x["expiry_minutes"]=1
         direction=str(x.get("direction","")).upper()
         self_strategy=str(x.get("self_strategy") or strategy)
@@ -932,12 +934,13 @@ class BrainState:
             if float(u)<=now:self.cooldown_until.pop(p,None)
 
 def rank_signal_candidates(candidates):
-    # LIVE EXACT-SETUP FILTER: only the empirically identified point can enter
-    # the production selector. Other indicator contexts remain available to the
-    # learning/research layers but cannot become live Telegram signals.
+    # Asset-class-specific production selector:
+    # REAL -> existing AVWAP + Volume Profile exact setup.
+    # OTC -> PRO Structure Continuation exact sequence only.
     q=[]
     for x in candidates:
-        if str(x.get("strategy","")).upper()!=ALLOWED_STRATEGY:
+        strategy=str(x.get("strategy","")).upper().strip()
+        if strategy not in ALLOWED_STRATEGIES:
             continue
         if int(x.get("confidence") or 0)<MIN_CONFIDENCE:
             continue
@@ -945,24 +948,48 @@ def rank_signal_candidates(candidates):
             continue
         if bool(x.get("ai_learning_blocked")):
             continue
+
         ind=dict(x.get("indicators") or x.get("indicator_context") or {})
-        value_position=str(ind.get("value_position") or "").upper()
         direction=str(x.get("direction") or "").upper()
-        if (
-            (direction=="UP" and value_position!="ABOVE_VALUE")
-            or (direction=="DOWN" and value_position!="BELOW_VALUE")
-        ):
+
+        if strategy==ALLOWED_STRATEGY:
+            value_position=str(ind.get("value_position") or "").upper()
+            if (
+                (direction=="UP" and value_position!="ABOVE_VALUE")
+                or (direction=="DOWN" and value_position!="BELOW_VALUE")
+            ):
+                continue
+            if ind.get("level_reclaim") is not False:
+                continue
+            if ind.get("slope_persistent") is not True:
+                continue
+            if ind.get("exact_live_setup") is not True:
+                continue
+        elif strategy==OTC_STRATEGY:
+            # The OTC strategy is isolated to the exact structural sequence.
+            if ind.get("otc_strategy") is not True:
+                continue
+            if ind.get("otc_market_bias") != ("BULLISH" if direction=="UP" else "BEARISH"):
+                continue
+            for flag in (
+                "otc_bos_confirmed",
+                "otc_displacement_confirmed",
+                "otc_retest_confirmed",
+                "otc_hold_confirmed",
+                "otc_confirmation_candle_confirmed",
+                "m1_continuation_ok",
+                "exact_live_setup",
+            ):
+                if ind.get(flag) is not True:
+                    break
+            else:
+                q.append(x)
             continue
-        if ind.get("level_reclaim") is not False:
-            continue
-        if ind.get("slope_persistent") is not True:
-            continue
-        if ind.get("exact_live_setup") is not True:
-            continue
+
         q.append(x)
 
-    # Among exact-setups, prefer the asset with the strongest current evidence
-    # plus bounded historical reliability from the same asset/setup context.
+    # Among exact-setups, prefer the strongest current evidence plus bounded
+    # historical reliability from the same context.
     return sorted(q,key=lambda x:(
         float(x.get("exact_setup_rank_score") or x.get("meta_rank_score") or x.get("confidence") or 0),
         float(x.get("exact_setup_reliability") or 0.5),
