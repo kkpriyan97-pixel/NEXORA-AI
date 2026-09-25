@@ -1,4 +1,5 @@
 import asyncio,json,logging,os,time,secrets,hashlib,re
+from math import isfinite
 from collections import defaultdict,deque
 from datetime import datetime,timezone,timedelta
 from zoneinfo import ZoneInfo
