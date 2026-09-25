@@ -2655,7 +2655,92 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         if a.get("signal_eligible",True)
     ]
     analyzed=[STATE["analyses"][a["pair"]].copy() for a in eligible if a["pair"] in STATE["analyses"]]
-    adapted=[BRAIN.adaptive_candidate(x) for x in analyzed]
+
+    # Volume-first candidate selection:
+    # 1) scan the full authenticated account asset universe;
+    # 2) keep assets with broker-reported real volume, broker tick volume, or
+    #    observed Event-1 tick-activity proxy;
+    # 3) keep only the top 10 by volume-data quality/coverage;
+    # 4) run the Candice Brain + AI verification only inside that volume pool.
+    #
+    # This is a candidate-priority layer only. It never overrides Brain direction,
+    # closed-candle structure, live quote checks, duplicate guards, or the final
+    # delivery gates. When the broker provides no usable volume field for any asset,
+    # the existing candidate path is preserved so volume-data scarcity cannot stop
+    # the 3-minute scheduler.
+    volume_priority_top_n=max(1,min(10,int(os.getenv("VOLUME_PRIORITY_TOP_N","10") or 10)))
+
+    def _volume_priority_key(candidate):
+        ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
+        data_class=str(ind.get("volume_data_class") or "").upper().strip()
+        source_rank={
+            "REAL_VOLUME":4,
+            "TICK_VOLUME":3,
+            "TICK_ACTIVITY_PROXY":2,
+            "NO_BROKER_VOLUME":0,
+        }.get(data_class,0)
+        try:
+            volume_coverage=float(ind.get("volume_coverage") or 0.0)
+        except (TypeError,ValueError):
+            volume_coverage=0.0
+        try:
+            source_coverage=max(
+                float(ind.get("real_volume_coverage") or 0.0),
+                float(ind.get("tick_volume_coverage") or 0.0),
+                float(ind.get("tick_activity_coverage") or 0.0),
+            )
+        except (TypeError,ValueError):
+            source_coverage=0.0
+        try:
+            volume_bars=int(ind.get("volume_bars") or 0)
+        except (TypeError,ValueError):
+            volume_bars=0
+        try:
+            fresh_activity_bars=int(ind.get("tick_activity_bars") or 0)
+        except (TypeError,ValueError):
+            fresh_activity_bars=0
+        return (
+            source_rank,
+            round(source_coverage,6),
+            round(volume_coverage,6),
+            volume_bars,
+            fresh_activity_bars,
+            int(candidate.get("confidence") or 0),
+        )
+
+    volume_enabled=[x for x in analyzed if _volume_priority_key(x)[0]>0 and _volume_priority_key(x)[1]>0.0]
+    volume_enabled.sort(key=_volume_priority_key,reverse=True)
+    volume_selected=volume_enabled[:volume_priority_top_n]
+    if volume_selected:
+        selected_pairs={str(x.get("pair")) for x in volume_selected}
+        volume_rank_by_pair={
+            str(x.get("pair")):idx for idx,x in enumerate(volume_selected,1)
+        }
+        selected_modes={}
+        for idx,x in enumerate(volume_selected,1):
+            pair=str(x.get("pair"))
+            ind=dict(x.get("indicators") or x.get("indicator_context") or {})
+            x["volume_priority_rank"]=idx
+            x["volume_priority_selected"]=True
+            x["volume_priority_source"]=str(ind.get("volume_data_class") or ind.get("volume_mode") or "UNKNOWN")
+            selected_modes[x["volume_priority_source"]]=selected_modes.get(x["volume_priority_source"],0)+1
+        analyzed_for_brain=volume_selected
+        log.info(
+            "VOLUME_PRIORITY_SCAN account_assets=%d analyzed=%d volume_enabled=%d "
+            "selected=%d top_n=%d modes=%s pairs=%s",
+            len(STATE.get("assets") or []),len(analyzed),len(volume_enabled),
+            len(volume_selected),volume_priority_top_n,selected_modes,
+            ",".join(str(x.get("pair")) for x in volume_selected),
+        )
+    else:
+        analyzed_for_brain=analyzed
+        log.warning(
+            "VOLUME_PRIORITY_FALLBACK account_assets=%d analyzed=%d reason=no_usable_volume_data "
+            "action=preserve_existing_brain_pool",
+            len(STATE.get("assets") or []),len(analyzed)
+        )
+
+    adapted=[BRAIN.adaptive_candidate(x) for x in analyzed_for_brain]
     # Final-pass resilience: earlier passes may have found a strong candidate that
     # disappears from STATE["analyses"] on the last refresh because its technical
     # score moved below the threshold for that instant. Never send that older decision
@@ -2793,9 +2878,21 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     # When deep_analysis is enabled, review every currently Brain-qualified setup
     # so one failed candidate can fall through to the next valid asset.
     # Preliminary passes remain intentionally narrow to protect the 3-minute timing window.
-    top=raw if not deep_analysis else raw[:AI_DEEP_REVIEW_TOP_N]
+    review_scope_n=min(
+        len(raw),
+        max(
+            AI_DEEP_REVIEW_TOP_N,
+            volume_priority_top_n if volume_selected else 0
+        )
+    )
+    top=raw if not deep_analysis else raw[:review_scope_n]
     if deep_analysis:
-        log.info("AI_DEEP_REVIEW_SCOPE candidates=%d configured_top_n=%d",len(raw),AI_DEEP_REVIEW_TOP_N)
+        log.info(
+            "AI_DEEP_REVIEW_SCOPE candidates=%d configured_top_n=%d volume_top_n=%d "
+            "review_scope=%d volume_priority=%s",
+            len(raw),AI_DEEP_REVIEW_TOP_N,volume_priority_top_n,
+            review_scope_n,bool(volume_selected)
+        )
     if require_live_price:
         log.info(            "LIVE_PRICE_SELECTION_MODE source=authenticated_event1 candidates=%d deep=%s",
             len(top),deep_analysis)
