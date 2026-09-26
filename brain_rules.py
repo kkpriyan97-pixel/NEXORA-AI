@@ -773,6 +773,16 @@ class BrainState:
         if strategy not in ALLOWED_STRATEGIES:
             return {}
         x["strategy"]=strategy
+        # Keep deterministic technical evidence separate from learned calibration.
+        # Historical penalties must not turn a technically valid setup into a
+        # sub-90 delivery score and suppress the entire 3-minute signal slot.
+        technical_confidence=int(
+            x.get("technical_confidence")
+            or x.get("confidence")
+            or x.get("market_quality")
+            or 0
+        )
+        x["technical_confidence"]=max(0,min(99,technical_confidence))
         x["expiry_minutes"]=1
         direction=str(x.get("direction","")).upper()
         self_strategy=str(x.get("self_strategy") or strategy)
@@ -829,7 +839,12 @@ class BrainState:
         # Confidence is the resulting evidence quality after bounded historical
         # calibration. A 94-96 technical score must not masquerade as a 94-96%
         # empirical win probability.
-        x["confidence"]=max(0,min(99,int(round(x["market_quality"]+calibration_penalty))))
+        x["calibrated_confidence"]=max(
+            0,min(99,int(round(x["market_quality"]+calibration_penalty)))
+        )
+        # Confidence shown at delivery remains the deterministic technical score.
+        # Learned calibration is retained separately for ranking/audit.
+        x["confidence"]=x["technical_confidence"]
 
         # Exact-setup asset reliability is now context-only. Broad pair history
         # is intentionally excluded because the same pair can alternate between
@@ -842,10 +857,26 @@ class BrainState:
         meta_rate=self._rate(meta_bucket) if meta_bucket and meta_n>=8 else 0.5
         exact_reliability=(0.55*ind_rate)+(0.45*meta_rate)
         reliability_bonus=max(-6.0,min(6.0,(exact_reliability-0.50)*24.0))
+        exact_evidence_samples=int(max(ind_n,meta_n))
         x["exact_setup_reliability"]=round(exact_reliability,4)
-        x["exact_setup_reliability_samples"]=int(ind_n+meta_n)
+        x["exact_setup_reliability_samples"]=exact_evidence_samples
+
+        # Hard-veto only when the exact context has enough observations.
+        # This prevents small samples from starving the 3-minute scheduler.
+        learned_veto=(
+            (exact_evidence_samples>=30 and exact_reliability<0.50)
+            or (exact_evidence_samples>=20 and exact_reliability<0.45)
+        )
+        if learned_veto:
+            x["ai_learning_blocked"]=True
+            x["learning_veto_reason"]=(
+                f"exact_context_reliability={exact_reliability:.4f};"
+                f"samples={exact_evidence_samples}"
+            )
+
         x["exact_setup_rank_score"]=round(
-            float(x.get("confidence") or 0)+reliability_bonus,
+            float(x.get("calibrated_confidence") or x.get("confidence") or 0)
+            +reliability_bonus,
             3
         )
 
