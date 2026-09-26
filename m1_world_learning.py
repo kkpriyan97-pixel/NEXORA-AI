@@ -43,11 +43,17 @@ TARGET_DAYS = 15
 TARGET_DOMAINS = 10_000
 TARGET_DAILY = math.ceil(TARGET_DOMAINS / TARGET_DAYS)
 RUN_SECONDS = max(30, int(os.getenv("M1_RESEARCH_RUN_SECONDS", "45")))
-MAX_CONCURRENCY = max(8, min(32, int(os.getenv("M1_RESEARCH_MAX_CONCURRENCY", "24"))))
-DISCOVERY_QUERIES_PER_RUN = max(16, min(64, int(os.getenv("M1_RESEARCH_QUERIES_PER_RUN", "48"))))
-FETCHES_PER_RUN = max(48, min(240, int(os.getenv("M1_RESEARCH_FETCHES_PER_RUN", "160"))))
+# Keep the multilingual research lab bounded on Render free tier. Research remains
+# enabled, but per-run concurrency, queue depth and page size are capped so it
+# cannot starve the 3-minute signal scheduler or exhaust the instance memory.
+MAX_CONCURRENCY = max(4, min(12, int(os.getenv("M1_RESEARCH_MAX_CONCURRENCY", "8"))))
+DISCOVERY_QUERIES_PER_RUN = max(12, min(32, int(os.getenv("M1_RESEARCH_QUERIES_PER_RUN", "24"))))
+FETCHES_PER_RUN = max(24, min(96, int(os.getenv("M1_RESEARCH_FETCHES_PER_RUN", "60"))))
 HTTP_TIMEOUT = max(3.0, float(os.getenv("M1_RESEARCH_HTTP_TIMEOUT", "6")))
-MAX_PAGE_BYTES = max(200_000, int(os.getenv("M1_RESEARCH_MAX_PAGE_BYTES", "700000")))
+MAX_PAGE_BYTES = max(200_000, min(400_000, int(os.getenv("M1_RESEARCH_MAX_PAGE_BYTES", "300000"))))
+MAX_RESEARCH_QUEUE = max(250, min(2000, int(os.getenv("M1_RESEARCH_MAX_QUEUE", "1000"))))
+MAX_ENQUEUED_URLS = max(5000, min(30000, int(os.getenv("M1_RESEARCH_MAX_ENQUEUED_URLS", "15000"))))
+MAX_ROBOTS_CACHE = max(128, min(1024, int(os.getenv("M1_RESEARCH_MAX_ROBOTS_CACHE", "512"))))
 USER_AGENT = os.getenv("M1_RESEARCH_USER_AGENT", "NEXORA-M1-ResearchBot/1.0")
 DB_URL = os.getenv("DATABASE_URL", "").strip()
 KIMI_RESEARCH_ENABLED = os.getenv("KIMI_RESEARCH_ENABLED", "true").strip().lower() != "false"
@@ -489,7 +495,7 @@ class NextCandleModel:
 class M1WorldLab:
     def __init__(self):
         self.db=DB();self.model=NextCandleModel(self.db);self.queue=asyncio.Queue()
-        self.enqueued=set();self.enqueued_order=deque(maxlen=MAX_ENQUEUED_URLS);self.robots={};self.robots_order=deque(maxlen=MAX_ROBOTS_CACHE);self.simhash_cache=deque(maxlen=2500);self.pending={}
+        self.enqueued=set();self.enqueued_order=deque();self.robots={};self.robots_order=deque();self.simhash_cache=deque(maxlen=2500);self.pending={}
         self.started_at=float(self.db.meta("started_at", "0") or 0)
         if not self.started_at:
             raw=os.getenv("M1_LEARNING_START_UTC",DEFAULT_START_UTC)
@@ -524,7 +530,7 @@ class M1WorldLab:
         if not u or self.db.page_seen(u) or u in self.enqueued:return
         if self.queue.qsize() >= MAX_RESEARCH_QUEUE:return
         self.enqueued.add(u);self.enqueued_order.append(u)
-        if len(self.enqueued)>MAX_ENQUEUED_URLS:
+        while len(self.enqueued)>MAX_ENQUEUED_URLS and self.enqueued_order:
             stale=self.enqueued_order.popleft()
             self.enqueued.discard(stale)
         try:self.queue.put_nowait((u,lang,origin));self.metrics["discovered"]+=1
@@ -540,7 +546,7 @@ class M1WorldLab:
                 if r.status_code<400:rp.parse(r.text.splitlines())
         except Exception:rp=None
         self.robots[d]=(now,rp);self.robots_order.append(d)
-        if len(self.robots)>MAX_ROBOTS_CACHE:
+        while len(self.robots)>MAX_ROBOTS_CACHE and self.robots_order:
             stale=self.robots_order.popleft()
             self.robots.pop(stale,None)
         return True if rp is None else rp.can_fetch(USER_AGENT,u)
