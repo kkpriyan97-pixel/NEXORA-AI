@@ -98,6 +98,8 @@ SIGNAL_SESSION_END_HOUR=24
 CYCLE_SCAN_OFFSETS=(150.0,120.0,90.0,75.0,60.0)
 CYCLE_SCAN_COUNT=len(CYCLE_SCAN_OFFSETS)
 # The signal scheduler runs continuously across the full UAE day. It does NOT enable broker auto-trading.
+# Production signal expiry is selected by the Brain from these two options.
+SIGNAL_EXPIRY_OPTIONS=(1,2)
 FORCE_SIGNAL_MODE=os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}
 ASSET_TRADEABILITY_PROBE_TIMEOUT=0.6
 # Avoid chasing an OTC move already stretched far beyond confirmed BOS.
@@ -5205,8 +5207,6 @@ async def cycle_loop():
                             item=raw_candidate.copy()
                             item["expiry_minutes"]=int(raw_candidate.get("expiry_minutes") or 1)
                             if item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
-                                item["expiry_minutes"]=int(raw_candidate.get("expiry_minutes") or 1)
-                            if item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
                                 item["expiry_minutes"]=1
                             item["qualified_pass"]=pass_no
                             item["deep_verified"]=pass_no>=4
@@ -5707,8 +5707,6 @@ async def cycle_loop():
                                     continue
                                 item=raw_recovered.copy()
                                 item["expiry_minutes"]=int(raw_recovered.get("expiry_minutes") or item.get("expiry_minutes") or 1)
-                                if item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
-                                    item["expiry_minutes"]=int(raw_recovered.get("expiry_minutes") or item.get("expiry_minutes") or 1)
                                 if item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
                                     item["expiry_minutes"]=1
                                 item["qualified_pass"]=5
