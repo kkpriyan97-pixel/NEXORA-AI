@@ -4333,6 +4333,31 @@ async def cycle_loop():
     SIGNAL_LEADS=(30.0,30.0)
     SCAN_OFFSETS=CYCLE_SCAN_OFFSETS
 
+    def normalize_live_expiry(candidate):
+        """Normalize production expiry at the scheduler boundary to 1m or 2m."""
+        if not isinstance(candidate,dict):
+            return candidate
+        x=candidate.copy()
+        strategy=str(x.get("strategy") or "").upper().strip()
+        direction=str(x.get("direction") or "").upper()
+        try:
+            technical=float(
+                x.get("technical_confidence")
+                or x.get("confidence")
+                or x.get("market_quality")
+                or 0
+            )
+        except (TypeError,ValueError):
+            technical=0.0
+        if strategy in {"AVWAP_VOLUME_PROFILE","PRO_OTC_STRUCTURE_CONTINUATION"} and direction in {"UP","DOWN"}:
+            x["expiry_minutes"]=int(BRAIN.choose_expiry(strategy=strategy,pair=x.get("pair"),direction=direction,live_quality=technical))
+            if int(x["expiry_minutes"]) not in SIGNAL_EXPIRY_OPTIONS:
+                x["expiry_minutes"]=2 if technical>=97 else 1
+            x["expiry_selection_basis"]="technical_boundary"
+        else:
+            x["expiry_minutes"]=1
+        return x
+
     async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
         if not signal_session_active(target):
             log.info(
@@ -4700,12 +4725,16 @@ async def cycle_loop():
             # The 3-minute value is the cycle interval only. The Brain chooses
             # the individual signal expiry from the locked 1m/2m production options.
             try:
+                candidate=normalize_live_expiry(candidate)
                 signal_expiry=int(candidate.get("expiry_minutes") or 1)
             except (TypeError,ValueError):
                 signal_expiry=1
             if signal_expiry not in SIGNAL_EXPIRY_OPTIONS:
                 signal_expiry=1
             candidate["expiry_minutes"]=signal_expiry
+            log.info("LIVE_EXPIRY_SELECTED cycle=%s pair=%s strategy=%s technical=%s expiry=%s basis=%s",
+                     cycle_id,p,candidate.get("strategy"),candidate.get("technical_confidence") or candidate.get("confidence"),
+                     signal_expiry,candidate.get("expiry_selection_basis"))
             s=BRAIN.mark_signal_sent(
                 account_id=STATE.get("account_id"),
                 pair=p,display_name=candidate["display_name"],
@@ -5204,8 +5233,8 @@ async def cycle_loop():
                         for raw_candidate in selected:
                             if not isinstance(raw_candidate,dict) or not raw_candidate.get("pair"):
                                 continue
-                            item=raw_candidate.copy()
-                            item["expiry_minutes"]=int(raw_candidate.get("expiry_minutes") or 1)
+                            item=normalize_live_expiry(raw_candidate)
+                            item["expiry_minutes"]=int(item.get("expiry_minutes") or 1)
                             if item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
                                 item["expiry_minutes"]=1
                             item["qualified_pass"]=pass_no
@@ -5512,7 +5541,7 @@ async def cycle_loop():
                         cycle_id,pass_no,len(STATE["analyses"])
                     )
                 else:
-                    candidate=candidate.copy()
+                    candidate=normalize_live_expiry(candidate)
                     candidate["expiry_minutes"]=int(candidate.get("expiry_minutes") or 1)
                     if candidate["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
                         candidate["expiry_minutes"]=1
@@ -5705,8 +5734,8 @@ async def cycle_loop():
                             for raw_recovered in recovered_list[:100]:
                                 if not isinstance(raw_recovered,dict) or not raw_recovered.get("pair"):
                                     continue
-                                item=raw_recovered.copy()
-                                item["expiry_minutes"]=int(raw_recovered.get("expiry_minutes") or item.get("expiry_minutes") or 1)
+                                item=normalize_live_expiry(raw_recovered)
+                                item["expiry_minutes"]=int(item.get("expiry_minutes") or 1)
                                 if item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
                                     item["expiry_minutes"]=1
                                 item["qualified_pass"]=5
