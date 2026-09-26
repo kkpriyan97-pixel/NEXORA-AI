@@ -4695,10 +4695,15 @@ async def cycle_loop():
             return False
 
         try:
-            # Live signal expiry is permanently fixed at 1 minute.
-            # The 3-minute value is the cycle interval only; it must never
-            # change the DEMO signal expiry in this delivery lane.
-            signal_expiry=1
+            # The 3-minute value is the cycle interval only. The Brain chooses
+            # the individual signal expiry from the locked 1m/2m production options.
+            try:
+                signal_expiry=int(candidate.get("expiry_minutes") or 1)
+            except (TypeError,ValueError):
+                signal_expiry=1
+            if signal_expiry not in SIGNAL_EXPIRY_OPTIONS:
+                signal_expiry=1
+            candidate["expiry_minutes"]=signal_expiry
             s=BRAIN.mark_signal_sent(
                 account_id=STATE.get("account_id"),
                 pair=p,display_name=candidate["display_name"],
@@ -4986,7 +4991,7 @@ async def cycle_loop():
                 "target_epoch":float(target),
                 "scans":[],
                 "protocol":"FLEX_MANUAL",
-                "signal_expiry_minutes":1,
+                "signal_expiry_options":list(SIGNAL_EXPIRY_OPTIONS),
                 "status":"WAITING_FOR_AUTH",
                 "reason":"broker_account_not_ready",
             }
@@ -5020,7 +5025,7 @@ async def cycle_loop():
             "target_epoch":float(target),
             "scans":[],
             "protocol":"FLEX_MANUAL",
-            "signal_expiry_minutes":1,
+            "signal_expiry_options":list(SIGNAL_EXPIRY_OPTIONS),
         }
         # Recovery metadata is best-effort; never block the signal scheduler on DB I/O.
         asyncio.create_task(save_cycle_state(
@@ -5198,7 +5203,11 @@ async def cycle_loop():
                             if not isinstance(raw_candidate,dict) or not raw_candidate.get("pair"):
                                 continue
                             item=raw_candidate.copy()
-                            item["expiry_minutes"]=1
+                            item["expiry_minutes"]=int(raw_candidate.get("expiry_minutes") or 1)
+                            if item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
+                                item["expiry_minutes"]=int(raw_candidate.get("expiry_minutes") or 1)
+                            if item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
+                                item["expiry_minutes"]=1
                             item["qualified_pass"]=pass_no
                             item["deep_verified"]=pass_no>=4
                             item["final_prepared_pass"]=pass_no if pass_no>=4 else 0
@@ -5386,7 +5395,9 @@ async def cycle_loop():
                                         }
                                     else:
                                         _item.update(refreshed)
-                                        _item["expiry_minutes"]=1
+                                        _item["expiry_minutes"]=int(refreshed.get("expiry_minutes") or _item.get("expiry_minutes") or 1)
+                                        if _item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
+                                            _item["expiry_minutes"]=1
                                         _item["qualified_pass"]=pass_no
                                         _item["deep_verified"]=True
                                         _item["final_delivery_precheck"]=_final_delivery_precheck(
@@ -5502,7 +5513,9 @@ async def cycle_loop():
                     )
                 else:
                     candidate=candidate.copy()
-                    candidate["expiry_minutes"]=1
+                    candidate["expiry_minutes"]=int(candidate.get("expiry_minutes") or 1)
+                    if candidate["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
+                        candidate["expiry_minutes"]=1
                     candidate["qualified_pass"]=pass_no
                     candidate["deep_verified"]=pass_no>=4
                     candidate["final_prepared_pass"]=pass_no if pass_no>=4 else 0
@@ -5693,7 +5706,11 @@ async def cycle_loop():
                                 if not isinstance(raw_recovered,dict) or not raw_recovered.get("pair"):
                                     continue
                                 item=raw_recovered.copy()
-                                item["expiry_minutes"]=1
+                                item["expiry_minutes"]=int(raw_recovered.get("expiry_minutes") or item.get("expiry_minutes") or 1)
+                                if item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
+                                    item["expiry_minutes"]=int(raw_recovered.get("expiry_minutes") or item.get("expiry_minutes") or 1)
+                                if item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
+                                    item["expiry_minutes"]=1
                                 item["qualified_pass"]=5
                                 item["deep_verified"]=True
                                 item["final_prepared_pass"]=5
@@ -7179,7 +7196,7 @@ async def build_live_analysis_payload():
         "strategy_families":[ALLOWED_STRATEGY,OTC_STRATEGY],
         "five_scan_cycle":dict(STATE.get("cycle_scan_status") or {}),
         "protocol":"FLEX_MANUAL",
-        "signal_expiry_minutes":1,
+        "signal_expiry_options":list(SIGNAL_EXPIRY_OPTIONS),
         "flex_auto_trade":False,
         "order_position_monitor":dict(STATE.get("live_order_monitor") or {}),
         "live_orders":[dict(v) for v in (STATE.get("live_orders") or {}).values()],
