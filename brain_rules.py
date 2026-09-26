@@ -7,7 +7,9 @@ import os
 from typing import Any
 from research_brain import research_status, TARGET_DAYS as RESEARCH_TARGET_DAYS
 
-COOLDOWN_SECONDS = 600
+# One full 3-minute cycle of pair-local cooldown after a LOSS.
+# The scheduler remains continuous and unrelated assets remain eligible.
+COOLDOWN_SECONDS = max(180, int(os.getenv("PAIR_LOSS_COOLDOWN_SECONDS", "180") or 180))
 GLOBAL_LOSS_STREAK_LIMIT = max(1, int(os.getenv("GLOBAL_LOSS_STREAK_LIMIT", "3") or 3))
 GLOBAL_LOSS_STREAK_COOLDOWN_SECONDS = max(60, int(os.getenv("GLOBAL_LOSS_STREAK_COOLDOWN_SECONDS", "600") or 600))
 MIN_CONFIDENCE = 90

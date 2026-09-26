@@ -9,7 +9,7 @@ from telegram.ext import ContextTypes
 import httpx
 from olymptrade_ws import OlympTradeClient
 from olymptrade_ws.olympconfig import parameters
-from brain_rules import ActiveSignal,BrainState,rank_signal_candidates
+from brain_rules import ActiveSignal,BrainState,rank_signal_candidates,COOLDOWN_SECONDS
 from candice_brain import analyze_asset,OTC_STRATEGY,ALLOWED_STRATEGY
 from ai_engine import snapshot_from_asset,ai_environment_status
 from ai_router import analyze_with_fallback,review_result_with_fallback
@@ -100,6 +100,9 @@ CYCLE_SCAN_COUNT=len(CYCLE_SCAN_OFFSETS)
 # The signal scheduler runs continuously across the full UAE day. It does NOT enable broker auto-trading.
 FORCE_SIGNAL_MODE=os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}
 ASSET_TRADEABILITY_PROBE_TIMEOUT=0.6
+# Avoid chasing an OTC move already stretched far beyond confirmed BOS.
+# This is an entry-integrity heuristic, not a profitability guarantee.
+OTC_MAX_BOS_EXTENSION_RANGES=max(1.5,min(5.0,float(os.getenv("OTC_MAX_BOS_EXTENSION_RANGES","2.5") or 2.5)))
 ASSET_TRADEABILITY_CACHE_TTL=45.0
 ASSET_TRADEABILITY_HARD_MAX_AGE=50.0
 # Final tick preparation is only an optimization for boundary delivery. It must
@@ -2075,8 +2078,8 @@ async def send_learning_summary(summary):
     lines += ["","📖 WHAT BRAIN LEARNED"]
     lines.extend(f"• {x}" for x in (summary.get("lessons") or []))
     lines += ["","🔐 Learning scope → authenticated token account only",
-              "⏸️ Account cooldown → 10 MIN",
-              "⚠️ Cooldown pauses new signals for this authenticated account only."]
+              f"⏸️ Pair loss cooldown → {max(1,int(COOLDOWN_SECONDS/60))} MIN",
+              "⚠️ A losing pair is cooled down locally; unrelated assets remain eligible."]
     await telegram("\n".join(lines),chat_id=ADMIN_TELEGRAM_ID)
 
 async def telegram_background(text_msg,label):
@@ -4253,13 +4256,14 @@ async def result_watch(key):
     trend=str(rec.get("trend_15m") or "").upper()
     trend_label="BULLISH" if "BULL" in trend else "BEARISH" if "BEAR" in trend else "—"
     structure=str(rec.get("structure_1m") or "").upper()
+    is_otc=str(rec.get("strategy") or "").upper()==OTC_STRATEGY
     structure_label=(
-        "ABOVE AVWAP + POC" if "ABOVE_AVWAP_POC" in structure
+        "BOS → DISPLACEMENT → RETEST → HOLD → CONFIRM"
+        if is_otc
+        else "ABOVE AVWAP + POC" if "ABOVE_AVWAP_POC" in structure
         else "BELOW AVWAP + POC" if "BELOW_AVWAP_POC" in structure
-        else "PRO OTC STRUCTURE CONTINUATION" if "PRO_OTC_STRUCTURE" in structure
         else "—"
     )
-    is_otc=str(rec.get("strategy") or "").upper()==OTC_STRATEGY
     engine_label="PRO OTC STRUCTURE CONTINUATION" if is_otc else "AVWAP + VOLUME PROFILE"
     verification_label=(
         "BROKER EVENT 26 • ACTUAL DEMO TRADE" if rec.get("result_source")=="broker_event26"
@@ -4555,6 +4559,29 @@ async def cycle_loop():
                     cycle_id,p,expected,entry,bos_level
                 )
                 return False
+
+            # 1-minute expiry is highly sensitive to a late/chased entry.
+            # Measure live distance from BOS against the setup's own M1 baseline
+            # range; reject clearly stretched entries and let the fallback continue.
+            baseline_range=float(ind.get("otc_baseline_range") or 0.0)
+            extension_norm=(
+                ((entry-bos_level)/baseline_range) if expected=="UP"
+                else ((bos_level-entry)/baseline_range)
+            ) if baseline_range>0.0 else 0.0
+            candidate["otc_entry_extension_norm"]=float(extension_norm)
+            candidate["otc_entry_extension_threshold"]=float(OTC_MAX_BOS_EXTENSION_RANGES)
+            ind["otc_entry_extension_norm"]=float(extension_norm)
+            ind["otc_entry_extension_threshold"]=float(OTC_MAX_BOS_EXTENSION_RANGES)
+            if baseline_range>0.0 and extension_norm>OTC_MAX_BOS_EXTENSION_RANGES:
+                log.info(
+                    "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=entry_overextended_from_bos entry=%s bos_level=%s "
+                    "baseline_range=%s extension_norm=%.3f max_ranges=%.3f next_asset=TRUE",
+                    cycle_id,p,expected,entry,bos_level,baseline_range,
+                    extension_norm,OTC_MAX_BOS_EXTENSION_RANGES
+                )
+                return False
+
             required_flags=(
                 "otc_strategy","otc_bos_confirmed","otc_displacement_confirmed",
                 "otc_retest_confirmed","otc_hold_confirmed",
@@ -5808,6 +5835,22 @@ async def cycle_loop():
             if int(x.get("qualified_pass") or 0)>=4
             and bool(x.get("deep_verified"))
         ]
+        # Remove pair-local LOSS cooldowns before boundary ranking so they cannot
+        # consume the exact 02:30 delivery slot.
+        boundary_candidates=[]
+        cooldown_excluded=0
+        for _candidate in final_candidates:
+            if BRAIN.is_signal_blocked(
+                pair=_candidate.get("pair"),
+                account_id=STATE.get("account_id"),
+            ):
+                cooldown_excluded+=1
+                log.info(
+                    "FINAL_BOUNDARY_COOLDOWN_EXCLUDED cycle=%s pair=%s reason=pair_loss_cooldown",
+                    cycle_id,_candidate.get("pair")
+                )
+                continue
+            boundary_candidates.append(_candidate)
         now_boundary=time.time()
         # Pass 5 now runs 15 seconds before the signal boundary. It prepares the final
         # closed-candle gate ahead of time; the exact signal second is delivery-only.
@@ -5825,7 +5868,7 @@ async def cycle_loop():
         # final confirmation, fresh authenticated tick, confidence and deadline.
         # This prevents one late gate failure from deleting otherwise valid
         # techniques that were already researched/qualified in the same cycle.
-        boundary_pool=list(final_candidates)
+        boundary_pool=list(boundary_candidates)
         _boundary_unique=[]
         _boundary_seen=set()
         for _x in sorted(
@@ -5853,13 +5896,14 @@ async def cycle_loop():
             _boundary_unique.append(_x)
         boundary_pool=_boundary_unique
         log.info(
-            "FINAL_BOUNDARY_POOL cycle=%s candidates=%d prepared_confirmed=%d total_deep=%d unique_assets=%d fresh_now=%d",
+            "FINAL_BOUNDARY_POOL cycle=%s candidates=%d prepared_confirmed=%d total_deep=%d unique_assets=%d fresh_now=%d cooldown_excluded=%d",
             cycle_id,len(boundary_pool),
             sum(1 for x in boundary_pool if bool(x.get("final_delivery_confirmed"))),
             len(final_candidates),len(boundary_pool),
             sum(1 for x in boundary_pool if has_fresh_live_price(
                 x.get("pair"),now_boundary,LIVE_TICK_MAX_AGE
-            ))
+            )),
+            cooldown_excluded
         )
         ranked_pool=sorted(
             boundary_pool,
@@ -5922,9 +5966,9 @@ async def cycle_loop():
                     break
 
         if not sent:
-            if boundary_lag>0.35:
+            if boundary_lag>1.00:
                 log.warning(
-                    "FINAL_BOUNDARY_MISSED cycle=%s lag_seconds=%.3f candidates=%s max_lag=0.35",
+                    "FINAL_BOUNDARY_MISSED cycle=%s lag_seconds=%.3f candidates=%s max_lag=1.00",
                     cycle_id,boundary_lag,len(ranked_pool)
                 )
             if ranked_pool:
