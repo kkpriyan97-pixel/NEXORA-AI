@@ -1179,6 +1179,10 @@ AI_REVIEW_FAIL_TTL=90.0
 # admitted only after strict Brain setup gates; external AI is a verifier, not
 # a hard scheduler dependency when every provider is unavailable.
 ALLOW_PROXY_LIVE_FALLBACK=os.getenv("ALLOW_PROXY_LIVE_FALLBACK","1").strip().lower() in {"1","true","yes","on"}
+# When Event-1 has limited subscription slots, use the authenticated broker's
+# current 1-minute candle as the live-quote activity fallback. This does not create
+# synthetic data; it only removes the false dependency on an Event-1 subscription.
+ALLOW_AUTHENTICATED_CANDLE_LIVE_FALLBACK=os.getenv("ALLOW_AUTHENTICATED_CANDLE_LIVE_FALLBACK","1").strip().lower() in {"1","true","yes","on"}
 AI_DEEP_REVIEW_TOP_N=max(1,min(5,int(os.getenv("AI_DEEP_REVIEW_TOP_N","5") or 5)))
 # Preserve a fully reviewed candidate for the short exact-boundary window.
 # This prevents a transient provider/cache refresh from erasing a valid setup
@@ -4501,10 +4505,24 @@ async def cycle_loop():
             high_tick_activity=_high_tick_activity_status(p,time.time())
             candidate["high_tick_activity"]=high_tick_activity
             candidate["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
+            live_quote_source=str(STATE["price_source"].get(p,"") or "").lower()
+            authenticated_candle_fresh=(
+                ALLOW_AUTHENTICATED_CANDLE_LIVE_FALLBACK
+                and live_quote_source=="authenticated_broker_live_candle"
+                and has_fresh_live_price(p,time.time(),QUOTE_SNAPSHOT_MAX_AGE)
+            )
+            broker_candle_proxy_ok=bool(
+                authenticated_candle_fresh
+                and strict_local_proxy_fallback
+                and live_quote_source=="authenticated_broker_live_candle"
+            )
             proxy_volume_mode=str(ind.get("volume_mode") or "").upper()
             proxy_volume_ok=(
                 ALLOW_PROXY_LIVE_FALLBACK
-                and bool(high_tick_activity.get("confirmed"))
+                and (
+                    bool(high_tick_activity.get("confirmed"))
+                    or broker_candle_proxy_ok
+                )
                 and proxy_volume_mode in {
                     "M1_EQUAL_ACTIVITY_PROXY",
                     "M1_TICK_ACTIVITY_PROXY",
@@ -4534,14 +4552,24 @@ async def cycle_loop():
                 return False
             if not real_volume_ok:
                 ind["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
+                ind["authenticated_candle_live_fallback"]=bool(broker_candle_proxy_ok)
+                ind["authenticated_candle_live_fallback_source"]=live_quote_source
                 ind["high_tick_activity_recent_ticks"]=int(high_tick_activity.get("recent_ticks") or 0)
                 ind["high_tick_activity_total_ticks"]=int(high_tick_activity.get("total_ticks") or 0)
                 ind["high_tick_activity_burst_ratio"]=float(high_tick_activity.get("burst_ratio") or 0.0)
                 candidate["indicators"]=ind
-                log.info(
-                    "HIGH_TICK_ACTIVITY_VOLUME_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
-                    cycle_id,p,expected,high_tick_activity
-                )
+                if broker_candle_proxy_ok and not bool(high_tick_activity.get("confirmed")):
+                    log.info(
+                        "AUTHENTICATED_CANDLE_LIVE_FALLBACK_CONFIRMED cycle=%s pair=%s direction=%s "
+                        "source=%s quote_age=%.3f reason=event1_subscription_unavailable_strict_local_setup",
+                        cycle_id,p,expected,live_quote_source,
+                        float(live_price_age(p,time.time()) or 0.0)
+                    )
+                else:
+                    log.info(
+                        "HIGH_TICK_ACTIVITY_VOLUME_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
+                        cycle_id,p,expected,high_tick_activity
+                    )
         elif strategy_name==OTC_STRATEGY:
             ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
             bos_level=float(ind.get("otc_bos_level") or 0.0)
@@ -4598,14 +4626,26 @@ async def cycle_loop():
             high_tick_activity=_high_tick_activity_status(p,time.time())
             candidate["high_tick_activity"]=high_tick_activity
             candidate["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
-            if not bool(high_tick_activity.get("confirmed")):
+            live_quote_source=str(STATE["price_source"].get(p,"") or "").lower()
+            authenticated_candle_fresh=(
+                ALLOW_AUTHENTICATED_CANDLE_LIVE_FALLBACK
+                and live_quote_source=="authenticated_broker_live_candle"
+                and has_fresh_live_price(p,time.time(),QUOTE_SNAPSHOT_MAX_AGE)
+            )
+            if not bool(high_tick_activity.get("confirmed")) and not (
+                authenticated_candle_fresh and bool(ind.get("m1_continuation_ok"))
+            ):
                 log.info(
                     "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
                     "reason=high_tick_activity_not_confirmed diagnostic=%s next_asset=TRUE",
                     cycle_id,p,expected,high_tick_activity
                 )
                 return False
-            ind["high_tick_activity_confirmed"]=True
+            ind["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
+            ind["authenticated_candle_live_fallback"]=bool(
+                authenticated_candle_fresh and bool(ind.get("m1_continuation_ok"))
+            )
+            ind["authenticated_candle_live_fallback_source"]=live_quote_source
             ind["high_tick_activity_recent_ticks"]=int(high_tick_activity.get("recent_ticks") or 0)
             ind["high_tick_activity_total_ticks"]=int(high_tick_activity.get("total_ticks") or 0)
             ind["high_tick_activity_burst_ratio"]=float(high_tick_activity.get("burst_ratio") or 0.0)
