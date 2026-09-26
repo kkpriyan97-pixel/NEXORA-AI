@@ -488,8 +488,26 @@ class BrainState:
         }
 
     def post_result_context_blocked(self,rec):
+        """Apply a hard post-result AI re-entry block only with repeated evidence.
+
+        A single high-confidence AI-reviewed LOSS must never starve the 3-minute
+        scheduler or permanently suppress a technically valid setup. The normal
+        statistical exact-context veto in adaptive_candidate() already requires
+        20/30 observations; this separate History-AI lesson is therefore treated
+        as a hard block only after materially repeated exact-context losses.
+        """
         b=self.post_result_lessons.get(self.lesson_key(rec))
-        return bool(b and b.get("block_reentry"))
+        if not b or not b.get("block_reentry"):
+            return False
+        try:
+            n=float(b.get("n",0) or 0.0)
+            losses=float(b.get("loss",0) or 0.0)
+            wins=float(b.get("win",0) or 0.0)
+        except (TypeError,ValueError):
+            return False
+        if n < 6.0 or losses < 4.0:
+            return False
+        return (losses/max(1.0,n)) >= 0.70 and losses > wins
 
     def post_result_learning_bonus(self,rec):
         b=self.post_result_lessons.get(self.lesson_key(rec))
