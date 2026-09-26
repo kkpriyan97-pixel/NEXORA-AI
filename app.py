@@ -4970,16 +4970,41 @@ async def cycle_loop():
             )
 
         if not account_ready_now():
-            ready_deadline=signal_at-20.0
-            while time.time()<ready_deadline and not account_ready_now():
-                await asyncio.sleep(0.5)
-            if not account_ready_now():
-                log.warning(
-                    "CYCLE_SKIPPED_ACCOUNT_NOT_READY cycle=%s signal_utc=%s "
-                    "reason=account_not_ready_by_safe_window",
-                    cycle_id,time.strftime("%H:%M:%S",time.gmtime(signal_at))
-                )
-                continue
+            # Keep the wall-clock 3-minute scheduler alive even while the broker
+            # session is temporarily unavailable. We do not manufacture a signal
+            # or analyze stale market data; we simply consume this slot cleanly
+            # and enter the next exact 3-minute window. When auth/feed recovers,
+            # the next cycle automatically resumes the full five-pass analysis.
+            STATE["cycle"]=cycle_id
+            STATE["cycle_scan_status"]={
+                "cycle_id":int(cycle_id),
+                "total_passes":CYCLE_SCAN_COUNT,
+                "completed_pass":0,
+                "scan_offsets_seconds":[int(x) for x in SCAN_OFFSETS],
+                "signal_lead_seconds":int(signal_lead),
+                "signal_epoch":float(signal_at),
+                "target_epoch":float(target),
+                "scans":[],
+                "protocol":"FLEX_MANUAL",
+                "signal_expiry_minutes":1,
+                "status":"WAITING_FOR_AUTH",
+                "reason":"broker_account_not_ready",
+            }
+            log.warning(
+                "CYCLE_ACCOUNT_NOT_READY_CONTINUE cycle=%s signal_utc=%s "
+                "next_boundary_utc=%s cadence=3m reason=broker_account_not_ready",
+                cycle_id,
+                time.strftime("%H:%M:%S",time.gmtime(signal_at)),
+                time.strftime("%H:%M:%S",time.gmtime(target)),
+            )
+            await asyncio.sleep(max(0.0,signal_at-time.time()))
+            log.warning(
+                "CYCLE_SLOT_COMPLETED cycle=%s outcome=ACCOUNT_NOT_READY "
+                "next_cycle_start_utc=%s",
+                cycle_id,
+                time.strftime("%H:%M:%S",time.gmtime(target)),
+            )
+            continue
 
         # Account/feed is now authenticated and has a non-empty account asset
         # universe before Brain state for this cycle is created.
@@ -6912,7 +6937,16 @@ async def market_worker():
                         log.warning("ACCOUNT_ASSET_SYNC_RETAINED count=%d",len(STATE["assets"]))
         except Exception as e:
             message=str(e)
-            invalid_token=("invalid_token" in message.lower())
+            cause=getattr(e,"__cause__",None)
+            context=" ".join(
+                str(part) for part in (
+                    message,
+                    getattr(cause,"reason",""),
+                    getattr(cause,"code",""),
+                    getattr(cause,"args",""),
+                ) if part
+            )
+            invalid_token=("invalid_token" in context.lower())
             STATE["status"]=(
                 "account_auth_invalid"
                 if invalid_token else
