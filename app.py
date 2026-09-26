@@ -1159,7 +1159,7 @@ HIGH_TICK_ACTIVITY_LOOKBACK=60.0
 HIGH_TICK_ACTIVITY_MIN_RECENT=3
 HIGH_TICK_ACTIVITY_MIN_TOTAL=8
 HIGH_TICK_ACTIVITY_BURST_RATIO=1.10
-HIGH_TICK_ACTIVITY_PIN_TTL=32.0
+HIGH_TICK_ACTIVITY_PIN_TTL=55.0
 # Rolling coverage window for the account-wide rotating live feed. The broker
 # only exposes a small number of simultaneous tick subscriptions, so an asset
 # can be live-covered without having a fresh tick at every one-second audit.
@@ -4606,7 +4606,7 @@ async def cycle_loop():
             return False
 
         ts=target-signal_lead
-        if time.time() > ts+0.75:
+        if time.time() > ts+1.00:
             log.info(
                 "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=deadline_passed",
                 cycle_id,p
@@ -5363,7 +5363,7 @@ async def cycle_loop():
                                     # subscriptions, and requires a real fresh event-1 tick.
                                     # Keep pass-5 tick ownership short; send_cycle_signal()
                                     # refreshes the authenticated broker quote when stale.
-                                    pin_ttl=max(12.0,min(HIGH_TICK_ACTIVITY_PIN_TTL,target-time.time()-25.0))
+                                    pin_ttl=max(30.0,min(HIGH_TICK_ACTIVITY_PIN_TTL,target-time.time()-5.0))
                                     # Broker Event-12 capability/freshness probing is bounded here.
                                     # A stalled subscription must never hold cycle_loop past the
                                     # exact signal boundary. Delivery still performs its authoritative
@@ -5893,7 +5893,7 @@ async def cycle_loop():
         while time.time()<signal_at:
             await asyncio.sleep(0)
         boundary_lag=time.time()-signal_at
-        if boundary_lag<=0.35:
+        if boundary_lag<=1.00:
             attempted_final=0
             for candidate in ranked_pool:
                 attempted_final+=1
@@ -5960,7 +5960,7 @@ async def cycle_loop():
             )
             cycle_outcome="SKIPPED_NO_SETUP"
 
-        next_target=target+SIGNAL_INTERVAL
+        next_target=(int(time.time())//int(SIGNAL_INTERVAL)+1)*int(SIGNAL_INTERVAL)
         next_cycle_id=int(next_target//SIGNAL_INTERVAL)
         next_signal=next_target-SIGNAL_LEADS[0 if (next_cycle_id%20 or 20)<=10 else 1]
         log.info(
