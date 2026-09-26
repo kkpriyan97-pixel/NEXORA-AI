@@ -956,8 +956,17 @@ class BrainState:
 
         if pair and strategy:
             allow_5m=bool(x.get("five_minute_eligible")) and strategy=="TREND_FOLLOWING"
+            # Keep expiry selection tied to deterministic technical strength.
+            # Learned ranking penalties must not silently turn a 97-99 technical
+            # setup back into 1m after the earlier 2m selection.
+            expiry_quality=float(
+                x.get("technical_confidence")
+                or x.get("confidence")
+                or x.get("market_quality")
+                or 0
+            )
             x["expiry_minutes"]=self.choose_expiry(
-                pair,strategy,direction,float(x.get("market_quality") or 0),
+                pair,strategy,direction,expiry_quality,
                 allow_5m=allow_5m
             )
         # Production live expiry is intentionally limited to 1m or 2m.
