@@ -832,9 +832,19 @@ class BrainState:
             or 0
         )
         x["technical_confidence"]=max(0,min(99,technical_confidence))
+        expiry_quality=float(
+            x.get("technical_confidence")
+            or x.get("confidence")
+            or x.get("market_quality")
+            or 0
+        )
         x["expiry_minutes"]=self.choose_expiry(
             pair,strategy,str(x.get("direction","")).upper(),
-            float(x.get("market_quality") or x.get("confidence") or 0)
+            expiry_quality
+        )
+        x["expiry_selection_basis"]=(
+            "technical_confidence" if x.get("technical_confidence") is not None
+            else "confidence"
         )
         direction=str(x.get("direction","")).upper()
         self_strategy=str(x.get("self_strategy") or strategy)
