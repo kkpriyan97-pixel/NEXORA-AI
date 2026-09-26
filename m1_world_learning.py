@@ -29,7 +29,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 import unicodedata
-from collections import defaultdict
+from collections import defaultdict, deque
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, quote_plus, urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
@@ -489,7 +489,7 @@ class NextCandleModel:
 class M1WorldLab:
     def __init__(self):
         self.db=DB();self.model=NextCandleModel(self.db);self.queue=asyncio.Queue()
-        self.enqueued=set();self.robots={};self.simhash_cache=[];self.pending={}
+        self.enqueued=set();self.enqueued_order=deque(maxlen=MAX_ENQUEUED_URLS);self.robots={};self.robots_order=deque(maxlen=MAX_ROBOTS_CACHE);self.simhash_cache=deque(maxlen=2500);self.pending={}
         self.started_at=float(self.db.meta("started_at", "0") or 0)
         if not self.started_at:
             raw=os.getenv("M1_LEARNING_START_UTC",DEFAULT_START_UTC)
@@ -522,7 +522,11 @@ class M1WorldLab:
     def enqueue(self,u,lang,origin):
         u=clean_url(u)
         if not u or self.db.page_seen(u) or u in self.enqueued:return
-        self.enqueued.add(u)
+        if self.queue.qsize() >= MAX_RESEARCH_QUEUE:return
+        self.enqueued.add(u);self.enqueued_order.append(u)
+        if len(self.enqueued)>MAX_ENQUEUED_URLS:
+            stale=self.enqueued_order.popleft()
+            self.enqueued.discard(stale)
         try:self.queue.put_nowait((u,lang,origin));self.metrics["discovered"]+=1
         except asyncio.QueueFull:pass
     async def robots_ok(self,u):
@@ -535,7 +539,11 @@ class M1WorldLab:
                 r=await h.get("https://"+d+"/robots.txt");rp=None if r.status_code>=400 else rp
                 if r.status_code<400:rp.parse(r.text.splitlines())
         except Exception:rp=None
-        self.robots[d]=(now,rp);return True if rp is None else rp.can_fetch(USER_AGENT,u)
+        self.robots[d]=(now,rp);self.robots_order.append(d)
+        if len(self.robots)>MAX_ROBOTS_CACHE:
+            stale=self.robots_order.popleft()
+            self.robots.pop(stale,None)
+        return True if rp is None else rp.can_fetch(USER_AGENT,u)
     async def fetch(self,u):
         async with httpx.AsyncClient(timeout=httpx.Timeout(HTTP_TIMEOUT,connect=3),headers={"User-Agent":USER_AGENT,"Accept":"text/html,application/xhtml+xml"},follow_redirects=True) as h:
             r=await h.get(u);r.raise_for_status()
