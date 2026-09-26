@@ -17,7 +17,7 @@ import re
 from datetime import datetime, timezone
 from math import isfinite
 
-EXPIRIES=(1,)
+EXPIRIES=(1,2)
 MIN_CLOSED_CANDLES=60
 ONE_MINUTE=60
 FIFTEEN_MINUTES=900
