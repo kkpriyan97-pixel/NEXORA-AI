@@ -1221,6 +1221,44 @@ def analyze_asset(
         )
         return None
 
+    # Stronger anti-chop confirmation for the 1m/2m production lane:
+    # require directional consistency across the recent closed-M1 sequence
+    # and a close near the candle extreme. This does not create or flip
+    # direction; it only rejects weak continuation candles.
+    recent3=cs[-3:]
+    aligned3=0
+    try:
+        for rc in recent3:
+            ro=float(rc["open"]); rh=float(rc["high"]); rl=float(rc["low"]); rcx=float(rc["close"])
+            aligned3 += 1 if (
+                (direction=="UP" and rcx>=ro and rcx>float(recent3[0]["close"]))
+                or
+                (direction=="DOWN" and rcx<=ro and rcx<float(recent3[0]["close"]))
+            ) else 0
+    except (TypeError,ValueError,KeyError):
+        aligned3=0
+    last_range=max(float(last["high"])-float(last["low"]),1e-12)
+    last_close_position=(last_close-float(last["low"]))/last_range
+    last_body_ratio=abs(last_close-last_open)/last_range
+    recent_directional_confirmation=(
+        aligned3>=2
+        and (
+            (direction=="UP" and last_close_position>=0.60)
+            or
+            (direction=="DOWN" and last_close_position<=0.40)
+        )
+        and last_body_ratio>=0.35
+    )
+    if not recent_directional_confirmation:
+        _diag(
+            pair,"m1_strong_continuation_rejected",
+            direction=direction,
+            aligned3=aligned3,
+            last_close_position=round(last_close_position,3),
+            last_body_ratio=round(last_body_ratio,3),
+        )
+        return None
+
     # A one-minute expiry benefits from directional acceptance or a genuine
     # reclaim of AVWAP/POC. A mere location above/below both levels while still
     # trapped inside the value area is treated as a weak setup.
@@ -1341,6 +1379,10 @@ def analyze_asset(
             "LIVE_DISCOVERY_PENDING_HIGH_TICK_ACTIVITY"
         ),
         "m1_continuation_ok":m1_continuation_ok,
+        "m1_recent_aligned_candles":int(aligned3),
+        "m1_last_close_position":round(last_close_position,4),
+        "m1_last_body_ratio":round(last_body_ratio,4),
+        "m1_strong_continuation_confirmed":bool(recent_directional_confirmation),
         "value_position":value_position,
         "value_area_acceptance":value_acceptance,
         "level_reclaim":level_reclaim,
@@ -1385,6 +1427,7 @@ def analyze_asset(
             f"reclaim={level_reclaim}; POC_migration={migration_norm:.4f}; "
             f"volume_quality={volume_quality}; HIGH_VOLUME=CONFIRMED; AVWAP+POC aligned; "
             f"Alligator(13/8,8/5,5/3)=CONFIRMED; "
+            f"M1_strong_continuation={aligned3}/3 body={last_body_ratio:.2f} close_pos={last_close_position:.2f}; "
             f"BB(18,2)={bb.get('bb_confirmation','UNAVAILABLE')}."
         ),
         "indicator_features":features,
