@@ -14,7 +14,9 @@ GLOBAL_LOSS_STREAK_LIMIT = max(1, int(os.getenv("GLOBAL_LOSS_STREAK_LIMIT", "3")
 GLOBAL_LOSS_STREAK_COOLDOWN_SECONDS = max(60, int(os.getenv("GLOBAL_LOSS_STREAK_COOLDOWN_SECONDS", "600") or 600))
 MIN_CONFIDENCE = 90
 CYCLE_SECONDS = 180
-EXPIRIES = (1,)
+EXPIRIES = (1,2)
+LIVE_EXPIRY_OPTIONS = (1,2)
+LIVE_EXPIRY_HIGH_QUALITY = max(90.0,min(99.0,float(os.getenv("LIVE_EXPIRY_HIGH_QUALITY","97") or 97)))
 ALLOWED_STRATEGY = "AVWAP_VOLUME_PROFILE"
 OTC_STRATEGY = "PRO_OTC_STRUCTURE_CONTINUATION"
 ALLOWED_STRATEGIES = (ALLOWED_STRATEGY, OTC_STRATEGY)
@@ -619,10 +621,37 @@ class BrainState:
         return max(-8.0,min(8.0,base_bonus+strategy_bonus+pattern_bonus+context_bonus+indicator_bonus))
 
     def choose_expiry(self,pair,strategy,direction,live_quality=0,allow_5m=False):
-        """Choose expiry from strategy-local evidence."""
+        """Choose the production signal expiry between 1m and 2m.
+        
+        The 3-minute scheduler is independent of expiry. A stronger current
+        technical setup may use 2m; ordinary qualified setups use 1m. Exact
+        pair/strategy/direction outcome history can also select 2m when it has
+        enough evidence. This is bounded learning, not a promise of returns.
+        """
         strategy=str(strategy).upper().strip()
-        # Both production live strategies use the fixed 1-minute signal expiry.
         if strategy in ALLOWED_STRATEGIES:
+            direction=str(direction or "").upper()
+            pair_key=str(pair)
+            quality=float(live_quality or 0.0)
+            two=self.stats.get((pair_key,strategy,direction,2))
+            one=self.stats.get((pair_key,strategy,direction,1))
+            try:
+                two_n=float(two.get("n",0) or 0.0) if two else 0.0
+                one_n=float(one.get("n",0) or 0.0) if one else 0.0
+            except (TypeError,ValueError):
+                two_n=one_n=0.0
+            two_rate=self._rate(two) if two and two_n>=8 else 0.0
+            one_rate=self._rate(one) if one and one_n>=8 else 0.0
+            if (
+                two_n>=8
+                and (
+                    (one_n>=8 and two_rate>=one_rate+0.03)
+                    or (two_rate>=0.62 and one_n<8)
+                )
+            ):
+                return 2
+            if quality>=LIVE_EXPIRY_HIGH_QUALITY:
+                return 2
             return 1
         direction=str(direction).upper()
         base={
@@ -803,7 +832,10 @@ class BrainState:
             or 0
         )
         x["technical_confidence"]=max(0,min(99,technical_confidence))
-        x["expiry_minutes"]=1
+        x["expiry_minutes"]=self.choose_expiry(
+            pair,strategy,str(x.get("direction","")).upper(),
+            float(x.get("market_quality") or x.get("confidence") or 0)
+        )
         direction=str(x.get("direction","")).upper()
         self_strategy=str(x.get("self_strategy") or strategy)
 
@@ -918,6 +950,9 @@ class BrainState:
                 pair,strategy,direction,float(x.get("market_quality") or 0),
                 allow_5m=allow_5m
             )
+        # Production live expiry is intentionally limited to 1m or 2m.
+        if int(x.get("expiry_minutes") or 0) not in LIVE_EXPIRY_OPTIONS:
+            x["expiry_minutes"]=1
         return x
 
 
