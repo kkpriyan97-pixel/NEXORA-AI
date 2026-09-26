@@ -6911,15 +6911,33 @@ async def market_worker():
                     else:
                         log.warning("ACCOUNT_ASSET_SYNC_RETAINED count=%d",len(STATE["assets"]))
         except Exception as e:
-            STATE["status"]=("account_token_mismatch" if "Access token does not expose configured demo account" in str(e) else "error")
-            log.exception("MARKET_WORKER_ERROR %s",e)
-            # Connection startup failures are retried quickly so a transient
-            # broker websocket drop cannot suppress the next signal cycle.
-            retry_delay=4 if (
-                "Not connected" in str(e)
-                or "WebSocket dropped" in str(e)
-                or "WebSocket disconnected" in str(e)
-            ) else 30
+            message=str(e)
+            invalid_token=("invalid_token" in message.lower())
+            STATE["status"]=(
+                "account_auth_invalid"
+                if invalid_token else
+                ("account_token_mismatch" if "Access token does not expose configured demo account" in message else "error")
+            )
+            if invalid_token:
+                # An invalid/revoked broker token is a persistent credential state,
+                # not a transient socket hiccup. Avoid traceback churn/reconnect storms
+                # that inflate memory on the free Render instance. The next retry
+                # re-reads OLYMPTRADE_ACCESS_TOKEN, so a fresh token is picked up
+                # without another deployment.
+                log.error(
+                    "MARKET_WORKER_AUTH_INVALID_TOKEN retry_seconds=60 "
+                    "signal_scheduler_independent=true"
+                )
+                retry_delay=60
+            else:
+                log.exception("MARKET_WORKER_ERROR %s",e)
+                # Connection startup failures are retried quickly so a transient
+                # broker websocket drop cannot suppress the next signal cycle.
+                retry_delay=4 if (
+                    "Not connected" in message
+                    or "WebSocket dropped" in message
+                    or "WebSocket disconnected" in message
+                ) else 30
             await asyncio.sleep(retry_delay)
         finally:
             if live_quote_task is not None:
