@@ -887,12 +887,18 @@ class BrainState:
             (exact_evidence_samples>=30 and exact_reliability<0.50)
             or (exact_evidence_samples>=20 and exact_reliability<0.45)
         )
+        # Learning is ranking/audit-only. Even a statistically weak learned
+        # context must not become an account-wide or exact-setup delivery stop;
+        # the locked technical Brain remains the sole signal qualifier.
+        x["learning_veto_observed"]=bool(learned_veto)
         if learned_veto:
-            x["ai_learning_blocked"]=True
             x["learning_veto_reason"]=(
                 f"exact_context_reliability={exact_reliability:.4f};"
                 f"samples={exact_evidence_samples}"
             )
+        # Explicitly keep this flag false unless a future safety-critical gate
+        # is introduced outside the learning layer.
+        x["ai_learning_blocked"]=False
 
         x["exact_setup_rank_score"]=round(
             float(x.get("calibrated_confidence") or x.get("confidence") or 0)
@@ -1017,9 +1023,9 @@ def rank_signal_candidates(candidates):
             continue
         if str(x.get("direction","")).upper() not in {"UP","DOWN"}:
             continue
-        if bool(x.get("ai_learning_blocked")):
-            continue
-
+        # History-AI / learning is observability and ranking only. It must not
+        # suppress a technically qualified live setup or break the wall-clock
+        # 3-minute scheduler.
         ind=dict(x.get("indicators") or x.get("indicator_context") or {})
         direction=str(x.get("direction") or "").upper()
 
