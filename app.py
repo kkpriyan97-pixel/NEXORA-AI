@@ -10,7 +10,7 @@ import httpx
 from olymptrade_ws import OlympTradeClient
 from olymptrade_ws.olympconfig import parameters
 from brain_rules import ActiveSignal,BrainState,rank_signal_candidates,COOLDOWN_SECONDS
-from candice_brain import analyze_asset,OTC_STRATEGY,ALLOWED_STRATEGY
+from candice_brain import analyze_asset,OTC_STRATEGY,ALLOWED_STRATEGY,detect_alligator_breakout
 from ai_engine import snapshot_from_asset,ai_environment_status
 from ai_router import analyze_with_fallback,review_result_with_fallback
 from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot_async, world_learning_loop
@@ -3372,7 +3372,7 @@ def _prune_runtime_caches(now=None):
             CANDIDATE_CACHE_HARD_REJECTED.pop(key,None)
 
 
-async def final_candidate(use_cached_only=False,require_live_price=False,deep_analysis=False,seed_candidates=None,return_ranked=False):
+async def final_candidate(use_cached_only=False,require_live_price=False,deep_analysis=False,seed_candidates=None,return_ranked=False,focus_pairs=None):
     _prune_runtime_caches()
     BRAIN.prune_expired_cooldowns()
 
@@ -3389,7 +3389,51 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         a for a in BRAIN.filter_candidates(STATE["assets"])
         if a.get("signal_eligible",True)
     ]
-    analyzed=[STATE["analyses"][a["pair"]].copy() for a in eligible if a["pair"] in STATE["analyses"]]
+    focus_set={
+        str(x).strip() for x in (focus_pairs or [])
+        if str(x).strip()
+    }
+    if focus_set:
+        focused=[]
+        for asset in eligible:
+            pair=str(asset.get("pair") or "")
+            if pair not in focus_set:
+                continue
+            try:
+                closed=_closed_candles(
+                    STATE["candles"].get(pair,[]),time.time()
+                )
+                if len(closed)<45:
+                    continue
+                live_price=STATE["prices"].get(pair,(None,None))[0]
+                focused_candidate=analyze_asset(
+                    asset,
+                    _prepare_volume_candles(pair,closed),
+                    live_price,
+                    forced_strategy=(
+                        OTC_STRATEGY if "_OTC" in pair.upper()
+                        else ALLOWED_STRATEGY
+                    ),
+                    require_high_volume=False,
+                )
+                if focused_candidate:
+                    focused_candidate["profitability"]=asset.get("profitability",0)
+                    focused.append(focused_candidate)
+            except Exception as e:
+                log.warning(
+                    "BREAKOUT_FOCUS_ANALYSIS_FAILED pair=%s type=%s message=%s",
+                    pair,type(e).__name__,str(e)[:120]
+                )
+        analyzed=focused
+        log.info(
+            "BREAKOUT_FOCUS_ANALYSIS pairs=%s qualified=%d",
+            ",".join(sorted(focus_set)),len(analyzed)
+        )
+    else:
+        analyzed=[
+            STATE["analyses"][a["pair"]].copy()
+            for a in eligible if a["pair"] in STATE["analyses"]
+        ]
 
     # Volume-first candidate selection:
     # 1) scan the full authenticated account asset universe;
@@ -3444,6 +3488,13 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         )
 
     volume_min_coverage=max(0.80,min(1.0,float(os.getenv("VOLUME_PRIORITY_MIN_COVERAGE","0.80") or 0.80)))
+    if focus_set:
+        volume_selected=[]
+        analyzed_for_brain=analyzed
+        log.info(
+            "VOLUME_PRIORITY_BYPASS focus_breakout_pairs=%s reason=current_breakout_event_is_selector",
+            ",".join(sorted(focus_set))
+        )
     volume_enabled=[
         x for x in analyzed
         if _volume_priority_key(x)[0]>0
@@ -3451,6 +3502,8 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     ]
     volume_enabled.sort(key=_volume_priority_key,reverse=True)
     volume_selected=volume_enabled[:volume_priority_top_n]
+    if focus_set:
+        volume_enabled=[]
     if volume_selected:
         selected_pairs={str(x.get("pair")) for x in volume_selected}
         volume_rank_by_pair={
@@ -5460,6 +5513,45 @@ async def cycle_loop():
         catchup_mode=False
         catchup_next_at=None
 
+        # Breakout-first watchlist. The 3-minute scheduler remains
+        # authoritative; this list only determines which ten assets receive the
+        # lightweight current-breakout probe during the cycle.
+        breakout_watch_pairs=[]
+        _watch_candidates=[]
+        now_watch=time.time()
+        for _asset in STATE.get("assets") or []:
+            if not _asset.get("signal_eligible",True):
+                continue
+            _pair=str(_asset.get("pair") or "")
+            if not _pair:
+                continue
+            stats=BRAIN.asset_stats.get(_pair,{}) if isinstance(BRAIN.asset_stats,dict) else {}
+            n=float(stats.get("n",0) or 0)
+            learned_rate=((float(stats.get("win",0) or 0)+0.5)/(n+1.0)) if n>0 else 0.5
+            recent_ticks=0
+            for minute,rec in list(VOLUME_M1_CACHE.get(_pair,{}).items())[-8:]:
+                try:
+                    if float(minute)>=now_watch-300.0:
+                        recent_ticks+=int(rec.get("tick_count") or 0)
+                except (TypeError,ValueError):
+                    continue
+            try:
+                profitability=float(_asset.get("profitability") or 0.0)
+            except (TypeError,ValueError):
+                profitability=0.0
+            watch_score=(
+                min(100.0,max(0.0,profitability))*0.35
+                + learned_rate*100.0*0.45
+                + min(100.0,float(recent_ticks))*0.20
+            )
+            _watch_candidates.append((_watch_score,_pair))
+        _watch_candidates.sort(key=lambda x:(x[0],x[1]),reverse=True)
+        breakout_watch_pairs=[p for _,p in _watch_candidates[:10]]
+        log.info(
+            "BREAKOUT_WATCHLIST cycle=%s top_n=%d pairs=%s",
+            cycle_id,len(breakout_watch_pairs),",".join(breakout_watch_pairs)
+        )
+
         for pass_no,offset in enumerate(SCAN_OFFSETS,1):
             if pass_no<=resume_completed_pass:
                 log.info(
@@ -5591,15 +5683,48 @@ async def cycle_loop():
                         reverse=True
                     )[:100]
                 else:
-                    candidate=await asyncio.wait_for(
-                        final_candidate(
-                            require_live_price=False,
-                            deep_analysis=(pass_no==4),
-                            use_cached_only=False,
-                            return_ranked=(pass_no in (1,2,3,4))
-                        ),
-                        timeout=max(1.0,remaining-0.50)
-                    )
+                    # Probe only the current Top-10 watchlist for a NEW
+                    # closed-M1 Alligator breakout. This probe is local and cheap;
+                    # it never changes the 180s scheduler cadence.
+                    live_breakout_pairs=[]
+                    for _pair in breakout_watch_pairs:
+                        try:
+                            _event=detect_alligator_breakout(
+                                _prepare_volume_candles(
+                                    _pair,
+                                    _closed_candles(
+                                        STATE.get("candles",{}).get(_pair,[]),time.time()
+                                    )
+                                ),
+                                time.time()
+                            )
+                            if _event and str(_event.get("direction") or "").upper() in {"UP","DOWN"}:
+                                live_breakout_pairs.append(_pair)
+                                log.info(
+                                    "BREAKOUT_WATCH_HIT cycle=%s scan=%s pair=%s direction=%s candle_ts=%s",
+                                    cycle_id,pass_no,_pair,_event.get("direction"),
+                                    _event.get("breakout_candle_ts")
+                                )
+                        except Exception as _event_error:
+                            log.warning(
+                                "BREAKOUT_WATCH_PROBE_FAILED cycle=%s pair=%s type=%s message=%s",
+                                cycle_id,_pair,type(_event_error).__name__,str(_event_error)[:100]
+                            )
+
+                    if live_breakout_pairs:
+                        candidate=await asyncio.wait_for(
+                            final_candidate(
+                                require_live_price=False,
+                                deep_analysis=(pass_no==4),
+                                use_cached_only=False,
+                                return_ranked=(pass_no in (1,2,3,4)),
+                                focus_pairs=live_breakout_pairs,
+                            ),
+                            timeout=max(1.0,remaining-0.50)
+                        )
+                    else:
+                        candidate=None
+
                 if isinstance(candidate,list):
                     selected=candidate[:100]
                     if not selected:
