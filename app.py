@@ -3018,44 +3018,6 @@ def _final_delivery_precheck(candidate,reference_ts=None):
         if px<=0:
             return -900.0
 
-        signal_mode=str(
-            (candidate or {}).get("signal_mode")
-            or ind.get("signal_mode")
-            or "STRICT_SETUP"
-        ).upper()
-        if signal_mode=="SCHEDULED_CONTINUATION":
-            if strategy==OTC_STRATEGY:
-                bos=float(ind.get("otc_bos_level") or 0.0)
-                if bos<=0:
-                    return -850.0
-                aligned=(px>bos) if expected=="UP" else (px<bos)
-                if not aligned:
-                    return -800.0
-                if ind.get("otc_bos_confirmed") is not True or ind.get("m1_continuation_ok") is not True:
-                    return -850.0
-                if ind.get("alligator_confirmed") is not True or ind.get("alligator_timing_ok") is not True:
-                    return -850.0
-            elif strategy==ALLOWED_STRATEGY:
-                avwap=float(ind.get("anchored_vwap") or candidate.get("avwap") or 0.0)
-                poc=float(ind.get("volume_profile_poc") or candidate.get("poc") or 0.0)
-                if avwap<=0 or poc<=0:
-                    return -850.0
-                aligned=(px>avwap and px>poc) if expected=="UP" else (px<avwap and px<poc)
-                if not aligned:
-                    return -800.0
-                if ind.get("alligator_confirmed") is not True or ind.get("alligator_timing_ok") is not True:
-                    return -850.0
-                if ind.get("m1_continuation_ok") is not True:
-                    return -850.0
-            else:
-                return -1000.0
-            return round(
-                100.0
-                + min(20.0,float(candidate.get("confidence") or 0.0)*0.20)
-                + (8.0 if ind.get("alligator_breakout_confirmed") is True else 0.0),
-                3
-            )
-
         if strategy==OTC_STRATEGY:
             bos=float(ind.get("otc_bos_level") or 0.0)
             if bos<=0:
@@ -3463,22 +3425,10 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                     "BREAKOUT_FOCUS_ANALYSIS_FAILED pair=%s type=%s message=%s",
                     pair,type(e).__name__,str(e)[:120]
                 )
-        # A breakout event gets first priority, but it must never make
-        # the entire five-minute slot depend on one asset. If the event pair does
-        # not qualify, immediately fall back to the complete authenticated
-        # account-wide Brain pool.
-        all_analyzed=[
-            STATE["analyses"][a["pair"]].copy()
-            for a in eligible if a["pair"] in STATE["analyses"]
-        ]
-        focused_pairs={str(x.get("pair")) for x in focused}
-        analyzed=focused + [
-            x for x in all_analyzed if str(x.get("pair")) not in focused_pairs
-        ]
+        analyzed=focused
         log.info(
-            "BREAKOUT_FOCUS_ANALYSIS pairs=%s qualified=%d account_wide_pool=%d "
-            "mode=priority_not_exclusive",
-            ",".join(sorted(focus_set)),len(focused),len(all_analyzed)
+            "BREAKOUT_FOCUS_ANALYSIS pairs=%s qualified=%d",
+            ",".join(sorted(focus_set)),len(analyzed)
         )
     else:
         analyzed=[
@@ -3587,14 +3537,9 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
             len(STATE.get("assets") or []),len(analyzed),volume_min_coverage
         )
 
-    # Five-minute cadence requires account-wide selection. Volume quality
-    # remains a ranking/diagnostic input, but it must not remove otherwise-valid
-    # assets before the technical Brain evaluates the full authenticated universe.
-    analyzed_for_brain=analyzed
     log.info(
-        "BRAIN_INPUT_READY focus_breakout=%s analyzed_for_brain=%d "
-        "account_assets=%d selection=ACCOUNT_WIDE",
-        bool(focus_set),len(analyzed_for_brain),len(eligible)
+        "BRAIN_INPUT_READY focus_breakout=%s analyzed_for_brain=%d",
+        bool(focus_set),len(analyzed_for_brain)
     )
     adapted=[BRAIN.adaptive_candidate(x) for x in analyzed_for_brain]
     # Final-pass resilience: earlier passes may have found a strong candidate that
@@ -3733,7 +3678,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     # refresh_candles() already evaluates the full authenticated account asset set.
     # When deep_analysis is enabled, review every currently Brain-qualified setup
     # so one failed candidate can fall through to the next valid asset.
-    # Preliminary passes remain intentionally narrow to protect the 5-minute timing window.
+    # Preliminary passes remain intentionally narrow to protect the 3-minute timing window.
     review_scope_n=min(
         len(raw),
         max(
@@ -4604,7 +4549,7 @@ async def continuous_breakout_monitor():
 
 
 async def cycle_loop():
-    # 5-minute signal scheduler, active 24/7.
+    # 3-minute signal scheduler, active 24/7.
     # For each cycle:
     #   - cycle_start = T - 180s
     #   - Telegram signal = cycle_start + 150s (2m30s after Candice cycle start)
@@ -4616,9 +4561,9 @@ async def cycle_loop():
     #     the scheduler, so one completed signal cannot stop the next cycle.
     # The Brain/AI strategy itself is unchanged; only the scheduling cadence
     # and the requested expiry are changed for DEMO analysis.
-    # Day signal session: every 5 minutes. Signal is fixed at target-30s;
+    # Day signal session: every 3 minutes. Signal is fixed at target-30s;
     # the 1-minute DEMO entry/expiry boundary is the exact 5-minute target.
-    SIGNAL_INTERVAL=300.0
+    SIGNAL_INTERVAL=180.0
     SIGNAL_LEADS=(30.0,30.0)
     SCAN_OFFSETS=CYCLE_SCAN_OFFSETS
 
@@ -4833,22 +4778,12 @@ async def cycle_loop():
         strategy_name=str(candidate.get("strategy") or "").upper()
         trend_name=str(candidate.get("trend_15m") or "").upper()
 
-        # Alligator final timing is strategy-specific.
-        # REAL strict setups may use the NEW-breakout event when available.
-        # The five-minute scheduled fallback only requires current Alligator
+        # Exact Alligator breakout timing gate.
+        # The direction is still owned by the strategy brain. Alligator only
+        # decides whether a NEW breakout event is happening on this latest
+        # closed M1 candle, preventing old breakouts from generating late entry.
         ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
-        # alignment/timing. OTC never requires a NEW Alligator crossing because
-        # its authoritative direction is the PRO structure engine.
-        signal_mode=str(
-            candidate.get("signal_mode")
-            or ind.get("signal_mode")
-            or "STRICT_SETUP"
-        ).upper()
-        require_new_breakout=(
-            strategy_name==ALLOWED_STRATEGY
-            and signal_mode!="SCHEDULED_CONTINUATION"
-        )
-        breakout_ok=(
+        alligator_breakout_ok=(
             ind.get("alligator_breakout_confirmed") is True
             and str(ind.get("alligator_breakout_direction") or "").upper()==expected
         )
@@ -4857,10 +4792,10 @@ async def cycle_loop():
             time.time()-(float(breakout_ts)+60.0)
             if breakout_ts else 9999.0
         )
-
-        if require_new_breakout and (
-            not breakout_ok or breakout_age<0.0 or breakout_age>90.0
-        ):
+        if not alligator_breakout_ok or breakout_age<0.0 or breakout_age>90.0:
+            # Recompute the same deterministic brain on the latest closed M1
+            # candles. This is local-only and does not alter the 3-minute
+            # scheduler timing.
             try:
                 boundary_asset=next(
                     (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
@@ -4877,139 +4812,51 @@ async def cycle_loop():
                     forced_strategy=strategy_name,
                     require_high_volume=False,
                 )
+                refreshed_ind=dict(
+                    boundary_refreshed.get("indicators")
+                    or boundary_refreshed.get("indicator_context")
+                    or {}
+                ) if boundary_refreshed else {}
+                refreshed_direction=(
+                    str(boundary_refreshed.get("direction") or "").upper()
+                    if boundary_refreshed else ""
+                )
                 if (
                     boundary_refreshed
-                    and str(boundary_refreshed.get("strategy") or "").upper()==strategy_name
-                    and str(boundary_refreshed.get("direction") or "").upper()==expected
+                    and refreshed_direction==expected
+                    and bool(refreshed_ind.get("alligator_breakout_confirmed"))
                 ):
                     candidate.update(boundary_refreshed)
-                    ind=dict(
-                        boundary_refreshed.get("indicators")
-                        or boundary_refreshed.get("indicator_context")
-                        or {}
-                    )
-                    signal_mode=str(
-                        candidate.get("signal_mode")
-                        or ind.get("signal_mode")
-                        or "STRICT_SETUP"
-                    ).upper()
-                    breakout_ok=(
-                        ind.get("alligator_breakout_confirmed") is True
-                        and str(ind.get("alligator_breakout_direction") or "").upper()==expected
-                    )
+                    ind=refreshed_ind
                     breakout_ts=ind.get("alligator_breakout_candle_ts")
                     breakout_age=(
                         time.time()-(float(breakout_ts)+60.0)
                         if breakout_ts else 9999.0
                     )
-                    log.info(
-                        "FINAL_ALLIGATOR_BOUNDARY_RECHECKED cycle=%s pair=%s "
-                        "direction=%s mode=%s breakout=%s age=%.3f",
-                        cycle_id,p,expected,signal_mode,breakout_ok,
-                        float(breakout_age)
+                    alligator_breakout_ok=(
+                        str(ind.get("alligator_breakout_direction") or "").upper()==expected
                     )
-                else:
                     log.info(
-                        "FINAL_ALLIGATOR_STRICT_RECHECK_NO_SETUP cycle=%s pair=%s "
-                        "direction=%s action=try_scheduled_fallback",
-                        cycle_id,p,expected
+                        "FINAL_ALLIGATOR_BREAKOUT_BOUNDARY_RECHECKED cycle=%s pair=%s "
+                        "direction=%s candle_ts=%s age=%.3f",
+                        cycle_id,p,expected,breakout_ts,float(breakout_age)
                     )
             except Exception as refresh_error:
                 log.warning(
-                    "FINAL_ALLIGATOR_BOUNDARY_RECHECK_FAILED cycle=%s pair=%s type=%s message=%s",
+                    "FINAL_ALLIGATOR_BREAKOUT_RECHECK_FAILED cycle=%s pair=%s type=%s message=%s",
                     cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
                 )
-
-        alligator_confirmed=(
-            ind.get("alligator_confirmed") is True
-            or ind.get("alligator_alignment_ready") is True
-        )
-        alligator_timing_ok=ind.get("alligator_timing_ok") is True
-        if strategy_name==ALLOWED_STRATEGY:
-            if signal_mode!="SCHEDULED_CONTINUATION" and require_new_breakout:
-                if not breakout_ok or breakout_age<0.0 or breakout_age>90.0:
-                    # A strict candidate that lost its NEW event is eligible to be
-                    # reclassified only by the deterministic wrapper on a current
-                    # closed-M1 snapshot. Do not invent breakout=true.
-                    try:
-                        boundary_asset=next(
-                            (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
-                            None
-                        )
-                        boundary_closed=_closed_candles(
-                            STATE.get("candles",{}).get(p,[]),time.time()
-                        )
-                        fallback_refreshed=analyze_asset(
-                            boundary_asset or {"pair":p,"display_name":p},
-                            _prepare_volume_candles(p,boundary_closed),
-                            entry,
-                            forced_strategy=ALLOWED_STRATEGY,
-                            require_high_volume=False,
-                        )
-                        if (
-                            fallback_refreshed
-                            and str(fallback_refreshed.get("direction") or "").upper()==expected
-                            and str(fallback_refreshed.get("strategy") or "").upper()==ALLOWED_STRATEGY
-                        ):
-                            candidate.update(fallback_refreshed)
-                            ind=dict(
-                                fallback_refreshed.get("indicators")
-                                or fallback_refreshed.get("indicator_context") or {}
-                            )
-                            signal_mode=str(
-                                candidate.get("signal_mode")
-                                or ind.get("signal_mode")
-                                or "STRICT_SETUP"
-                            ).upper()
-                            breakout_ok=(
-                                ind.get("alligator_breakout_confirmed") is True
-                                and str(ind.get("alligator_breakout_direction") or "").upper()==expected
-                            )
-                            breakout_ts=ind.get("alligator_breakout_candle_ts")
-                            breakout_age=(
-                                time.time()-(float(breakout_ts)+60.0)
-                                if breakout_ts else 9999.0
-                            )
-                    except Exception as fallback_error:
-                        log.info(
-                            "FINAL_SCHEDULED_FALLBACK_RECHECK_FAILED cycle=%s pair=%s type=%s message=%s",
-                            cycle_id,p,type(fallback_error).__name__,str(fallback_error)[:120]
-                        )
-            if signal_mode=="SCHEDULED_CONTINUATION":
-                if not alligator_confirmed or not alligator_timing_ok:
-                    log.info(
-                        "FINAL_LIVE_ALLIGATOR_REJECTED cycle=%s pair=%s direction=%s "
-                        "mode=SCHEDULED_CONTINUATION confirmed=%s timing_ok=%s next_asset=TRUE",
-                        cycle_id,p,expected,alligator_confirmed,alligator_timing_ok
-                    )
-                    return False
-            elif not breakout_ok or breakout_age<0.0 or breakout_age>90.0:
-                # Do not consume a scheduled slot with a stale strict event. A
-                # deterministic fallback candidate may still be supplied by the
-                # next-ranked asset.
-                if not alligator_confirmed or not alligator_timing_ok:
-                    log.info(
-                        "FINAL_LIVE_ALLIGATOR_REJECTED cycle=%s pair=%s direction=%s "
-                        "reason=no_current_strict_breakout_and_no_alligator_confirmation next_asset=TRUE",
-                        cycle_id,p,expected
-                    )
-                    return False
-                log.info(
-                    "FINAL_LIVE_ALLIGATOR_SWITCHED_TO_SCHEDULED cycle=%s pair=%s direction=%s",
-                    cycle_id,p,expected
-                )
-                candidate["signal_mode"]="SCHEDULED_CONTINUATION"
-                candidate["scheduled_fallback"]=True
-        elif strategy_name==OTC_STRATEGY:
-            # OTC uses the PRO structure brain for direction. Alligator is an
-            # alignment/timing confirmation only; a NEW crossing is not required.
-            if not alligator_confirmed or not alligator_timing_ok:
-                log.info(
-                    "FINAL_LIVE_OTC_ALLIGATOR_REJECTED cycle=%s pair=%s direction=%s "
-                    "confirmed=%s timing_ok=%s next_asset=TRUE",
-                    cycle_id,p,expected,alligator_confirmed,alligator_timing_ok
-                )
-                return False
+        if (
+            not alligator_breakout_ok
+            or breakout_age<0.0
+            or breakout_age>90.0
+        ):
+            log.info(
+                "FINAL_ALLIGATOR_BREAKOUT_REJECTED cycle=%s pair=%s direction=%s "
+                "reason=no_new_closed_m1_breakout breakout_candle_ts=%s age=%.3f next_asset=TRUE",
+                cycle_id,p,expected,breakout_ts,float(breakout_age)
+            )
+            return False
 
         # Exact-entry market-state gate is strategy-specific:
         # REAL -> AVWAP + POC live alignment.
@@ -5370,29 +5217,17 @@ async def cycle_loop():
                 )
                 return False
 
-            signal_mode=str(
-                candidate.get("signal_mode")
-                or ind.get("signal_mode")
-                or "STRICT_SETUP"
-            ).upper()
-            if signal_mode=="SCHEDULED_CONTINUATION":
-                required_flags=(
-                    "otc_strategy","otc_bos_confirmed",
-                    "m1_continuation_ok","exact_live_setup",
-                    "alligator_confirmed","alligator_timing_ok"
-                )
-            else:
-                required_flags=(
-                    "otc_strategy","otc_bos_confirmed","otc_displacement_confirmed",
-                    "otc_retest_confirmed","otc_hold_confirmed",
-                    "otc_confirmation_candle_confirmed","m1_continuation_ok",
-                    "exact_live_setup"
-                )
+            required_flags=(
+                "otc_strategy","otc_bos_confirmed","otc_displacement_confirmed",
+                "otc_retest_confirmed","otc_hold_confirmed",
+                "otc_confirmation_candle_confirmed","m1_continuation_ok",
+                "exact_live_setup"
+            )
             if any(ind.get(flag) is not True for flag in required_flags):
                 log.info(
-                    "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s mode=%s "
+                    "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
                     "reason=structure_confirmation_missing next_asset=TRUE",
-                    cycle_id,p,expected,signal_mode
+                    cycle_id,p,expected
                 )
                 return False
             high_tick_activity=_high_tick_activity_status(p,time.time())
@@ -6865,7 +6700,7 @@ async def cycle_loop():
         # already completed (for example at T-25s). Poll the event store during
         # the remaining pre-signal window so that a late breakout is analyzed and
         # can still enter the exact 30-second delivery boundary. This does not
-        # move the 5-minute clock or weaken the final Alligator/strategy gates.
+        # move the 3-minute clock or weaken the final Alligator/strategy gates.
         _late_event_seen=set()
         _late_sweep_end=max(time.time(),signal_at)
         while time.time() < _late_sweep_end:
@@ -7042,7 +6877,7 @@ async def cycle_loop():
         boundary_pool=_boundary_unique
 
         # Entry timing is event-driven, while delivery remains on the strict
-        # 5-minute wall-clock cycle. Keep a broader account-wide fallback pool;
+        # 3-minute wall-clock cycle. Keep only the best 10 unique assets for
         # the boundary decision; continuous events are already injected when
         # discovered during the final pre-signal sweep.
         _top10_by_pair={}
@@ -7062,7 +6897,7 @@ async def cycle_loop():
             if not _pair_key or _pair_key in _top10_by_pair:
                 continue
             _top10_by_pair[_pair_key]=_x
-            if len(_top10_by_pair)>=20:
+            if len(_top10_by_pair)>=10:
                 break
         boundary_pool=list(_top10_by_pair.values())
         _all_boundary_breakout_events=set(cycle_breakout_events)
