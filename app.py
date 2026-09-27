@@ -3489,21 +3489,24 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
 
     volume_min_coverage=max(0.80,min(1.0,float(os.getenv("VOLUME_PRIORITY_MIN_COVERAGE","0.80") or 0.80)))
     if focus_set:
+        # A current closed-M1 breakout is the selector. Do not let the generic
+        # volume-priority stage discard the asset that just produced the event.
         volume_selected=[]
+        volume_enabled=[]
         analyzed_for_brain=analyzed
         log.info(
             "VOLUME_PRIORITY_BYPASS focus_breakout_pairs=%s reason=current_breakout_event_is_selector",
             ",".join(sorted(focus_set))
         )
-    volume_enabled=[
-        x for x in analyzed
-        if _volume_priority_key(x)[0]>0
-        and _volume_priority_key(x)[1]>=volume_min_coverage
-    ]
-    volume_enabled.sort(key=_volume_priority_key,reverse=True)
-    volume_selected=volume_enabled[:volume_priority_top_n]
-    if focus_set:
-        volume_enabled=[]
+    else:
+        volume_enabled=[
+            x for x in analyzed
+            if _volume_priority_key(x)[0]>0
+            and _volume_priority_key(x)[1]>=volume_min_coverage
+        ]
+        volume_enabled.sort(key=_volume_priority_key,reverse=True)
+        volume_selected=volume_enabled[:volume_priority_top_n]
+
     if volume_selected:
         selected_pairs={str(x.get("pair")) for x in volume_selected}
         volume_rank_by_pair={
@@ -3533,6 +3536,10 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
             len(STATE.get("assets") or []),len(analyzed),volume_min_coverage
         )
 
+    log.info(
+        "BRAIN_INPUT_READY focus_breakout=%s analyzed_for_brain=%d",
+        bool(focus_set),len(analyzed_for_brain)
+    )
     adapted=[BRAIN.adaptive_candidate(x) for x in analyzed_for_brain]
     # Final-pass resilience: earlier passes may have found a strong candidate that
     # disappears from STATE["analyses"] on the last refresh because its technical
