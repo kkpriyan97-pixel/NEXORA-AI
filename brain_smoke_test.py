@@ -14,7 +14,7 @@ def up_candles(n=120, start=1_000_000):
         o=base
         c=o+0.08
         out.append({
-            "time":t,"open":o,"high":c+0.01,"low":o-0.01,
+            "time":t,"open":o,"high":c,"low":o-0.01,
             "close":c,"volume":100
         })
     return out
@@ -28,7 +28,7 @@ def down_candles(n=120, start=1_000_000):
         o=base
         c=o-0.08
         out.append({
-            "time":t,"open":o,"high":o+0.01,"low":c-0.01,
+            "time":t,"open":o,"high":o+0.01,"low":c,
             "close":c,"volume":100
         })
     return out
