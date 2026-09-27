@@ -1977,8 +1977,11 @@ async def account_tick_subscription_worker():
         await asyncio.sleep(ACCOUNT_TICK_ROTATE_INTERVAL)
 TELEGRAM_HTTP_CLIENT=None
 TELEGRAM_HTTP_CLIENT_LOCK=asyncio.Lock()
-TELEGRAM_SIGNAL_TIMEOUT=2.0
-TELEGRAM_DEFAULT_TIMEOUT=3.5
+# Telegram delivery must survive a transient connection stall at the exact
+# 30-second signal boundary. A connect failure is retried with a fresh client;
+# read/time-out failures are not blindly retried to avoid duplicate messages.
+TELEGRAM_SIGNAL_TIMEOUT=5.5
+TELEGRAM_DEFAULT_TIMEOUT=5.0
 
 async def _get_telegram_http_client():
     global TELEGRAM_HTTP_CLIENT
@@ -1988,46 +1991,85 @@ async def _get_telegram_http_client():
         if TELEGRAM_HTTP_CLIENT is None or TELEGRAM_HTTP_CLIENT.is_closed:
             TELEGRAM_HTTP_CLIENT=httpx.AsyncClient(
                 limits=httpx.Limits(max_connections=20,max_keepalive_connections=10,keepalive_expiry=60.0),
-                timeout=httpx.Timeout(connect=1.5,read=3.0,write=2.0,pool=0.5),
+                timeout=httpx.Timeout(connect=3.5,read=4.0,write=2.5,pool=1.0),
                 headers={"Connection":"keep-alive"},
             )
     return TELEGRAM_HTTP_CLIENT
 
 async def telegram(text, chat_id=None, reply_markup=None, timeout_seconds=TELEGRAM_DEFAULT_TIMEOUT):
+    global TELEGRAM_HTTP_CLIENT
     token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
     chat=str(chat_id or STATE.get("telegram_chat_id") or os.getenv("TELEGRAM_CHAT_ID","")).strip()
     if not token or not chat:
         log.warning("TELEGRAM_NOT_CONFIGURED")
         return False
     started=time.perf_counter()
-    try:
-        client=await _get_telegram_http_client()
-        timeout=max(0.75,min(8.0,float(timeout_seconds)))
-        payload={"chat_id":chat,"text":text,"parse_mode":"HTML"}
-        if reply_markup is not None: payload["reply_markup"]=reply_markup
-        r=await asyncio.wait_for(
-            client.post(f"https://api.telegram.org/bot{token}/sendMessage",json=payload),
-            timeout=timeout
-        )
-        latency_ms=(time.perf_counter()-started)*1000.0
-        if r.status_code>=400:
-            try: detail=r.json()
-            except Exception: detail={"description":r.text[:200]}
-            log.warning("TELEGRAM_SEND_FAILED status=%s description=%s latency_ms=%.1f",
-                        r.status_code,detail.get("description"),latency_ms)
+    timeout=max(2.5,min(8.0,float(timeout_seconds)))
+    payload={"chat_id":chat,"text":text,"parse_mode":"HTML"}
+    if reply_markup is not None: payload["reply_markup"]=reply_markup
+
+    for attempt in (1,2):
+        client=None
+        try:
+            client=await _get_telegram_http_client()
+            r=await asyncio.wait_for(
+                client.post(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    json=payload,
+                ),
+                timeout=timeout
+            )
+            latency_ms=(time.perf_counter()-started)*1000.0
+            if r.status_code>=400:
+                try: detail=r.json()
+                except Exception: detail={"description":r.text[:200]}
+                log.warning(
+                    "TELEGRAM_SEND_FAILED status=%s description=%s attempt=%s latency_ms=%.1f",
+                    r.status_code,detail.get("description"),attempt,latency_ms
+                )
+                return False
+            log.info(
+                "TELEGRAM_SEND_OK chat=%s attempt=%s latency_ms=%.1f",
+                chat,attempt,latency_ms
+            )
+            return True
+        except (httpx.ConnectTimeout,httpx.ConnectError,httpx.PoolTimeout) as e:
+            latency_ms=(time.perf_counter()-started)*1000.0
+            if attempt==1:
+                log.warning(
+                    "TELEGRAM_SEND_RETRY type=%s latency_ms=%.1f reason=fresh_connection",
+                    type(e).__name__,latency_ms
+                )
+                # Only replace the shared client when it is still the client
+                # that failed; never retry a potentially accepted request.
+                async with TELEGRAM_HTTP_CLIENT_LOCK:
+                    if client is TELEGRAM_HTTP_CLIENT:
+                        try:
+                            await client.aclose()
+                        except Exception:
+                            pass
+                        TELEGRAM_HTTP_CLIENT=None
+                await asyncio.sleep(0.15)
+                continue
+            log.warning(
+                "TELEGRAM_SEND_FAILED type=%s message=%s attempt=%s latency_ms=%.1f",
+                type(e).__name__,str(e)[:200],attempt,latency_ms
+            )
             return False
-        log.info("TELEGRAM_SEND_OK chat=%s latency_ms=%.1f",chat,latency_ms)
-        return True
-    except asyncio.TimeoutError:
-        latency_ms=(time.perf_counter()-started)*1000.0
-        log.warning("TELEGRAM_SEND_FAILED type=TimeoutError timeout=%.2fs latency_ms=%.1f",
-                    timeout,latency_ms)
-        return False
-    except Exception as e:
-        latency_ms=(time.perf_counter()-started)*1000.0
-        log.warning("TELEGRAM_SEND_FAILED type=%s message=%s latency_ms=%.1f",
-                    type(e).__name__,str(e)[:200],latency_ms)
-        return False
+        except asyncio.TimeoutError:
+            latency_ms=(time.perf_counter()-started)*1000.0
+            log.warning(
+                "TELEGRAM_SEND_FAILED type=TimeoutError timeout=%.2fs attempt=%s latency_ms=%.1f",
+                timeout,attempt,latency_ms
+            )
+            return False
+        except Exception as e:
+            latency_ms=(time.perf_counter()-started)*1000.0
+            log.warning(
+                "TELEGRAM_SEND_FAILED type=%s message=%s attempt=%s latency_ms=%.1f",
+                type(e).__name__,str(e)[:200],attempt,latency_ms
+            )
+            return False
 
 async def telegram_answer_callback(query_id, text_msg=""):
     token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
