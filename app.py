@@ -3993,6 +3993,53 @@ def _exact_expiry_candle(candles,target_ts,reference_ts=None):
         return raw,close
     return None
 
+
+def _exact_expiry_window_price(candles,target_ts,expiry_minutes,reference_ts=None):
+    """Return the close of the exact closed M1 candle window for a 1m/2m signal.
+
+    The configured expiry is part of the result contract. For 2m, both exact
+    one-minute candles beginning at target_ts and target_ts+60s must be present
+    and fully closed; the second candle close is the only valid expiry price.
+    Missing/gapped minutes never fall back to a newer candle.
+    """
+    reference=time.time() if reference_ts is None else float(reference_ts)
+    try:
+        target_start=(int(float(target_ts))//60)*60
+        minutes=int(expiry_minutes)
+    except (TypeError,ValueError):
+        return None
+    if minutes not in SIGNAL_EXPIRY_OPTIONS:
+        return None
+
+    by_start={}
+    for raw in candles or []:
+        if not isinstance(raw,dict):
+            continue
+        ts=_candle_epoch(raw)
+        if ts is None:
+            continue
+        start=int(ts//60)*60
+        if start not in {
+            target_start + (offset*60)
+            for offset in range(minutes)
+        }:
+            continue
+        close_at=float(start)+60.0
+        if close_at>reference:
+            continue
+        try:
+            close=float(raw.get("close",raw.get("c")))
+        except (TypeError,ValueError):
+            continue
+        if not isfinite(close):
+            continue
+        by_start[start]=(raw,close)
+
+    expected=[target_start+(offset*60) for offset in range(minutes)]
+    if any(ts not in by_start for ts in expected):
+        return None
+    return by_start[expected[-1]]
+
 async def result_watch(key):
     s=BRAIN.active_signals.get(key)
     if not s:
@@ -4186,12 +4233,20 @@ async def result_watch(key):
             rec.get("broker_trade_profit"),rec.get("broker_trade_status")
         )
     else:
-        # No user trade was matched: measure the signal itself with the exact
-        # broker-market candle that starts at the signal entry boundary.
+        # No user trade was matched: measure the signal itself over the exact
+        # configured expiry horizon using fully closed 1m candles.
         expiry_price=None
         expiry_source=""
+        expiry_minutes=int(s.expiry_minutes)
+        expiry_target_ts=(int(float(s.entry_ts))//60)*60 + (expiry_minutes*60)
         client=CLIENT
-        candle_deadline=time.time()+60.0
+        # The watcher already sleeps through the configured expiry horizon above.
+        # Keep a short bounded retry for delayed candle publication, but never
+        # extend the signal's logical expiry by selecting a newer candle.
+        candle_deadline=max(
+            time.time()+15.0,
+            float(expiry_target_ts)+15.0,
+        )
         while expiry_price is None and time.time()<candle_deadline:
             try:
                 if client and getattr(client.connection,"is_connected",False):
@@ -4210,19 +4265,39 @@ async def result_watch(key):
                                 normalized.append(item)
                     if normalized:
                         try:
-                            normalized.sort(key=lambda x: float(x.get("time",x.get("t",0))))
+                            normalized.sort(key=lambda x: float(
+                                _candle_epoch(x) if _candle_epoch(x) is not None else 0
+                            ))
                         except Exception:
                             pass
-                        exact=_exact_expiry_candle(normalized,s.entry_ts,time.time())
+                        exact=_exact_expiry_window_price(
+                            normalized,
+                            s.entry_ts,
+                            expiry_minutes,
+                            time.time(),
+                        )
                         if exact:
                             _,expiry_price=exact
                             STATE["candles"][s.pair]=normalized
-                            expiry_source="signal-market:candle-closed:exact-entry-minute"
+                            expiry_source=(
+                                f"signal-market:candle-closed:exact-entry-{expiry_minutes}m-window"
+                            )
+                            log.info(
+                                "RESULT_EXPIRY_HORIZON_VERIFIED cycle=%s pair=%s "
+                                "configured_expiry=%s observed_minutes=%s "
+                                "expiry_target_utc=%s source=%s",
+                                s.cycle_id,s.pair,expiry_minutes,expiry_minutes,
+                                datetime.fromtimestamp(
+                                    float(expiry_target_ts),tz=timezone.utc
+                                ).strftime("%H:%M:%S"),
+                                expiry_source,
+                            )
                             break
             except Exception as e:
                 log.warning(
-                    "RESULT_SIGNAL_CANDLE_READ_FAILED pair=%s type=%s message=%s",
-                    s.pair,type(e).__name__,str(e)[:120]
+                    "RESULT_SIGNAL_CANDLE_READ_FAILED pair=%s expiry=%s "
+                    "type=%s message=%s",
+                    s.pair,expiry_minutes,type(e).__name__,str(e)[:120]
                 )
             await asyncio.sleep(0.75)
 
@@ -4252,8 +4327,12 @@ async def result_watch(key):
         await save_persistent_learning()
         BRAIN.consume_batch_summary()
         log.info(
-            "RESULT_SIGNAL_MARKET_OUTCOME pair=%s result=%s entry=%s exit=%s source=%s",
-            rec["pair"],rec["result"],rec["entry_price"],rec["exit_price"],expiry_source
+            "RESULT_SIGNAL_MARKET_OUTCOME pair=%s result=%s entry=%s exit=%s "
+            "expiry=%s expiry_target_utc=%s source=%s",
+            rec["pair"],rec["result"],rec["entry_price"],rec["exit_price"],
+            rec["expiry_minutes"],
+            datetime.fromtimestamp(float(expiry_target_ts),tz=timezone.utc).strftime("%H:%M:%S"),
+            expiry_source
         )
 
     # User-facing result notification is deliberately generated only after the
