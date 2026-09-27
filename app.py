@@ -99,8 +99,10 @@ SIGNAL_SESSION_END_HOUR=24
 CYCLE_SCAN_OFFSETS=(270.0,210.0,150.0,90.0,60.0)
 CYCLE_SCAN_COUNT=len(CYCLE_SCAN_OFFSETS)
 # The signal scheduler runs continuously across the full UAE day. It does NOT enable broker auto-trading.
-# Production signal expiry is selected by the Brain from these two options.
-SIGNAL_EXPIRY_OPTIONS=(1,2)
+# Explicit 5M-expiry mode keeps the five-minute wall-clock cycle unchanged
+# while measuring each delivered signal over an exact +5:00 horizon.
+FIVE_MINUTE_EXPIRY_MODE = os.getenv("NEXORA_5M_EXPIRY_MODE","1").strip().lower() in {"1","true","yes","on"}
+SIGNAL_EXPIRY_OPTIONS=(5,) if FIVE_MINUTE_EXPIRY_MODE else (1,2)
 FORCE_SIGNAL_MODE=os.getenv("FORCE_SIGNAL_MODE","0").strip().lower() in {"1","true","yes","on"}
 ASSET_TRADEABILITY_PROBE_TIMEOUT=0.6
 # Avoid chasing an OTC move already stretched far beyond confirmed BOS.
@@ -4725,7 +4727,7 @@ async def cycle_loop():
     SCAN_OFFSETS=CYCLE_SCAN_OFFSETS
 
     def normalize_live_expiry(candidate):
-        """Normalize production expiry at the scheduler boundary to 1m or 2m."""
+        """Normalize the exact live outcome horizon without touching cycle timing."""
         if not isinstance(candidate,dict):
             return candidate
         x=candidate.copy()
@@ -4740,13 +4742,18 @@ async def cycle_loop():
             )
         except (TypeError,ValueError):
             technical=0.0
-        if strategy in {"AVWAP_VOLUME_PROFILE","PRO_OTC_STRUCTURE_CONTINUATION"} and direction in {"UP","DOWN"}:
+        if FIVE_MINUTE_EXPIRY_MODE and strategy in {"AVWAP_VOLUME_PROFILE","PRO_OTC_STRUCTURE_CONTINUATION"} and direction in {"UP","DOWN"}:
+            x["expiry_minutes"]=5
+            x["expiry_selection_basis"]="explicit_5m_expiry"
+            x["expiry_mode"]="5M"
+        elif strategy in {"AVWAP_VOLUME_PROFILE","PRO_OTC_STRUCTURE_CONTINUATION"} and direction in {"UP","DOWN"}:
             x["expiry_minutes"]=int(BRAIN.choose_expiry(strategy=strategy,pair=x.get("pair"),direction=direction,live_quality=technical))
             if int(x["expiry_minutes"]) not in SIGNAL_EXPIRY_OPTIONS:
                 x["expiry_minutes"]=2 if technical>=97 else 1
             x["expiry_selection_basis"]="technical_boundary"
         else:
-            x["expiry_minutes"]=1
+            x["expiry_minutes"]=5 if FIVE_MINUTE_EXPIRY_MODE else 1
+            x["expiry_mode"]="5M" if FIVE_MINUTE_EXPIRY_MODE else "1M_2M"
         return x
 
     async def send_cycle_signal(candidate,target,signal_lead,cycle_id):
@@ -5664,19 +5671,21 @@ async def cycle_loop():
             return False
 
         try:
-            # The 5-minute value is the cycle interval only. The Brain chooses
-            # the individual signal expiry from the locked 1m/2m production options.
+            # The cycle interval stays five minutes. In explicit 5M-expiry
+            # mode the outcome horizon is exactly +5:00 and never shifts
+            # the scheduler boundary.
             try:
                 candidate=normalize_live_expiry(candidate)
-                signal_expiry=int(candidate.get("expiry_minutes") or 1)
+                signal_expiry=int(candidate.get("expiry_minutes") or (5 if FIVE_MINUTE_EXPIRY_MODE else 1))
             except (TypeError,ValueError):
-                signal_expiry=1
+                signal_expiry=5 if FIVE_MINUTE_EXPIRY_MODE else 1
             if signal_expiry not in SIGNAL_EXPIRY_OPTIONS:
-                signal_expiry=1
+                signal_expiry=5 if FIVE_MINUTE_EXPIRY_MODE else 1
             candidate["expiry_minutes"]=signal_expiry
-            log.info("LIVE_EXPIRY_SELECTED cycle=%s pair=%s strategy=%s technical=%s expiry=%s basis=%s",
+            log.info("LIVE_EXPIRY_SELECTED cycle=%s pair=%s strategy=%s technical=%s expiry=%s mode=%s basis=%s",
                      cycle_id,p,candidate.get("strategy"),candidate.get("technical_confidence") or candidate.get("confidence"),
-                     signal_expiry,candidate.get("expiry_selection_basis"))
+                     signal_expiry,"5M" if FIVE_MINUTE_EXPIRY_MODE else "1M_2M",
+                     candidate.get("expiry_selection_basis"))
             s=BRAIN.mark_signal_sent(
                 account_id=STATE.get("account_id"),
                 pair=p,display_name=candidate["display_name"],
