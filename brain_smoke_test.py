@@ -74,10 +74,10 @@ def otc_structure_candles(n=120,start=1_000_000):
 
 
 def main():
-    # Anchor synthetic candles to a fully closed 15M block so the REAL
-    # AVWAP/VP test is deterministic regardless of the current minute.
-    last_closed_minute=(int(time.time())//900)*900-60
-    start=last_closed_minute-(119*60)
+    # Keep the latest synthetic M1 candle recent enough for the live
+    # Alligator timing gate while providing enough history to contain complete
+    # closed 15M blocks.
+    start=int(time.time()//60)*60-(181*60)
 
     up=analyze_asset({"pair":"TEST_UP","display_name":"TEST_UP"},up_candles(start=start))
     assert up and up["direction"]=="UP"
