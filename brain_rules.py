@@ -255,8 +255,13 @@ class BrainState:
     def mark_signal_sent(self,**kw):
         if not self.can_send_cycle_signal(kw.get("account_id"),kw.get("pair")):
             raise RuntimeError("Signal delivery blocked by cooldown/account/duplicate gate")
-        if int(kw.get("confidence",0)) < MIN_CONFIDENCE:
-            raise ValueError("Confidence below 90")
+        kw_ind=dict(kw.get("indicator_context") or {})
+        cadence_fallback=(
+            str(kw_ind.get("five_minute_mode") or "").upper()=="CADENCE_CONTINUATION_V1"
+        )
+        minimum_confidence=75 if cadence_fallback else MIN_CONFIDENCE
+        if int(kw.get("confidence",0)) < minimum_confidence:
+            raise ValueError(f"Confidence below {minimum_confidence}")
         key=self.duplicate_key(kw["pair"],kw["entry_candle_ts"])
         if key in self.sent_keys:
             raise RuntimeError("Duplicate asset/entry candle")
