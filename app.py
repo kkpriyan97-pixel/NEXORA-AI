@@ -4539,7 +4539,11 @@ async def cycle_loop():
             current_closed=_closed_candles(
                 STATE.get("candles",{}).get(p,[]),time.time()
             )
-            current_closed_ts=int(current_closed[-1]["time"]) if current_closed else 0
+            current_closed_ts=(
+                int(_candle_epoch(current_closed[-1]))
+                if current_closed and _candle_epoch(current_closed[-1]) is not None
+                else 0
+            )
             alligator_age=(
                 time.time()-(float(alligator_candle_ts)+60.0)
                 if alligator_candle_ts else 9999.0
@@ -7219,12 +7223,16 @@ def format_candice_signal_message(s, indicator_check, ts, target):
     direction_focus="🟢 𝗨𝗣" if direction=="UP" else "🔴 𝗗𝗢𝗪𝗡"
     bold_digits=str.maketrans("0123456789","𝟬𝟭𝟮𝟯𝟰𝟱𝟲𝟳𝟴𝟵")
     entry_time=uae_time(target).translate(bold_digits)
+    try:
+        expiry_label=str(int(s.expiry_minutes)).translate(bold_digits)
+    except (TypeError,ValueError):
+        expiry_label="𝟭"
     return (
         "🚨 <b>CANDICE AI</b>\n"
         "💎 <b>PRO SIGNAL</b>\n\n"
         f"📊 <b>{s.display_name}</b>\n\n"
         f"<b>{direction_focus}</b>\n"
-        "⏱️ <b>𝟭 𝗠𝗜𝗡</b>\n\n"
+        f"⏱️ <b>{expiry_label} 𝗠𝗜𝗡</b>\n\n"
         f"🎯 <b>𝗘𝗡𝗧𝗥𝗬</b>\n"
         f"<b>{entry_time} UAE</b>\n\n"
         f"💰 Reference → <code>{s.entry_price}</code>\n"
