@@ -961,7 +961,7 @@ class BrainState:
         x["exact_setup_reliability_samples"]=exact_evidence_samples
 
         # Hard-veto only when the exact context has enough observations.
-        # This prevents small samples from starving the 3-minute scheduler.
+        # This prevents small samples from starving the 5-minute scheduler.
         learned_veto=(
             (exact_evidence_samples>=30 and exact_reliability<0.50)
             or (exact_evidence_samples>=20 and exact_reliability<0.45)
@@ -1126,7 +1126,7 @@ def rank_signal_candidates(candidates):
             continue
         # History-AI / learning is observability and ranking only. It must not
         # suppress a technically qualified live setup or break the wall-clock
-        # 3-minute scheduler.
+        # 5-minute scheduler.
         ind=dict(x.get("indicators") or x.get("indicator_context") or {})
         direction=str(x.get("direction") or "").upper()
 
