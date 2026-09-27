@@ -5549,43 +5549,46 @@ async def cycle_loop():
         catchup_mode=False
         catchup_next_at=None
 
-        # Breakout-first watchlist. The 3-minute scheduler remains
-        # authoritative; this list only determines which ten assets receive the
-        # lightweight current-breakout probe during the cycle.
-        breakout_watch_pairs=[]
-        _watch_candidates=[]
-        now_watch=time.time()
-        for _asset in STATE.get("assets") or []:
-            if not _asset.get("signal_eligible",True):
-                continue
-            _pair=str(_asset.get("pair") or "")
-            if not _pair:
-                continue
-            stats=BRAIN.asset_stats.get(_pair,{}) if isinstance(BRAIN.asset_stats,dict) else {}
-            n=float(stats.get("n",0) or 0)
-            learned_rate=((float(stats.get("win",0) or 0)+0.5)/(n+1.0)) if n>0 else 0.5
-            recent_ticks=0
-            for minute,rec in list(VOLUME_M1_CACHE.get(_pair,{}).items())[-8:]:
-                try:
-                    if float(minute)>=now_watch-300.0:
-                        recent_ticks+=int(rec.get("tick_count") or 0)
-                except (TypeError,ValueError):
+        # Breakout-first watchlist. The 3-minute scheduler remains authoritative,
+        # but the actual Top-10 is refreshed at every scan pass. This prevents a
+        # pair that becomes one of the best ten during the cycle from being missed
+        # just because it was outside the ranking at cycle start.
+        def refresh_breakout_watchlist():
+            watch_candidates=[]
+            now_watch=time.time()
+            for _asset in STATE.get("assets") or []:
+                if not _asset.get("signal_eligible",True):
                     continue
-            try:
-                profitability=float(_asset.get("profitability") or 0.0)
-            except (TypeError,ValueError):
-                profitability=0.0
-            watch_score=(
-                min(100.0,max(0.0,profitability))*0.35
-                + learned_rate*100.0*0.45
-                + min(100.0,float(recent_ticks))*0.20
-            )
-            _watch_candidates.append((watch_score,_pair))
-        _watch_candidates.sort(key=lambda x:(x[0],x[1]),reverse=True)
-        breakout_watch_pairs=[p for _,p in _watch_candidates[:10]]
+                _pair=str(_asset.get("pair") or "")
+                if not _pair:
+                    continue
+                stats=BRAIN.asset_stats.get(_pair,{}) if isinstance(BRAIN.asset_stats,dict) else {}
+                n=float(stats.get("n",0) or 0)
+                learned_rate=((float(stats.get("win",0) or 0)+0.5)/(n+1.0)) if n>0 else 0.5
+                recent_ticks=0
+                for minute,rec in list(VOLUME_M1_CACHE.get(_pair,{}).items())[-8:]:
+                    try:
+                        if float(minute)>=now_watch-300.0:
+                            recent_ticks+=int(rec.get("tick_count") or 0)
+                    except (TypeError,ValueError):
+                        continue
+                try:
+                    profitability=float(_asset.get("profitability") or 0.0)
+                except (TypeError,ValueError):
+                    profitability=0.0
+                watch_score=(
+                    min(100.0,max(0.0,profitability))*0.35
+                    + learned_rate*100.0*0.45
+                    + min(100.0,float(recent_ticks))*0.20
+                )
+                watch_candidates.append((watch_score,_pair))
+            watch_candidates.sort(key=lambda x:(x[0],x[1]),reverse=True)
+            return [p for _,p in watch_candidates[:10]]
+
         # Per-cycle breakout memory is observability/state only. It never relaxes
         # strategy gates and never reuses a stale breakout at a later cycle.
         cycle_breakout_events={}
+        breakout_watch_pairs=refresh_breakout_watchlist()
         log.info(
             "BREAKOUT_WATCHLIST cycle=%s top_n=%d pairs=%s",
             cycle_id,len(breakout_watch_pairs),",".join(breakout_watch_pairs)
@@ -5699,6 +5702,14 @@ async def cycle_loop():
                 break
 
             try:
+                # Refresh the Top-10 immediately before each lightweight breakout
+                # probe so the watch set reflects the latest learned/ranking data.
+                breakout_watch_pairs=refresh_breakout_watchlist()
+                log.info(
+                    "BREAKOUT_WATCH_REFRESH cycle=%s scan=SCAN_%s top_n=%d pairs=%s",
+                    cycle_id,pass_no,len(breakout_watch_pairs),
+                    ",".join(breakout_watch_pairs)
+                )
                 if pass_no==5:
                     # PASS_5 is the final current-state breakout opportunity. It
                     # still runs at target-60s (30s before the signal boundary), so
