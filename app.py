@@ -5668,27 +5668,66 @@ async def cycle_loop():
 
             try:
                 if pass_no==5:
-                    # PASS_5 is delivery preparation only. The expensive Brain/AI
-                    # qualification is already completed in pass 4. Reusing the
-                    # current deep-qualified pool avoids the boundary race that
-                    # previously consumed the last seconds before Telegram delivery.
-                    candidate=sorted(
-                        [
-                            x for x in candidate_pool.values()
-                            if isinstance(x,dict)
-                            and x.get("pair")
-                            and int(x.get("qualified_pass") or 0)>=4
-                            and bool(x.get("deep_verified"))
-                        ],
-                        key=lambda x:(
-                            float(x.get("meta_rank_score") or x.get("confidence") or 0),
-                            int(x.get("confidence") or 0),
-                            float(x.get("strategy_margin") or 0),
-                            float(x.get("direction_agreement") or 0),
-                            float(x.get("market_quality") or 0)
-                        ),
-                        reverse=True
-                    )[:100]
+                    # PASS_5 is the final current-state breakout opportunity. It
+                    # still runs at target-60s (30s before the signal boundary), so
+                    # the probe must remain local/lightweight. If a NEW closed-M1
+                    # Alligator breakout appears after SCAN_4, re-run the exact
+                    # strategy + AI verification for that breakout pair instead of
+                    # reusing a stale candidate pool.
+                    live_breakout_pairs=[]
+                    for _pair in breakout_watch_pairs:
+                        try:
+                            _event=detect_alligator_breakout(
+                                _prepare_volume_candles(
+                                    _pair,
+                                    _closed_candles(
+                                        STATE.get("candles",{}).get(_pair,[]),time.time()
+                                    )
+                                ),
+                                time.time()
+                            )
+                            if _event and str(_event.get("direction") or "").upper() in {"UP","DOWN"}:
+                                live_breakout_pairs.append(_pair)
+                                log.info(
+                                    "BREAKOUT_WATCH_HIT cycle=%s scan=SCAN_%s pair=%s direction=%s candle_ts=%s",
+                                    cycle_id,pass_no,_pair,_event.get("direction"),
+                                    _event.get("breakout_candle_ts")
+                                )
+                        except Exception as _event_error:
+                            log.warning(
+                                "BREAKOUT_WATCH_PROBE_FAILED cycle=%s pair=%s type=%s message=%s",
+                                cycle_id,_pair,type(_event_error).__name__,str(_event_error)[:100]
+                            )
+
+                    if live_breakout_pairs:
+                        candidate=await asyncio.wait_for(
+                            final_candidate(
+                                require_live_price=False,
+                                deep_analysis=True,
+                                use_cached_only=False,
+                                return_ranked=True,
+                                focus_pairs=live_breakout_pairs,
+                            ),
+                            timeout=max(1.0,remaining-0.50)
+                        )
+                    else:
+                        candidate=sorted(
+                            [
+                                x for x in candidate_pool.values()
+                                if isinstance(x,dict)
+                                and x.get("pair")
+                                and int(x.get("qualified_pass") or 0)>=4
+                                and bool(x.get("deep_verified"))
+                            ],
+                            key=lambda x:(
+                                float(x.get("meta_rank_score") or x.get("confidence") or 0),
+                                int(x.get("confidence") or 0),
+                                float(x.get("strategy_margin") or 0),
+                                float(x.get("direction_agreement") or 0),
+                                float(x.get("market_quality") or 0)
+                            ),
+                            reverse=True
+                        )[:100]
                 else:
                     # Probe only the current Top-10 watchlist for a NEW
                     # closed-M1 Alligator breakout. This probe is local and cheap;
