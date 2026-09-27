@@ -3425,10 +3425,18 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                     "BREAKOUT_FOCUS_ANALYSIS_FAILED pair=%s type=%s message=%s",
                     pair,type(e).__name__,str(e)[:120]
                 )
-        analyzed=focused
+        # Breakout focus is a priority signal, not an exclusive universe.
+        # Keep the strict breakout analysis first; when it yields nothing, retain
+        # the account-wide strict Brain candidates instead of starving the cycle.
+        account_wide=[
+            STATE["analyses"][a["pair"]].copy()
+            for a in eligible if a["pair"] in STATE["analyses"]
+        ]
+        analyzed=focused if focused else account_wide
         log.info(
-            "BREAKOUT_FOCUS_ANALYSIS pairs=%s qualified=%d",
-            ",".join(sorted(focus_set)),len(analyzed)
+            "BREAKOUT_FOCUS_ANALYSIS pairs=%s focused=%d account_wide=%d selected=%d mode=%s",
+            ",".join(sorted(focus_set)),len(focused),len(account_wide),len(analyzed),
+            "FOCUS_PRIORITY" if focused else "ACCOUNT_WIDE_FALLBACK"
         )
     else:
         analyzed=[
