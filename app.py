@@ -2845,7 +2845,7 @@ async def refresh_candles(force=False):
                         # Fetch extra closed history so the forming/current
                         # M1 bar cannot reduce the live Brain input to 59 bars.
                         # AVWAP+Volume Profile requires 60 completed M1 candles.
-                        client.market.get_candles(p,size=60,count=120),
+                        client.market.get_candles(p,size=60,count=120,solid=False),
                         timeout=2.0
                     )
                     normalized=[]
@@ -4507,7 +4507,7 @@ async def result_watch(key):
             try:
                 if client and getattr(client.connection,"is_connected",False):
                     raw=await asyncio.wait_for(
-                        client.market.get_candles(s.pair,size=60,count=60),
+                        client.market.get_candles(s.pair,size=60,count=60,solid=False),
                         timeout=2.0
                     )
                     normalized=[]
@@ -4702,7 +4702,7 @@ async def continuous_breakout_monitor():
                     try:
                         async with CANDLE_FETCH_SEM:
                             raw=await asyncio.wait_for(
-                                client.market.get_candles(p,size=60,count=CONTINUOUS_BREAKOUT_CANDLE_COUNT),
+                                client.market.get_candles(p,size=60,count=CONTINUOUS_BREAKOUT_CANDLE_COUNT,solid=False),
                                 timeout=3.0,
                             )
                         normalized=[]
