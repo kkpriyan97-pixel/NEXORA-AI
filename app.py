@@ -4564,6 +4564,86 @@ async def cycle_loop():
         strategy_name=str(candidate.get("strategy") or "").upper()
         trend_name=str(candidate.get("trend_15m") or "").upper()
 
+        # Exact Alligator breakout timing gate.
+        # The direction is still owned by the strategy brain. Alligator only
+        # decides whether a NEW breakout event is happening on this latest
+        # closed M1 candle, preventing old breakouts from generating late entry.
+        ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
+        alligator_breakout_ok=(
+            ind.get("alligator_breakout_confirmed") is True
+            and str(ind.get("alligator_breakout_direction") or "").upper()==expected
+        )
+        breakout_ts=ind.get("alligator_breakout_candle_ts")
+        breakout_age=(
+            time.time()-(float(breakout_ts)+60.0)
+            if breakout_ts else 9999.0
+        )
+        if not alligator_breakout_ok or breakout_age<0.0 or breakout_age>90.0:
+            # Recompute the same deterministic brain on the latest closed M1
+            # candles. This is local-only and does not alter the 3-minute
+            # scheduler timing.
+            try:
+                boundary_asset=next(
+                    (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
+                    None
+                )
+                boundary_closed=_closed_candles(
+                    STATE.get("candles",{}).get(p,[]),time.time()
+                )
+                boundary_analysis=_prepare_volume_candles(p,boundary_closed)
+                boundary_refreshed=analyze_asset(
+                    boundary_asset or {"pair":p,"display_name":p},
+                    boundary_analysis,
+                    entry,
+                    forced_strategy=strategy_name,
+                    require_high_volume=False,
+                )
+                refreshed_ind=dict(
+                    boundary_refreshed.get("indicators")
+                    or boundary_refreshed.get("indicator_context")
+                    or {}
+                ) if boundary_refreshed else {}
+                refreshed_direction=(
+                    str(boundary_refreshed.get("direction") or "").upper()
+                    if boundary_refreshed else ""
+                )
+                if (
+                    boundary_refreshed
+                    and refreshed_direction==expected
+                    and bool(refreshed_ind.get("alligator_breakout_confirmed"))
+                ):
+                    candidate.update(boundary_refreshed)
+                    ind=refreshed_ind
+                    breakout_ts=ind.get("alligator_breakout_candle_ts")
+                    breakout_age=(
+                        time.time()-(float(breakout_ts)+60.0)
+                        if breakout_ts else 9999.0
+                    )
+                    alligator_breakout_ok=(
+                        str(ind.get("alligator_breakout_direction") or "").upper()==expected
+                    )
+                    log.info(
+                        "FINAL_ALLIGATOR_BREAKOUT_BOUNDARY_RECHECKED cycle=%s pair=%s "
+                        "direction=%s candle_ts=%s age=%.3f",
+                        cycle_id,p,expected,breakout_ts,float(breakout_age)
+                    )
+            except Exception as refresh_error:
+                log.warning(
+                    "FINAL_ALLIGATOR_BREAKOUT_RECHECK_FAILED cycle=%s pair=%s type=%s message=%s",
+                    cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
+                )
+        if (
+            not alligator_breakout_ok
+            or breakout_age<0.0
+            or breakout_age>90.0
+        ):
+            log.info(
+                "FINAL_ALLIGATOR_BREAKOUT_REJECTED cycle=%s pair=%s direction=%s "
+                "reason=no_new_closed_m1_breakout breakout_candle_ts=%s age=%.3f next_asset=TRUE",
+                cycle_id,p,expected,breakout_ts,float(breakout_age)
+            )
+            return False
+
         # Exact-entry market-state gate is strategy-specific:
         # REAL -> AVWAP + POC live alignment.
         # OTC -> the locked BOS level must still hold at the live entry and
@@ -6303,11 +6383,35 @@ async def cycle_loop():
             _boundary_seen.add(_candidate_identity)
             _boundary_unique.append(_x)
         boundary_pool=_boundary_unique
+
+        # Entry timing is event-driven, but the scheduler remains a strict
+        # 3-minute wall-clock cycle. Keep only the best 10 unique assets for
+        # the boundary decision; each is checked for a NEW Alligator breakout.
+        _top10_by_pair={}
+        for _x in sorted(
+            boundary_pool,
+            key=lambda x:(
+                int(x.get("confidence") or 0),
+                float(x.get("final_delivery_precheck") or -900.0),
+                float(x.get("strategy_margin") or 0),
+                float(x.get("direction_agreement") or 0),
+                float(x.get("market_quality") or 0),
+                float(x.get("learning_bonus") or 0),
+            ),
+            reverse=True
+        ):
+            _pair_key=str(_x.get("pair") or "")
+            if not _pair_key or _pair_key in _top10_by_pair:
+                continue
+            _top10_by_pair[_pair_key]=_x
+            if len(_top10_by_pair)>=10:
+                break
+        boundary_pool=list(_top10_by_pair.values())
         log.info(
-            "FINAL_BOUNDARY_POOL cycle=%s candidates=%d prepared_confirmed=%d total_deep=%d unique_assets=%d fresh_now=%d cooldown_excluded=%d",
-            cycle_id,len(boundary_pool),
+            "FINAL_BOUNDARY_POOL cycle=%s candidates=%d top10_assets=%d prepared_confirmed=%d total_deep=%d fresh_now=%d cooldown_excluded=%d",
+            cycle_id,len(boundary_pool),len(_top10_by_pair),
             sum(1 for x in boundary_pool if bool(x.get("final_delivery_confirmed"))),
-            len(final_candidates),len(boundary_pool),
+            len(final_candidates),
             sum(1 for x in boundary_pool if has_fresh_live_price(
                 x.get("pair"),now_boundary,LIVE_TICK_MAX_AGE
             )),
