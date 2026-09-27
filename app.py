@@ -5832,7 +5832,9 @@ async def cycle_loop():
         log.info(
             "CYCLE_WINDOW_START cycle=%s sequence=%s interval=%ss cycle_start_offset=0s signal_offset=%ss signal_lead=%ss "
             "signal_utc=%s target_utc=%s analysis_passes=5 frames=5s,1m..15m",
-            cycle_id,cycle_sequence,int(SIGNAL_INTERVAL),int(signal_lead),
+            cycle_id,cycle_sequence,int(SIGNAL_INTERVAL),
+            int(signal_at-(target-SIGNAL_INTERVAL)),
+            int(signal_lead),
             time.strftime("%H:%M:%S",time.gmtime(signal_at)),
             time.strftime("%H:%M:%S",time.gmtime(target))
         )
