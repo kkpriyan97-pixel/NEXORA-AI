@@ -4629,6 +4629,77 @@ async def cycle_loop():
                 time.time()-(float(alligator_candle_ts)+60.0)
                 if alligator_candle_ts else 9999.0
             )
+            # A new M1 candle can close between SCAN_5 and the exact
+            # Telegram boundary. Refresh the same deterministic technical brain
+            # locally before rejecting the candidate. The refreshed result must
+            # keep the same strategy and direction; this only removes timing
+            # starvation caused by a one-candle-old prepared snapshot.
+            if (
+                alligator_candle_ts<=0
+                or current_closed_ts!=alligator_candle_ts
+                or alligator_age>90.0
+                or alligator_age<0.0
+            ):
+                try:
+                    boundary_asset=next(
+                        (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
+                        None
+                    )
+                    boundary_closed=_closed_candles(
+                        STATE.get("candles",{}).get(p,[]),time.time()
+                    )
+                    boundary_analysis=_prepare_volume_candles(p,boundary_closed)
+                    boundary_refreshed=analyze_asset(
+                        boundary_asset or {"pair":p,"display_name":p},
+                        boundary_analysis,
+                        entry,
+                        forced_strategy=ALLOWED_STRATEGY,
+                        require_high_volume=False,
+                    )
+                    if (
+                        boundary_refreshed
+                        and str(boundary_refreshed.get("strategy") or "").upper()==strategy_name
+                        and str(boundary_refreshed.get("direction") or "").upper()==expected
+                    ):
+                        candidate.update(boundary_refreshed)
+                        ind=dict(
+                            boundary_refreshed.get("indicators")
+                            or boundary_refreshed.get("indicator_context")
+                            or {}
+                        )
+                        candidate["indicators"]=ind
+                        try:
+                            alligator_candle_ts=int(
+                                ind.get("alligator_latest_closed_candle_ts")
+                                or candidate.get("entry_candle_ts") or 0
+                            )
+                        except (TypeError,ValueError):
+                            alligator_candle_ts=0
+                        current_closed=_closed_candles(
+                            STATE.get("candles",{}).get(p,[]),time.time()
+                        )
+                        current_closed_ts=(
+                            int(_candle_epoch(current_closed[-1]))
+                            if current_closed and _candle_epoch(current_closed[-1]) is not None
+                            else 0
+                        )
+                        alligator_age=(
+                            time.time()-(float(alligator_candle_ts)+60.0)
+                            if alligator_candle_ts else 9999.0
+                        )
+                        log.info(
+                            "FINAL_ALLIGATOR_BOUNDARY_RECHECKED cycle=%s pair=%s "
+                            "direction=%s candle_ts=%s current_closed_ts=%s age=%.3f",
+                            cycle_id,p,expected,alligator_candle_ts,
+                            current_closed_ts,alligator_age
+                        )
+                except Exception as refresh_error:
+                    log.warning(
+                        "FINAL_ALLIGATOR_BOUNDARY_RECHECK_FAILED cycle=%s pair=%s "
+                        "type=%s message=%s",
+                        cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
+                    )
+
             if (
                 alligator_candle_ts<=0
                 or current_closed_ts!=alligator_candle_ts
