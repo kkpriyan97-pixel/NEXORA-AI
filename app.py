@@ -5940,23 +5940,19 @@ async def cycle_loop():
                             timeout=max(1.0,remaining-0.50)
                         )
                     else:
-                        candidate=sorted(
-                            [
-                                x for x in candidate_pool.values()
-                                if isinstance(x,dict)
-                                and x.get("pair")
-                                and int(x.get("qualified_pass") or 0)>=4
-                                and bool(x.get("deep_verified"))
-                            ],
-                            key=lambda x:(
-                                float(x.get("meta_rank_score") or x.get("confidence") or 0),
-                                int(x.get("confidence") or 0),
-                                float(x.get("strategy_margin") or 0),
-                                float(x.get("direction_agreement") or 0),
-                                float(x.get("market_quality") or 0)
+                        # No new breakout event does not mean the account-wide strict
+                        # Brain should be skipped. Re-evaluate the authenticated account
+                        # universe at pass-5 so an AVWAP/VP REAL setup or PRO Structure
+                        # Continuation OTC setup can still reach the final boundary.
+                        candidate=await asyncio.wait_for(
+                            final_candidate(
+                                require_live_price=False,
+                                deep_analysis=True,
+                                use_cached_only=False,
+                                return_ranked=True,
                             ),
-                            reverse=True
-                        )[:100]
+                            timeout=max(1.0,remaining-0.50)
+                        )
                 else:
                     # Probe only the current Top-10 watchlist for a NEW
                     # closed-M1 Alligator breakout. This probe is local and cheap;
@@ -5998,7 +5994,18 @@ async def cycle_loop():
                             timeout=max(1.0,remaining-0.50)
                         )
                     else:
-                        candidate=None
+                        # Every scheduled pass must feed the strict Brain even when
+                        # there is no breakout event. Breakout focus remains a priority
+                        # selector, never the only route into the account-wide Brain.
+                        candidate=await asyncio.wait_for(
+                            final_candidate(
+                                require_live_price=False,
+                                deep_analysis=(pass_no==4),
+                                use_cached_only=False,
+                                return_ranked=True,
+                            ),
+                            timeout=max(1.0,remaining-0.50)
+                        )
 
                 if isinstance(candidate,list):
                     selected=candidate[:100]
