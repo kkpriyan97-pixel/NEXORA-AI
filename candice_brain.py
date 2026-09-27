@@ -601,6 +601,58 @@ def _alligator_confirmation(cs,direction):
     }
 
 
+def detect_alligator_breakout(candles, now=None):
+    """Return a NEW closed-M1 Alligator breakout event, or None.
+
+    This is a lightweight event detector for the scheduler's watchlist.
+    It does not choose strategy direction, does not use future candles, and
+    does not run AVWAP/VP, OTC structure, BB, or AI checks. Those existing
+    confirmations remain authoritative after an event is detected.
+    """
+    cs=_closed_1m(candles, time.time() if now is None else float(now))
+    if len(cs)<max(
+        ALLIGATOR_JAW_PERIOD+ALLIGATOR_JAW_SHIFT,
+        ALLIGATOR_TEETH_PERIOD+ALLIGATOR_TEETH_SHIFT,
+        ALLIGATOR_LIPS_PERIOD+ALLIGATOR_LIPS_SHIFT,
+    )+2:
+        return None
+
+    up=_alligator_confirmation(cs,"UP")
+    down=_alligator_confirmation(cs,"DOWN")
+    events=[]
+    for item in (up,down):
+        if not isinstance(item,dict):
+            continue
+        if bool(item.get("breakout")) and bool(item.get("breakout_confirmed")):
+            events.append(item)
+    if not events:
+        return None
+    # A single candle should not qualify as both directions; preserve the
+    # deterministic order in case numerical equality occurs at a boundary.
+    events.sort(key=lambda x: (
+        1 if str(x.get("direction") or "").upper()=="UP" else 0,
+        float(x.get("closed_age_seconds") or 9999.0)
+    ), reverse=True)
+    event=events[0]
+    return {
+        "direction":str(event.get("direction") or "").upper(),
+        "breakout_confirmed":True,
+        "breakout_candle_ts":int(event.get("breakout_candle_ts") or cs[-1]["time"]),
+        "previous_close":float(event.get("breakout_previous_close") or cs[-2]["close"]),
+        "current_close":float(event.get("breakout_current_close") or cs[-1]["close"]),
+        "jaw":event.get("jaw"),
+        "teeth":event.get("teeth"),
+        "lips":event.get("lips"),
+        "aligned":bool(event.get("aligned")),
+        "sloping":bool(event.get("sloping")),
+        "price_position":bool(event.get("price_position")),
+        "timing_ok":bool(event.get("timing_ok")),
+        "spread_ratio":float(event.get("spread_ratio") or 0.0),
+        "closed_age_seconds":float(event.get("closed_age_seconds") or 9999.0),
+        "periods":event.get("periods","13/8,8/5,5/3"),
+    }
+
+
 def _bollinger_confirmation(candles, direction, period=18, multiplier=2.0):
     """Return a zero-network M1 Bollinger 18/2 confirmation layer.
     
