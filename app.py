@@ -4518,6 +4518,57 @@ async def cycle_loop():
                 )
                 return False
 
+            # Re-validate the Alligator timing at the actual Telegram boundary.
+            # The terminal parameters are 13/8, 8/5 and 5/3. This is a local
+            # closed-candle integrity check; it does not create another scheduler
+            # or timer, so the 3-minute wall-clock cadence remains unchanged.
+            if ind.get("alligator_timing_ok") is not True:
+                log.info(
+                    "FINAL_LIVE_ALLIGATOR_TIMING_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=timing_flag_not_confirmed next_asset=TRUE",
+                    cycle_id,p,expected
+                )
+                return False
+            try:
+                alligator_candle_ts=int(
+                    ind.get("alligator_latest_closed_candle_ts")
+                    or candidate.get("entry_candle_ts") or 0
+                )
+            except (TypeError,ValueError):
+                alligator_candle_ts=0
+            current_closed=_closed_candles(
+                STATE.get("candles",{}).get(p,[]),time.time()
+            )
+            current_closed_ts=int(current_closed[-1]["time"]) if current_closed else 0
+            alligator_age=(
+                time.time()-(float(alligator_candle_ts)+60.0)
+                if alligator_candle_ts else 9999.0
+            )
+            if (
+                alligator_candle_ts<=0
+                or current_closed_ts!=alligator_candle_ts
+                or alligator_age>90.0
+                or alligator_age<0.0
+            ):
+                log.info(
+                    "FINAL_LIVE_ALLIGATOR_TIMING_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=closed_candle_changed_or_timing_stale indicator_candle_ts=%s "
+                    "current_closed_ts=%s age=%.3f next_asset=TRUE",
+                    cycle_id,p,expected,alligator_candle_ts,current_closed_ts,
+                    alligator_age
+                )
+                return False
+            ind["alligator_final_timing_verified"]=True
+            ind["alligator_final_timing_age_seconds"]=round(alligator_age,3)
+            log.info(
+                "FINAL_ALLIGATOR_TIMING_CONFIRMED cycle=%s pair=%s direction=%s "
+                "periods=13/8,8/5,5/3 candle_ts=%s age=%.3f spread_ratio=%s",
+                cycle_id,p,expected,
+                ind.get("alligator_latest_closed_candle_ts"),
+                float(ind.get("alligator_final_timing_age_seconds") or 0.0),
+                ind.get("alligator_spread_ratio")
+            )
+
             real_volume_ok=(ind.get("real_volume_verified") is True)
             fallback_value_position=str(ind.get("value_position") or "").upper()
             fallback_direction=str(expected or "").upper()
