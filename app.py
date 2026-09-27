@@ -284,7 +284,9 @@ AI_REVIEW_QUEUE_POLL_SECONDS=0.5
 AI_REVIEW_QUEUE_STALE_SECONDS=600.0
 AI_REVIEW_QUEUE_RETRY_DELAYS=(5,15,30,60,120,300)
 RESULT_WATCH_QUEUE_STALE_SECONDS=600.0
-RESULT_WATCH_STALE_GRACE_SECONDS=180.0
+# Result watches must survive a short Render restart without being declared unresolved.
+RESULT_WATCH_STALE_GRACE_SECONDS=1800.0
+RESULT_WATCH_RECOVERY_INTERVAL=5.0
 ACCOUNT_TICK_CONTROL_LOCK=asyncio.Lock()
 
 # Durable scheduler state. Render can replace the running instance at any time;
@@ -840,6 +842,29 @@ async def mark_result_watch_error(watch_id,error):
                     watch_id,type(e).__name__,str(e)[:160])
         return False
 
+async def result_watch_recovery_worker():
+    """Continuously recover durable result watches if an individual watcher disappears."""
+    while True:
+        try:
+            client=CLIENT
+            connected=bool(
+                client
+                and getattr(getattr(client,"connection",None),"is_connected",False)
+            )
+            if connected:
+                restored=await restore_pending_result_watches()
+                if restored:
+                    log.info("RESULT_WATCH_RECOVERY_WORKER restored=%d",restored)
+                # Do not let a transient restart immediately erase a recoverable watch.
+                await expire_stale_result_watches()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("RESULT_WATCH_RECOVERY_WORKER_ERROR type=%s message=%s",
+                        type(e).__name__,str(e)[:180])
+        await asyncio.sleep(RESULT_WATCH_RECOVERY_INTERVAL)
+
+
 async def expire_stale_result_watches():
     """Terminally close old result watches that can no longer produce trustworthy data."""
     if not LEARNING_DB_URL:
@@ -877,6 +902,38 @@ async def expire_stale_result_watches():
         log.warning("RESULT_WATCH_STALE_CLEANUP_FAILED type=%s message=%s",
                     type(e).__name__,str(e)[:160])
         return 0
+
+async def revive_recent_unresolved_result_watches():
+    """Re-queue a recently stale-expired watch so a restart can finish its historical result measurement."""
+    if not LEARNING_DB_URL:
+        return 0
+    try:
+        import psycopg
+        def revive():
+            with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
+                with db.cursor() as cur:
+                    cur.execute("""
+                        UPDATE candice_result_watch_queue
+                        SET status='PENDING',
+                            last_error=NULL,
+                            completed_at=NULL,
+                            updated_at=NOW()
+                        WHERE status='UNRESOLVED'
+                          AND last_error='stale_result_watch_expired_without_authoritative_result'
+                          AND created_at > NOW() - INTERVAL '2 hours'
+                    """)
+                    count=cur.rowcount
+                db.commit()
+            return count
+        count=await asyncio.to_thread(revive)
+        if count:
+            log.info("RESULT_WATCH_RECOVERY_REQUEUED count=%d",int(count))
+        return int(count or 0)
+    except Exception as e:
+        log.warning("RESULT_WATCH_RECOVERY_REQUEUE_FAILED type=%s message=%s",
+                    type(e).__name__,str(e)[:160])
+        return 0
+
 
 async def restore_pending_result_watches():
     if not LEARNING_DB_URL or not CLIENT or not CLIENT.connection.is_connected:
@@ -4156,6 +4213,8 @@ async def result_watch(key):
     if not s:
         return
     watch_id=f"{s.cycle_id}:{s.pair}:{s.entry_ts}"
+    log.info("RESULT_WATCH_STARTED watch_id=%s cycle=%s pair=%s expiry=%s",
+             watch_id,s.cycle_id,s.pair,s.expiry_minutes)
 
     # Preserve the signal reference separately. A manual broker trade may be
     # opened later and at a different quote; its broker quote is authoritative
@@ -8044,10 +8103,12 @@ async def market_worker():
                      client.account_id,len(assets),real_n,otc_n,len(assets))
             log.info("STATIC_ACCOUNT_ASSETS_READY count=%d source=user_pdf_104_assets api_asset_listing=off",len(assets))
             await ensure_account_tick_subscriptions()
-            await expire_stale_result_watches()
+            revived=await revive_recent_unresolved_result_watches()
             restored=await restore_pending_result_watches()
-            if restored:
-                log.info("RESULT_WATCH_RECOVERY_COMPLETE restored=%d",restored)
+            if revived or restored:
+                log.info("RESULT_WATCH_RECOVERY_COMPLETE revived=%d restored=%d",revived,restored)
+            # Cleanup runs only after recovery/requeue so a short service restart
+            # cannot erase the durable watch before it has a chance to resume.
             # Individual event-12 subscriptions are managed by the dedicated
             # read-only worker below. Event-1 ticks are preferred when delivered;
             # the snapshot scanner remains a timestamped fallback for assets
@@ -8665,6 +8726,7 @@ async def main():
         continuous_breakout_monitor(),
         cycle_loop_supervisor(),
         ai_review_worker(),
+        result_watch_recovery_worker(),
         world_learning_loop(),
         strategy_knowledge_refresh_loop(),
         server.serve_forever(),
