@@ -769,6 +769,16 @@ def _otc_median(values):
 
 FIVE_MINUTES=300
 
+# The legacy 5M cadence fallback was introduced to keep wall-clock slots populated,
+# but it can use a completed 5M bar that is too old for a 1M/2M production entry.
+# Keep it opt-in for future 5M-expiry validation; production live signals remain
+# on the strict M1 structure path until the 5M entry timing is independently validated.
+ALLOW_5M_CADENCE_FALLBACK = os.getenv("ALLOW_5M_CADENCE_FALLBACK","0").strip().lower() in {"1","true","yes","on"}
+FIVE_MINUTE_MAX_SETUP_AGE_SECONDS = max(
+    60.0,
+    min(180.0,float(os.getenv("FIVE_MINUTE_MAX_SETUP_AGE_SECONDS","120") or 120.0))
+)
+
 def _complete_5m_blocks(cs,now=None):
     """Build exact closed 5-minute bars from complete 1-minute candles only."""
     now=time.time() if now is None else float(now)
@@ -907,6 +917,16 @@ def _five_minute_cadence_setup(cs,primary_bias=None,now=None):
     else:
         direction="UP" if up_score>down_score else "DOWN"
 
+    derived_bias="BULLISH" if direction=="UP" else "BEARISH"
+    # A 5M fallback may never override the authoritative 15M bias.
+    if primary_bias in {"BULLISH","BEARISH"} and derived_bias != primary_bias:
+        return None
+
+    closed_last_end=float(last["time"])+FIVE_MINUTES
+    setup_age_seconds=max(0.0,now-closed_last_end)
+    if setup_age_seconds > FIVE_MINUTE_MAX_SETUP_AGE_SECONDS:
+        return None
+
     directional_ok=(up_score>down_score) if direction=="UP" else (down_score>up_score)
     momentum_ok=momentum_up if direction=="UP" else momentum_down
     structure_ok=(
@@ -970,7 +990,9 @@ def _five_minute_cadence_setup(cs,primary_bias=None,now=None):
         "five_minute_score_up":int(up_score),
         "five_minute_score_down":int(down_score),
         "five_minute_confidence":int(confidence),
-        "five_minute_primary_bias":str(primary_bias or "NEUTRAL"),
+        "five_minute_primary_bias":str(primary_bias or derived_bias or "NEUTRAL"),
+        "five_minute_last_closed_ts":int(closed_last_end),
+        "five_minute_setup_age_seconds":float(setup_age_seconds),
     }
 
 
@@ -1171,6 +1193,9 @@ def analyze_otc_asset(
     # directional bias from closed 5M structure/momentum rather than starving
     # the wall-clock 5-minute signal slot.
     if bias not in {"BULLISH","BEARISH"}:
+        if not ALLOW_5M_CADENCE_FALLBACK:
+            _diag(pair,"otc_15m_bias_rejected",bias=bias,bias_votes=bias_votes,blocks=len(blocks),reason="5m_cadence_fallback_disabled")
+            return None
         cadence_setup=_five_minute_cadence_setup(cs,None,now=now)
         if not cadence_setup:
             _diag(pair,"otc_15m_bias_rejected",bias=bias,bias_votes=bias_votes,blocks=len(blocks))
@@ -1187,6 +1212,9 @@ def analyze_otc_asset(
         direction="UP" if bias=="BULLISH" else "DOWN"
         setup=_otc_structure_setup(cs,direction)
         if not setup:
+            if not ALLOW_5M_CADENCE_FALLBACK:
+                _diag(pair,"otc_structure_sequence_rejected",direction=direction,reason="strict_m1_required")
+                return None
             cadence_setup=_five_minute_cadence_setup(cs,bias,now=now)
             if not cadence_setup:
                 _diag(pair,"otc_structure_sequence_rejected",direction=direction)
@@ -1194,7 +1222,10 @@ def analyze_otc_asset(
             setup=cadence_setup
             cadence_fallback=True
             direction=str(setup.get("direction") or direction).upper()
-            bias="BULLISH" if direction=="UP" else "BEARISH"
+            derived_bias="BULLISH" if direction=="UP" else "BEARISH"
+            if derived_bias != bias:
+                _diag(pair,"otc_5m_bias_conflict_rejected",direction=direction,primary_bias=bias)
+                return None
 
     # The strategy itself is structure/candle based. Broker-reported volume is
     # intentionally not used to create the OTC decision. The final scheduler
@@ -1224,6 +1255,26 @@ def analyze_otc_asset(
     # The structure detector already checked the exact closed-candle continuation
     # in the same bounded recent window. Keep the flag explicit for final gating.
     m1_continuation_ok=bool(setup.get("entry_continuation_confirmed"))
+
+    # Final freshness/alignment guard. A live OTC signal may never use stale
+    # structural evidence, and a 5M fallback may not disagree with the 15M bias.
+    latest_closed_ts=int(cs[-1]["time"])
+    if cadence_fallback:
+        five_bias=str(setup.get("five_minute_primary_bias") or bias).upper()
+        expected_bias="BULLISH" if direction=="UP" else "BEARISH"
+        if five_bias != expected_bias or five_bias != str(bias).upper():
+            _diag(pair,"otc_5m_bias_conflict_rejected",direction=direction,five_bias=five_bias,bias=bias)
+            return None
+        age=float(setup.get("five_minute_setup_age_seconds") or 9999.0)
+        if age > FIVE_MINUTE_MAX_SETUP_AGE_SECONDS:
+            _diag(pair,"otc_5m_setup_stale",age_seconds=age,max_age=FIVE_MINUTE_MAX_SETUP_AGE_SECONDS)
+            return None
+    else:
+        bos_age=max(0.0,float(latest_closed_ts)-float(setup.get("bos_candle_ts") or latest_closed_ts))
+        confirmation_age=max(0.0,float(latest_closed_ts)-float(setup.get("confirmation_candle_ts") or latest_closed_ts))
+        if bos_age > 5*ONE_MINUTE or confirmation_age > 4*ONE_MINUTE:
+            _diag(pair,"otc_m1_structure_stale",bos_age_seconds=bos_age,confirmation_age_seconds=confirmation_age)
+            return None
 
     # The complete strategy sequence is the authoritative live gate.
     exact_live_setup=bool(
@@ -1280,6 +1331,9 @@ def analyze_otc_asset(
         "five_minute_score_up":int(setup.get("five_minute_score_up") or 0),
         "five_minute_score_down":int(setup.get("five_minute_score_down") or 0),
         "five_minute_primary_bias":str(setup.get("five_minute_primary_bias") or bias),
+        "five_minute_last_closed_ts":int(setup.get("five_minute_last_closed_ts") or 0),
+        "five_minute_setup_age_seconds":float(setup.get("five_minute_setup_age_seconds") or 0.0),
+        "analysis_timeframe":"5M" if cadence_fallback else "1M",
         "volume_mode":"OTC_OBSERVED_TICK_ACTIVITY_AT_ENTRY",
         "volume_quality":"N/A_STRUCTURE_STRATEGY",
         "real_volume_verified":False,
@@ -1334,7 +1388,10 @@ def analyze_otc_asset(
         "expiry_minutes":1,
         "pattern":"PRO_OTC_STRUCTURE_CONTINUATION",
         "trend_15m":f"OTC_{bias}",
-        "structure_1m":setup["sequence"],
+        "structure_1m":(
+            setup["sequence"] if not cadence_fallback
+            else str(setup["sequence"]).replace("5M_","")
+        ),
         "market_quality":float(score),
         "confluence_score":float(score),
         "direction_agreement":1.0,
