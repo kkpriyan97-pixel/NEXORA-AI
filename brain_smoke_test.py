@@ -4,7 +4,7 @@ import time
 from candice_brain import ALLOWED_STRATEGY, OTC_STRATEGY, analyze_asset
 
 
-def up_candles(n=120, start=1_000_000):
+def up_candles(n=180, start=1_000_000):
     out=[]
     for i in range(n):
         t=start+i*60
@@ -20,7 +20,7 @@ def up_candles(n=120, start=1_000_000):
     return out
 
 
-def down_candles(n=120, start=1_000_000):
+def down_candles(n=180, start=1_000_000):
     out=[]
     for i in range(n):
         t=start+i*60
