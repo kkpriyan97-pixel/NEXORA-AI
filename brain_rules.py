@@ -538,6 +538,8 @@ class BrainState:
             "structure_1m":s.structure_1m,"self_strategy":s.self_strategy,
             "self_strategy_version":s.self_strategy_version,"reason":s.reason,
             "confidence":s.confidence,"result":result,
+            # A result must always be traceable to a Telegram-delivered signal.
+            "telegram_delivered":bool(getattr(s,"telegram_delivered",False)),
             "result_source":str(result_source or getattr(s,"broker_trade_source","") or ""),
             "broker_trade_id":str(broker_trade_id or getattr(s,"broker_trade_id","") or ""),
             "broker_trade_status":str(broker_status or getattr(s,"broker_trade_status","") or ""),
