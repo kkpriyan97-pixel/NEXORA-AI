@@ -1130,66 +1130,38 @@ def rank_signal_candidates(candidates):
         ind=dict(x.get("indicators") or x.get("indicator_context") or {})
         direction=str(x.get("direction") or "").upper()
 
-        signal_mode=str(x.get("signal_mode") or ind.get("signal_mode") or "STRICT_SETUP").upper()
-        scheduled=(signal_mode=="SCHEDULED_CONTINUATION" or bool(x.get("scheduled_fallback")))
         if strategy==ALLOWED_STRATEGY:
             value_position=str(ind.get("value_position") or "").upper()
-            if scheduled:
-                # Scheduled fallback still requires the locked AVWAP+POC direction,
-                # Alligator confirmation and the exact M1 continuation fields built
-                # by candice_brain.py. It simply does not require a NEW Alligator
-                # crossing in the same five-minute slot.
-                if ind.get("alligator_confirmed") is not True:
-                    continue
-                if ind.get("alligator_timing_ok") is not True:
-                    continue
-                if ind.get("m1_continuation_ok") is not True:
-                    continue
-                if ind.get("exact_live_setup") is not True:
-                    continue
-            else:
-                if (
-                    (direction=="UP" and value_position!="ABOVE_VALUE")
-                    or (direction=="DOWN" and value_position!="BELOW_VALUE")
-                ):
-                    continue
-                if ind.get("level_reclaim") is not False:
-                    continue
-                if ind.get("slope_persistent") is not True:
-                    continue
-                if ind.get("exact_live_setup") is not True:
-                    continue
+            if (
+                (direction=="UP" and value_position!="ABOVE_VALUE")
+                or (direction=="DOWN" and value_position!="BELOW_VALUE")
+            ):
+                continue
+            if ind.get("level_reclaim") is not False:
+                continue
+            if ind.get("slope_persistent") is not True:
+                continue
+            if ind.get("exact_live_setup") is not True:
+                continue
         elif strategy==OTC_STRATEGY:
+            # The OTC strategy is isolated to the exact structural sequence.
             if ind.get("otc_strategy") is not True:
                 continue
             if ind.get("otc_market_bias") != ("BULLISH" if direction=="UP" else "BEARISH"):
                 continue
-            if scheduled:
-                if ind.get("otc_bos_confirmed") is not True:
-                    continue
-                if ind.get("m1_continuation_ok") is not True:
-                    continue
-                if ind.get("exact_live_setup") is not True:
-                    continue
-                if ind.get("alligator_confirmed") is not True:
-                    continue
-                if ind.get("alligator_timing_ok") is not True:
-                    continue
-                q.append(x)
+            for flag in (
+                "otc_bos_confirmed",
+                "otc_displacement_confirmed",
+                "otc_retest_confirmed",
+                "otc_hold_confirmed",
+                "otc_confirmation_candle_confirmed",
+                "m1_continuation_ok",
+                "exact_live_setup",
+            ):
+                if ind.get(flag) is not True:
+                    break
             else:
-                for flag in (
-                    "otc_bos_confirmed",
-                    "otc_displacement_confirmed",
-                    "otc_retest_confirmed",
-                    "otc_hold_confirmed",
-                    "otc_confirmation_candle_confirmed",
-                    "m1_continuation_ok",
-                    "exact_live_setup",
-                ):
-                    if ind.get(flag) is not True:
-                        break
-                else:
-                    q.append(x)
+                q.append(x)
             continue
 
         q.append(x)
