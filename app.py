@@ -4557,11 +4557,11 @@ async def continuous_breakout_monitor():
 
 
 async def cycle_loop():
-    # 3-minute signal scheduler, active 24/7.
+    # 5-minute signal scheduler, active 24/7.
     # For each cycle:
-    #   - cycle_start = T - 180s
-    #   - Telegram signal = cycle_start + 150s (2m30s after Candice cycle start)
-    #   - entry/expiry boundary T = cycle_start + 180s
+    #   - cycle_start = T - 300s
+    #   - Telegram signal = cycle_start + 270s (4m30s after Candice cycle start)
+    #   - entry/expiry boundary T = cycle_start + 300s
     #   - five Brain passes are completed inside the same 150s pre-signal window
     #   - pass 5 is the deep/final qualification pass 15s before delivery
     #   - 5s + every complete 1m..15m frame are checked in each pass
@@ -4569,9 +4569,9 @@ async def cycle_loop():
     #     the scheduler, so one completed signal cannot stop the next cycle.
     # The Brain/AI strategy itself is unchanged; only the scheduling cadence
     # and the requested expiry are changed for DEMO analysis.
-    # Day signal session: every 3 minutes. Signal is fixed at target-30s;
+    # Day signal session: every 5 minutes. Signal is fixed at target-30s;
     # the 1-minute DEMO entry/expiry boundary is the exact 5-minute target.
-    SIGNAL_INTERVAL=180.0
+    SIGNAL_INTERVAL=300.0
     SIGNAL_LEADS=(30.0,30.0)
     SCAN_OFFSETS=CYCLE_SCAN_OFFSETS
 
@@ -4786,85 +4786,93 @@ async def cycle_loop():
         strategy_name=str(candidate.get("strategy") or "").upper()
         trend_name=str(candidate.get("trend_15m") or "").upper()
 
-        # Exact Alligator breakout timing gate.
-        # The direction is still owned by the strategy brain. Alligator only
-        # decides whether a NEW breakout event is happening on this latest
-        # closed M1 candle, preventing old breakouts from generating late entry.
-        ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
-        alligator_breakout_ok=(
-            ind.get("alligator_breakout_confirmed") is True
-            and str(ind.get("alligator_breakout_direction") or "").upper()==expected
-        )
-        breakout_ts=ind.get("alligator_breakout_candle_ts")
-        breakout_age=(
-            time.time()-(float(breakout_ts)+60.0)
-            if breakout_ts else 9999.0
-        )
-        if not alligator_breakout_ok or breakout_age<0.0 or breakout_age>90.0:
-            # Recompute the same deterministic brain on the latest closed M1
-            # candles. This is local-only and does not alter the 3-minute
-            # scheduler timing.
-            try:
-                boundary_asset=next(
-                    (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
-                    None
-                )
-                boundary_closed=_closed_candles(
-                    STATE.get("candles",{}).get(p,[]),time.time()
-                )
-                boundary_analysis=_prepare_volume_candles(p,boundary_closed)
-                boundary_refreshed=analyze_asset(
-                    boundary_asset or {"pair":p,"display_name":p},
-                    boundary_analysis,
-                    entry,
-                    forced_strategy=strategy_name,
-                    require_high_volume=False,
-                )
-                refreshed_ind=dict(
-                    boundary_refreshed.get("indicators")
-                    or boundary_refreshed.get("indicator_context")
-                    or {}
-                ) if boundary_refreshed else {}
-                refreshed_direction=(
-                    str(boundary_refreshed.get("direction") or "").upper()
-                    if boundary_refreshed else ""
-                )
-                if (
-                    boundary_refreshed
-                    and refreshed_direction==expected
-                    and bool(refreshed_ind.get("alligator_breakout_confirmed"))
-                ):
-                    candidate.update(boundary_refreshed)
-                    ind=refreshed_ind
-                    breakout_ts=ind.get("alligator_breakout_candle_ts")
-                    breakout_age=(
-                        time.time()-(float(breakout_ts)+60.0)
-                        if breakout_ts else 9999.0
-                    )
-                    alligator_breakout_ok=(
-                        str(ind.get("alligator_breakout_direction") or "").upper()==expected
-                    )
-                    log.info(
-                        "FINAL_ALLIGATOR_BREAKOUT_BOUNDARY_RECHECKED cycle=%s pair=%s "
-                        "direction=%s candle_ts=%s age=%.3f",
-                        cycle_id,p,expected,breakout_ts,float(breakout_age)
-                    )
-            except Exception as refresh_error:
-                log.warning(
-                    "FINAL_ALLIGATOR_BREAKOUT_RECHECK_FAILED cycle=%s pair=%s type=%s message=%s",
-                    cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
-                )
-        if (
-            not alligator_breakout_ok
-            or breakout_age<0.0
-            or breakout_age>90.0
-        ):
-            log.info(
-                "FINAL_ALLIGATOR_BREAKOUT_REJECTED cycle=%s pair=%s direction=%s "
-                "reason=no_new_closed_m1_breakout breakout_candle_ts=%s age=%.3f next_asset=TRUE",
-                cycle_id,p,expected,breakout_ts,float(breakout_age)
+        if strategy_name==ALLOWED_STRATEGY:
+            # Exact Alligator breakout timing gate.
+            # The direction is still owned by the strategy brain. Alligator only
+            # decides whether a NEW breakout event is happening on this latest
+            # closed M1 candle, preventing old breakouts from generating late entry.
+            ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
+            alligator_breakout_ok=(
+                ind.get("alligator_breakout_confirmed") is True
+                and str(ind.get("alligator_breakout_direction") or "").upper()==expected
             )
-            return False
+            breakout_ts=ind.get("alligator_breakout_candle_ts")
+            breakout_age=(
+                time.time()-(float(breakout_ts)+60.0)
+                if breakout_ts else 9999.0
+            )
+            if not alligator_breakout_ok or breakout_age<0.0 or breakout_age>90.0:
+                # Recompute the same deterministic brain on the latest closed M1
+                # candles. This is local-only and does not alter the 3-minute
+                # scheduler timing.
+                try:
+                    boundary_asset=next(
+                        (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
+                        None
+                    )
+                    boundary_closed=_closed_candles(
+                        STATE.get("candles",{}).get(p,[]),time.time()
+                    )
+                    boundary_analysis=_prepare_volume_candles(p,boundary_closed)
+                    boundary_refreshed=analyze_asset(
+                        boundary_asset or {"pair":p,"display_name":p},
+                        boundary_analysis,
+                        entry,
+                        forced_strategy=strategy_name,
+                        require_high_volume=False,
+                    )
+                    refreshed_ind=dict(
+                        boundary_refreshed.get("indicators")
+                        or boundary_refreshed.get("indicator_context")
+                        or {}
+                    ) if boundary_refreshed else {}
+                    refreshed_direction=(
+                        str(boundary_refreshed.get("direction") or "").upper()
+                        if boundary_refreshed else ""
+                    )
+                    if (
+                        boundary_refreshed
+                        and refreshed_direction==expected
+                        and bool(refreshed_ind.get("alligator_breakout_confirmed"))
+                    ):
+                        candidate.update(boundary_refreshed)
+                        ind=refreshed_ind
+                        breakout_ts=ind.get("alligator_breakout_candle_ts")
+                        breakout_age=(
+                            time.time()-(float(breakout_ts)+60.0)
+                            if breakout_ts else 9999.0
+                        )
+                        alligator_breakout_ok=(
+                            str(ind.get("alligator_breakout_direction") or "").upper()==expected
+                        )
+                        log.info(
+                            "FINAL_ALLIGATOR_BREAKOUT_BOUNDARY_RECHECKED cycle=%s pair=%s "
+                            "direction=%s candle_ts=%s age=%.3f",
+                            cycle_id,p,expected,breakout_ts,float(breakout_age)
+                        )
+                except Exception as refresh_error:
+                    log.warning(
+                        "FINAL_ALLIGATOR_BREAKOUT_RECHECK_FAILED cycle=%s pair=%s type=%s message=%s",
+                        cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
+                    )
+            if (
+                not alligator_breakout_ok
+                or breakout_age<0.0
+                or breakout_age>90.0
+            ):
+                log.info(
+                    "FINAL_ALLIGATOR_BREAKOUT_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=no_new_closed_m1_breakout breakout_candle_ts=%s age=%.3f next_asset=TRUE",
+                    cycle_id,p,expected,breakout_ts,float(breakout_age)
+                )
+                return False
+
+        else:
+            log.info(
+                "FINAL_ALLIGATOR_GATE_SKIPPED cycle=%s pair=%s strategy=%s direction=%s "
+                "reason=otc_strategy_uses_pro_structure_continuation",
+                cycle_id,p,strategy_name,expected
+            )
 
         # Exact-entry market-state gate is strategy-specific:
         # REAL -> AVWAP + POC live alignment.
@@ -7002,7 +7010,7 @@ async def cycle_loop():
 
         # Do not let the current cycle's durable DB status update block
         # the 24/7 scheduler after a signal/no-signal decision. The next
-        # 3-minute target must be scheduled immediately; persistence runs
+        # 5-minute target must be scheduled immediately; persistence runs
         # independently and never owns the scan loop.
         if sent:
             asyncio.create_task(
@@ -7032,7 +7040,7 @@ async def cycle_loop():
         )
         await asyncio.sleep(0)
 
-        # Immediately iterate to the next 3-minute target. The first scan
+        # Immediately iterate to the next 5-minute target. The first scan
         # begins 150s before that target, preserving the fixed 30s delivery lead.
 
 async def learning_practice_supervisor():
