@@ -14,8 +14,9 @@ GLOBAL_LOSS_STREAK_LIMIT = max(1, int(os.getenv("GLOBAL_LOSS_STREAK_LIMIT", "3")
 GLOBAL_LOSS_STREAK_COOLDOWN_SECONDS = max(60, int(os.getenv("GLOBAL_LOSS_STREAK_COOLDOWN_SECONDS", "600") or 600))
 MIN_CONFIDENCE = 90
 CYCLE_SECONDS = 300
-EXPIRIES = (1,2)
-LIVE_EXPIRY_OPTIONS = (1,2)
+FIVE_MINUTE_EXPIRY_MODE = os.getenv("NEXORA_5M_EXPIRY_MODE","1").strip().lower() in {"1","true","yes","on"}
+EXPIRIES = (1,2,5)
+LIVE_EXPIRY_OPTIONS = (5,) if FIVE_MINUTE_EXPIRY_MODE else (1,2)
 LIVE_EXPIRY_HIGH_QUALITY = max(90.0,min(99.0,float(os.getenv("LIVE_EXPIRY_HIGH_QUALITY","97") or 97)))
 ALLOWED_STRATEGY = "AVWAP_VOLUME_PROFILE"
 OTC_STRATEGY = "PRO_OTC_STRUCTURE_CONTINUATION"
@@ -631,18 +632,22 @@ class BrainState:
         return max(-8.0,min(8.0,base_bonus+strategy_bonus+pattern_bonus+context_bonus+indicator_bonus))
 
     def choose_expiry(self,pair,strategy,direction,live_quality=0,allow_5m=False):
-        """Choose the production signal expiry between 1m and 2m.
+        """Choose the production signal expiry.
         
-        The 3-minute scheduler is independent of expiry. A stronger current
-        technical setup may use 2m; ordinary qualified setups use 1m. Exact
-        pair/strategy/direction outcome history can also select 2m when it has
-        enough evidence. This is bounded learning, not a promise of returns.
+        In explicit 5M-expiry mode the horizon is fixed at 5 minutes for the
+        supported live strategies. The scheduler itself remains a separate
+        5-minute wall-clock cycle.
         """
         strategy=str(strategy).upper().strip()
         if strategy in ALLOWED_STRATEGIES:
             direction=str(direction or "").upper()
             pair_key=str(pair)
             quality=float(live_quality or 0.0)
+            if FIVE_MINUTE_EXPIRY_MODE:
+                # 5M is an explicit experiment/configuration, not a learned
+                # accidental selection. Learning still records 5M outcomes,
+                # but it never changes the wall-clock 5-minute cycle.
+                return 5
             two=self.stats.get((pair_key,strategy,direction,2))
             one=self.stats.get((pair_key,strategy,direction,1))
             try:
@@ -1019,9 +1024,10 @@ class BrainState:
                 pair,strategy,direction,expiry_quality,
                 allow_5m=allow_5m
             )
-        # Production live expiry is intentionally limited to 1m or 2m.
+        # Production live expiry follows the explicit 5M-expiry mode when enabled;
+        # otherwise retain the legacy 1m/2m selector.
         if int(x.get("expiry_minutes") or 0) not in LIVE_EXPIRY_OPTIONS:
-            x["expiry_minutes"]=1
+            x["expiry_minutes"]=5 if FIVE_MINUTE_EXPIRY_MODE else 1
         return x
 
 
