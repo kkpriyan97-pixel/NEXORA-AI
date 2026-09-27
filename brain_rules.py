@@ -13,7 +13,7 @@ COOLDOWN_SECONDS = max(180, int(os.getenv("PAIR_LOSS_COOLDOWN_SECONDS", "180") o
 GLOBAL_LOSS_STREAK_LIMIT = max(1, int(os.getenv("GLOBAL_LOSS_STREAK_LIMIT", "3") or 3))
 GLOBAL_LOSS_STREAK_COOLDOWN_SECONDS = max(60, int(os.getenv("GLOBAL_LOSS_STREAK_COOLDOWN_SECONDS", "600") or 600))
 MIN_CONFIDENCE = 90
-CYCLE_SECONDS = 180
+CYCLE_SECONDS = 300
 EXPIRIES = (1,2)
 LIVE_EXPIRY_OPTIONS = (1,2)
 LIVE_EXPIRY_HIGH_QUALITY = max(90.0,min(99.0,float(os.getenv("LIVE_EXPIRY_HIGH_QUALITY","97") or 97)))
@@ -1112,23 +1112,28 @@ class BrainState:
 def rank_signal_candidates(candidates):
     # Asset-class-specific production selector:
     # REAL -> existing AVWAP + Volume Profile exact setup.
-    # OTC -> PRO Structure Continuation exact sequence only.
+    # OTC -> strict PRO Structure Continuation first, with a 5-minute
+    # cadence-safe continuation fallback when the strict 1m sequence is absent.
     q=[]
     for x in candidates:
         strategy=str(x.get("strategy","")).upper().strip()
         if strategy not in ALLOWED_STRATEGIES:
             continue
-        if int(x.get("confidence") or 0)<MIN_CONFIDENCE:
+
+        ind=dict(x.get("indicators") or x.get("indicator_context") or {})
+        direction=str(x.get("direction") or "").upper()
+        is_5m_cadence=(
+            strategy==OTC_STRATEGY
+            and str(ind.get("five_minute_mode") or "").upper()=="CADENCE_CONTINUATION_V1"
+        )
+
+        minimum_confidence=75 if is_5m_cadence else MIN_CONFIDENCE
+        if int(x.get("confidence") or 0)<minimum_confidence:
             continue
-        if str(x.get("direction","")).upper() not in {"UP","DOWN"}:
+        if direction not in {"UP","DOWN"}:
             continue
         if bool(x.get("pair_expiry_quality_block")):
             continue
-        # History-AI / learning is observability and ranking only. It must not
-        # suppress a technically qualified live setup or break the wall-clock
-        # 5-minute scheduler.
-        ind=dict(x.get("indicators") or x.get("indicator_context") or {})
-        direction=str(x.get("direction") or "").upper()
 
         if strategy==ALLOWED_STRATEGY:
             value_position=str(ind.get("value_position") or "").upper()
@@ -1143,13 +1148,28 @@ def rank_signal_candidates(candidates):
                 continue
             if ind.get("exact_live_setup") is not True:
                 continue
+
         elif strategy==OTC_STRATEGY:
-            # The OTC strategy is isolated to the exact structural sequence.
+            if is_5m_cadence:
+                if ind.get("otc_strategy") is not True:
+                    continue
+                if ind.get("otc_market_bias") not in {"BULLISH","BEARISH","NEUTRAL"}:
+                    continue
+                if any(ind.get(flag) is not True for flag in (
+                    "five_minute_directional_ok",
+                    "five_minute_structure_ok",
+                    "five_minute_momentum_ok",
+                    "five_minute_entry_candle_ok",
+                )):
+                    continue
+                q.append(x)
+                continue
+
             if ind.get("otc_strategy") is not True:
                 continue
             if ind.get("otc_market_bias") != ("BULLISH" if direction=="UP" else "BEARISH"):
                 continue
-            for flag in (
+            if all(ind.get(flag) is True for flag in (
                 "otc_bos_confirmed",
                 "otc_displacement_confirmed",
                 "otc_retest_confirmed",
@@ -1157,18 +1177,15 @@ def rank_signal_candidates(candidates):
                 "otc_confirmation_candle_confirmed",
                 "m1_continuation_ok",
                 "exact_live_setup",
-            ):
-                if ind.get(flag) is not True:
-                    break
-            else:
+            )):
                 q.append(x)
             continue
 
         q.append(x)
 
-    # Among exact-setups, prefer the strongest current evidence plus bounded
-    # historical reliability from the same context.
     return sorted(q,key=lambda x:(
+        # Strict evidence remains ahead of cadence fallback.
+        1 if str((x.get("indicators") or x.get("indicator_context") or {}).get("five_minute_mode") or "").upper()=="CADENCE_CONTINUATION_V1" else 2,
         float(x.get("exact_setup_rank_score") or x.get("meta_rank_score") or x.get("confidence") or 0),
         float(x.get("exact_setup_reliability") or 0.5),
         int(x.get("confidence") or 0),
