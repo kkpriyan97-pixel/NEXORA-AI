@@ -1203,6 +1203,7 @@ LIVE_CANDLE_BRIDGE_MIN_OBSERVED_SECONDS=max(
 )
 LIVE_CANDLE_BRIDGE_LAST_PROMOTE={}
 LIVE_CANDLE_PAGE_LAST_NEWEST={}
+LIVE_CANDLE_PAGE_META_LOG_AT={}
 
 def _merge_authenticated_live_candle_page(pair,candles,reference_ts=None):
     """Use the broker's live event-10 page as fresh closed-candle history when it is current."""
@@ -1905,6 +1906,36 @@ async def refresh_broker_live_quote(pair):
                     live_recorded+=1
         if live_recorded==0:
             _record_live_candle_snapshot(pair,broker_candle,now)
+        if isinstance(live_page,list) and len(live_page)>1:
+            try:
+                meta_ts=[]
+                for raw_page_candle in live_page:
+                    ts_val=raw_page_candle.get("time",raw_page_candle.get("t")) if isinstance(raw_page_candle,dict) else None
+                    ts_val=float(ts_val)
+                    if ts_val>20_000_000_000:
+                        ts_val/=1000.0
+                    meta_ts.append(ts_val)
+                if meta_ts:
+                    newest_ts=max(meta_ts)
+                    newest_age=max(0.0,now-newest_ts)
+                    closed_ts=max((ts for ts in meta_ts if ts+60.0<=now),default=None)
+                    closed_age=(max(0.0,now-(closed_ts+60.0)) if closed_ts is not None else None)
+                    last_meta=float(LIVE_CANDLE_PAGE_META_LOG_AT.get(pair,0.0) or 0.0)
+                    if now-last_meta>=60.0:
+                        LIVE_CANDLE_PAGE_META_LOG_AT[pair]=now
+                        log.info(
+                            "LIVE_CANDLE_PAGE_META pair=%s candles=%d newest_age=%.1f latest_closed_age=%s "
+                            "newest_ts=%d latest_closed_ts=%s source=authenticated_event10_solid_false",
+                            pair,len(meta_ts),newest_age,
+                            ("NONE" if closed_age is None else f"{closed_age:.1f}"),
+                            int(newest_ts),
+                            ("NONE" if closed_ts is None else str(int(closed_ts)))
+                        )
+            except Exception as e:
+                log.debug(
+                    "LIVE_CANDLE_PAGE_META_FAILED pair=%s type=%s message=%s",
+                    pair,type(e).__name__,str(e)[:100]
+                )
         if page_closed_accepted:
             log.info(
                 "LIVE_CANDLE_HISTORY_ACCEPTED pair=%s closed=%d source=authenticated_event10_solid_false",
