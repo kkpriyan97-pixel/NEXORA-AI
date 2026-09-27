@@ -6621,6 +6621,44 @@ async def cycle_loop():
                                         _ai_verified_confidence_before=int(_item.get("ai_verified_confidence") or 0)
                                         _ai_verified_entry_before=_item.get("ai_verified_entry_candle_ts")
                                         _item.update(refreshed)
+
+                                        # In 5M-expiry mode, OTC entries should use the
+                                        # completed 5M context whenever available. The newest
+                                        # closed M1 candle remains the exact entry timestamp.
+                                        if FIVE_MINUTE_EXPIRY_MODE and strategy_name==OTC_STRATEGY:
+                                            _5m_ind=dict(refreshed.get("indicators") or refreshed.get("indicator_features") or {})
+                                            _5m_mode=str(_5m_ind.get("five_minute_mode") or "").upper()
+                                            _5m_entry_ts=refreshed.get("entry_candle_ts")
+                                            _5m_latest_ts=(closed_1m[-1].get("time") if closed_1m else None)
+                                            if _5m_entry_ts!=_5m_latest_ts:
+                                                reason="5m_entry_not_latest_closed_m1"
+                                                diag={
+                                                    "five_minute_mode":_5m_mode,
+                                                    "entry_candle_ts":_5m_entry_ts,
+                                                    "latest_closed_m1_ts":_5m_latest_ts,
+                                                }
+                                            elif _5m_mode=="CADENCE_CONTINUATION_V1":
+                                                _5m_expected_bias="BULLISH" if expected=="UP" else "BEARISH"
+                                                _5m_flags_ok=all(
+                                                    _5m_ind.get(k) is True for k in (
+                                                        "five_minute_directional_ok",
+                                                        "five_minute_structure_ok",
+                                                        "five_minute_momentum_ok",
+                                                        "five_minute_entry_candle_ok",
+                                                    )
+                                                )
+                                                _5m_bias_ok=str(_5m_ind.get("five_minute_primary_bias") or "").upper()==_5m_expected_bias
+                                                _5m_age=float(_5m_ind.get("five_minute_setup_age_seconds") or 9999.0)
+                                                if not (_5m_flags_ok and _5m_bias_ok and _5m_age<=360.0):
+                                                    reason="5m_structure_recheck_failed"
+                                                    diag={
+                                                        "five_minute_mode":_5m_mode,
+                                                        "flags_ok":_5m_flags_ok,
+                                                        "primary_bias":_5m_ind.get("five_minute_primary_bias"),
+                                                        "expected_bias":_5m_expected_bias,
+                                                        "setup_age_seconds":_5m_age,
+                                                    }
+
                                         _item["ai_verified"]=bool(_ai_verified_before)
                                         _item["ai_verified_direction"]=_ai_verified_direction_before
                                         _item["ai_verified_confidence"]=_ai_verified_confidence_before
@@ -6749,7 +6787,7 @@ async def cycle_loop():
                                 "SCAN_CANDIDATE_SELECTED cycle=%s scan=SCAN_%s pass=%s pair=%s "
                                 "confidence=%s strategy=%s expiry=%s pool=%s deep=%s",
                                 cycle_id,pass_no,pass_no,item.get("pair"),
-                                item.get("confidence"),item.get("strategy"),1,
+                                item.get("confidence"),item.get("strategy"),item.get("expiry_minutes") or (5 if FIVE_MINUTE_EXPIRY_MODE else 1),
                                 len(candidate_pool),pass_no==5
                             )
                 elif candidate is None:
