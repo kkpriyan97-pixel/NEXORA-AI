@@ -4938,6 +4938,32 @@ async def cycle_loop():
         strategy_name=str(candidate.get("strategy") or "").upper()
         trend_name=str(candidate.get("trend_15m") or "").upper()
 
+        # OTC requires the external verifier to have approved this exact entry
+        # candle/direction. A candidate with missing, mismatched or stale AI
+        # metadata can never be resurrected by the boundary cache.
+        if strategy_name==OTC_STRATEGY:
+            ai_verified=bool(candidate.get("ai_verified"))
+            ai_direction=str(candidate.get("ai_verified_direction") or "").upper()
+            ai_entry_ts=candidate.get("ai_verified_entry_candle_ts")
+            current_entry_ts=(
+                (candidate.get("indicators") or candidate.get("indicator_context") or {}).get(
+                    "otc_entry_candle_ts"
+                )
+                or candidate.get("entry_candle_ts")
+            )
+            if (
+                not ai_verified
+                or ai_direction!=expected
+                or ai_entry_ts!=current_entry_ts
+            ):
+                log.info(
+                    "SIGNAL_DELIVERY_BLOCKED_OTC_AI cycle=%s pair=%s direction=%s "
+                    "ai_verified=%s ai_direction=%s ai_entry_candle_ts=%s current_entry_candle_ts=%s "
+                    "reason=exact_candle_ai_agreement_required",
+                    cycle_id,p,expected,ai_verified,ai_direction,ai_entry_ts,current_entry_ts
+                )
+                return False
+
         if strategy_name==ALLOWED_STRATEGY:
             # Exact Alligator breakout timing gate.
             # The direction is still owned by the strategy brain. Alligator only
@@ -6531,7 +6557,35 @@ async def cycle_loop():
                                             "closed_1m":len(closed_1m),
                                         }
                                     else:
+                                        # Preserve the deep Brain+AI verification metadata
+                                        # across the final local candle refresh. If the refreshed
+                                        # decision moved to a different entry candle, it must not
+                                        # silently inherit the old AI verdict.
+                                        _ai_verified_before=bool(_item.get("ai_verified"))
+                                        _ai_verified_direction_before=str(_item.get("ai_verified_direction") or "").upper()
+                                        _ai_verified_confidence_before=int(_item.get("ai_verified_confidence") or 0)
+                                        _ai_verified_entry_before=_item.get("ai_verified_entry_candle_ts")
                                         _item.update(refreshed)
+                                        _item["ai_verified"]=bool(_ai_verified_before)
+                                        _item["ai_verified_direction"]=_ai_verified_direction_before
+                                        _item["ai_verified_confidence"]=_ai_verified_confidence_before
+                                        _item["ai_verified_entry_candle_ts"]=_ai_verified_entry_before
+                                        if (
+                                            strategy_name==OTC_STRATEGY
+                                            and (
+                                                not _ai_verified_before
+                                                or str(_ai_verified_direction_before or "")!=expected
+                                                or _ai_verified_entry_before!=refreshed.get("entry_candle_ts")
+                                            )
+                                        ):
+                                            reason="otc_ai_verification_missing_or_stale"
+                                            diag={
+                                                "ai_verified":_ai_verified_before,
+                                                "ai_direction":_ai_verified_direction_before,
+                                                "expected":expected,
+                                                "ai_entry_candle_ts":_ai_verified_entry_before,
+                                                "refreshed_entry_candle_ts":refreshed.get("entry_candle_ts"),
+                                            }
                                         _item["expiry_minutes"]=int(refreshed.get("expiry_minutes") or _item.get("expiry_minutes") or 1)
                                         if _item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
                                             _item["expiry_minutes"]=1
