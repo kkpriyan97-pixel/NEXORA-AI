@@ -19,7 +19,8 @@ import re
 from datetime import datetime, timezone
 from math import isfinite
 
-EXPIRIES=(1,2)
+FIVE_MINUTE_EXPIRY_MODE = os.getenv("NEXORA_5M_EXPIRY_MODE","1").strip().lower() in {"1","true","yes","on"}
+EXPIRIES=(5,) if FIVE_MINUTE_EXPIRY_MODE else (1,2)
 MIN_CLOSED_CANDLES=60
 ONE_MINUTE=60
 FIFTEEN_MINUTES=900
@@ -773,9 +774,13 @@ FIVE_MINUTES=300
 
 # The legacy 5M cadence fallback was introduced to keep wall-clock slots populated,
 # but it can use a completed 5M bar that is too old for a 1M/2M production entry.
-# Keep it opt-in for future 5M-expiry validation; production live signals remain
-# on the strict M1 structure path until the 5M entry timing is independently validated.
-ALLOW_5M_CADENCE_FALLBACK = os.getenv("ALLOW_5M_CADENCE_FALLBACK","0").strip().lower() in {"1","true","yes","on"}
+# In explicit 5M-expiry mode the validated 5M continuation fallback is
+# enabled by default for OTC assets. It never blocks the scheduler and still
+# requires a complete closed 5M structure/momentum sequence.
+ALLOW_5M_CADENCE_FALLBACK = os.getenv(
+    "ALLOW_5M_CADENCE_FALLBACK",
+    "1" if FIVE_MINUTE_EXPIRY_MODE else "0",
+).strip().lower() in {"1","true","yes","on"}
 FIVE_MINUTE_MAX_SETUP_AGE_SECONDS = max(
     60.0,
     min(180.0,float(os.getenv("FIVE_MINUTE_MAX_SETUP_AGE_SECONDS","120") or 120.0))
@@ -1415,8 +1420,9 @@ def analyze_otc_asset(
         "direction":direction,
         "confidence":confidence,
         "strategy":OTC_STRATEGY,
-        "expiry_minutes":1,
+        "expiry_minutes":5 if FIVE_MINUTE_EXPIRY_MODE else 1,
         "pattern":"PRO_OTC_STRUCTURE_CONTINUATION",
+        "expiry_mode":"5M" if FIVE_MINUTE_EXPIRY_MODE else "1M_2M",
         "trend_15m":f"OTC_{bias}",
         "structure_1m":(
             setup["sequence"] if not cadence_fallback
@@ -1447,7 +1453,7 @@ def analyze_otc_asset(
             "strategy":OTC_STRATEGY,
             "direction":direction,
             "score":confidence,
-            "expiry_minutes":1,
+            "expiry_minutes":5 if FIVE_MINUTE_EXPIRY_MODE else 1,
             "self_strategy_version":"OTC_STRUCTURE_V1",
         }],
         "strategy_audit":[{
@@ -1886,8 +1892,9 @@ def analyze_asset(
         "direction":direction,
         "confidence":confidence,
         "strategy":ALLOWED_STRATEGY,
-        "expiry_minutes":1,
+        "expiry_minutes":5 if FIVE_MINUTE_EXPIRY_MODE else 1,
         "pattern":"AVWAP_VOLUME_PROFILE_ALIGNMENT",
+        "expiry_mode":"5M" if FIVE_MINUTE_EXPIRY_MODE else "1M_2M",
         "trend_15m":trend,
         "structure_1m":structure,
         "market_quality":float(score),
@@ -1916,13 +1923,14 @@ def analyze_asset(
         "closed_15m_ts":anchor_ts,
         "decision_candle_closed":True,
         "price":px,
-        "five_minute_eligible":False,
+        "five_minute_eligible":bool(FIVE_MINUTE_EXPIRY_MODE),
+        "five_minute_expiry_mode":bool(FIVE_MINUTE_EXPIRY_MODE),
         "self_strategy_version":"AVWAP_VP_V2",
         "strategy_candidates":[{
             "strategy":ALLOWED_STRATEGY,
             "direction":direction,
             "score":confidence,
-            "expiry_minutes":1,
+            "expiry_minutes":5 if FIVE_MINUTE_EXPIRY_MODE else 1,
             "self_strategy_version":"AVWAP_VP_V2",
         }],
         "strategy_audit":[{
