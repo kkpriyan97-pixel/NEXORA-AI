@@ -8375,7 +8375,6 @@ def format_candice_signal_message(s, indicator_check, ts, target):
         confluence_label="15M BIAS + 1M STRUCTURE CONFIRMED"
     else:
         structure_tf="1M"
-    else:
         structure_label=(
             "ABOVE AVWAP + POC" if "ABOVE_AVWAP_POC" in structure
             else "BELOW AVWAP + POC" if "BELOW_AVWAP_POC" in structure
