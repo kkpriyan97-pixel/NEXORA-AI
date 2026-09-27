@@ -2943,6 +2943,24 @@ def _candle_data_stale(pair,reference_ts=None):
     closed_at=_candle_closed_at(closed[-1])
     return closed_at is None or (now-closed_at)>75.0
 
+def _candle_history_ready(pair,reference_ts=None,min_closed=60,recent_minutes=15):
+    """Require enough closed history plus a fresh contiguous recent bridge."""
+    now=time.time() if reference_ts is None else float(reference_ts)
+    closed=_closed_candles(STATE["candles"].get(pair,[]),now)
+    if len(closed)<int(min_closed) or not closed:
+        return False
+    last_close_at=_candle_closed_at(closed[-1])
+    if last_close_at is None or (now-float(last_close_at))>75.0:
+        return False
+    n=max(5,int(recent_minutes))
+    if len(closed)<n:
+        return False
+    recent=closed[-n:]
+    times=[int(_candle_epoch(x)) for x in recent if _candle_epoch(x) is not None]
+    if len(times)!=n:
+        return False
+    return all(times[i]==times[i-1]+60 for i in range(1,len(times)))
+
 async def refresh_candles(force=False):
     client=CLIENT;assets=list(STATE["assets"])
     if not client:return
@@ -3001,6 +3019,21 @@ async def refresh_candles(force=False):
                                 log.info("CANDLE_REFRESH_RECOVERED pair=%s attempt=%d closed=%d newest_age=%.1f",
                                          p,attempt,len(closed),age)
                             return
+                        # Preserve a stale but structurally valid historical seed when
+                        # the broker event-10 endpoint is lagging. The seed is never
+                        # considered live-ready; the live broker-current-candle bridge
+                        # must fill the missing recent minutes before Brain analysis.
+                        if len(closed)>=60 and newest is not None:
+                            existing=STATE["candles"].get(p,[]) or []
+                            existing_closed=_closed_candles(existing,time.time())
+                            existing_newest=_candle_epoch(existing_closed[-1]) if existing_closed else None
+                            if existing_newest is None or newest>existing_newest:
+                                STATE["candles"][p]=list(normalized)
+                                log.info(
+                                    "CANDLE_HISTORY_STALE_SEED_STORED pair=%s closed=%d newest_age=%.1f "
+                                    "source=event10_lag_seed awaiting_live_bridge=True",
+                                    p,len(closed),float(age or 0.0)
+                                )
                         last_reason=f"stale_response closed={len(closed)} newest_age={age}"
                     else:
                         last_reason="empty_response"
@@ -3050,7 +3083,12 @@ async def refresh_candles(force=False):
         if price is not None:
             live_price_count+=1
         closed=_closed_candles(STATE["candles"].get(p,[]),reference)
-        if len(closed)<60:
+        if (
+            len(closed)<60
+            or not _candle_history_ready(
+                p,reference,min_closed=60,recent_minutes=(15 if FIVE_MINUTE_EXPIRY_MODE else 5)
+            )
+        ):
             if a.get("signal_eligible",True):
                 STATE["analyses"].pop(p,None)
             continue
