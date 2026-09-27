@@ -77,7 +77,7 @@ def main():
     # Keep the latest synthetic M1 candle recent enough for the live
     # Alligator timing gate while providing enough history to contain complete
     # closed 15M blocks.
-    start=int(time.time()//60)*60-(181*60)
+    start=int(time.time()//60)*60-(180*60)
 
     up=analyze_asset({"pair":"TEST_UP","display_name":"TEST_UP"},up_candles(start=start))
     assert up and up["direction"]=="UP"
