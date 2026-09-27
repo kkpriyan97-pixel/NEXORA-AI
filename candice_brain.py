@@ -1164,22 +1164,37 @@ def analyze_otc_asset(
 
     blocks=_complete_15m_blocks(cs,now)
     bias,bias_votes=_otc_15m_bias(blocks)
-    if bias not in {"BULLISH","BEARISH"}:
-        _diag(pair,"otc_15m_bias_rejected",bias=bias,bias_votes=bias_votes,blocks=len(blocks))
-        return None
-
-    direction="UP" if bias=="BULLISH" else "DOWN"
-    setup=_otc_structure_setup(cs,direction)
     cadence_fallback=False
-    if not setup:
-        cadence_setup=_five_minute_cadence_setup(cs,bias,now=now)
+
+    # Prefer the authoritative closed-15M bias. If a cycle has no valid 15M
+    # bias yet, allow the deterministic 5M continuation lane to establish a
+    # directional bias from closed 5M structure/momentum rather than starving
+    # the wall-clock 5-minute signal slot.
+    if bias not in {"BULLISH","BEARISH"}:
+        cadence_setup=_five_minute_cadence_setup(cs,None,now=now)
         if not cadence_setup:
-            _diag(pair,"otc_structure_sequence_rejected",direction=direction)
+            _diag(pair,"otc_15m_bias_rejected",bias=bias,bias_votes=bias_votes,blocks=len(blocks))
             return None
         setup=cadence_setup
         cadence_fallback=True
-        direction=str(setup.get("direction") or direction).upper()
+        direction=str(setup.get("direction") or "").upper()
+        if direction not in {"UP","DOWN"}:
+            _diag(pair,"otc_5m_fallback_invalid_direction",direction=direction)
+            return None
         bias="BULLISH" if direction=="UP" else "BEARISH"
+        bias_votes=0
+    else:
+        direction="UP" if bias=="BULLISH" else "DOWN"
+        setup=_otc_structure_setup(cs,direction)
+        if not setup:
+            cadence_setup=_five_minute_cadence_setup(cs,bias,now=now)
+            if not cadence_setup:
+                _diag(pair,"otc_structure_sequence_rejected",direction=direction)
+                return None
+            setup=cadence_setup
+            cadence_fallback=True
+            direction=str(setup.get("direction") or direction).upper()
+            bias="BULLISH" if direction=="UP" else "BEARISH"
 
     # The strategy itself is structure/candle based. Broker-reported volume is
     # intentionally not used to create the OTC decision. The final scheduler
