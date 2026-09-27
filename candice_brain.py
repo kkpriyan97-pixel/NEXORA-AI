@@ -1205,44 +1205,78 @@ def analyze_otc_asset(
     bias,bias_votes=_otc_15m_bias(blocks)
     cadence_fallback=False
 
-    # Prefer the authoritative closed-15M bias. If a cycle has no valid 15M
-    # bias yet, allow the deterministic 5M continuation lane to establish a
-    # directional bias from closed 5M structure/momentum rather than starving
-    # the wall-clock 5-minute signal slot.
-    if bias not in {"BULLISH","BEARISH"}:
-        if not ALLOW_5M_CADENCE_FALLBACK:
-            _diag(pair,"otc_15m_bias_rejected",bias=bias,bias_votes=bias_votes,blocks=len(blocks),detail="5m_cadence_fallback_disabled")
-            return None
-        cadence_setup=_five_minute_cadence_setup(cs,None,now=now)
-        if not cadence_setup:
-            _diag(pair,"otc_15m_bias_rejected",bias=bias,bias_votes=bias_votes,blocks=len(blocks))
-            return None
-        setup=cadence_setup
-        cadence_fallback=True
-        direction=str(setup.get("direction") or "").upper()
-        if direction not in {"UP","DOWN"}:
-            _diag(pair,"otc_5m_fallback_invalid_direction",direction=direction)
-            return None
-        bias="BULLISH" if direction=="UP" else "BEARISH"
-        bias_votes=0
-    else:
-        direction="UP" if bias=="BULLISH" else "DOWN"
-        setup=_otc_structure_setup(cs,direction)
-        if not setup:
-            if not ALLOW_5M_CADENCE_FALLBACK:
-                _diag(pair,"otc_structure_sequence_rejected",direction=direction,detail="strict_m1_required")
-                return None
+    # In explicit 5M-expiry mode, prefer closed-5M structure first:
+    # 15M provides bias, 5M provides structure/momentum, and the newest
+    # completed M1 candle remains the precise entry timestamp. If the 5M
+    # context is unavailable, fall back to the strict M1 structure detector
+    # so the wall-clock 5-minute scheduler stays continuous.
+    if FIVE_MINUTE_EXPIRY_MODE and ALLOW_5M_CADENCE_FALLBACK:
+        if bias in {"BULLISH","BEARISH"}:
+            direction="UP" if bias=="BULLISH" else "DOWN"
             cadence_setup=_five_minute_cadence_setup(cs,bias,now=now)
+            if cadence_setup:
+                setup=cadence_setup
+                cadence_fallback=True
+                direction=str(setup.get("direction") or direction).upper()
+                derived_bias="BULLISH" if direction=="UP" else "BEARISH"
+                if derived_bias != bias:
+                    _diag(pair,"otc_5m_bias_conflict_rejected",direction=direction,primary_bias=bias)
+                    return None
+            else:
+                setup=_otc_structure_setup(cs,direction)
+                if not setup:
+                    _diag(pair,"otc_structure_sequence_rejected",direction=direction,detail="5m_context_and_m1_setup_unavailable")
+                    return None
+        else:
+            cadence_setup=_five_minute_cadence_setup(cs,None,now=now)
             if not cadence_setup:
-                _diag(pair,"otc_structure_sequence_rejected",direction=direction)
+                _diag(pair,"otc_15m_bias_rejected",bias=bias,bias_votes=bias_votes,blocks=len(blocks),detail="5m_context_unavailable")
                 return None
             setup=cadence_setup
             cadence_fallback=True
-            direction=str(setup.get("direction") or direction).upper()
-            derived_bias="BULLISH" if direction=="UP" else "BEARISH"
-            if derived_bias != bias:
-                _diag(pair,"otc_5m_bias_conflict_rejected",direction=direction,primary_bias=bias)
+            direction=str(setup.get("direction") or "").upper()
+            if direction not in {"UP","DOWN"}:
+                _diag(pair,"otc_5m_fallback_invalid_direction",direction=direction)
                 return None
+            bias="BULLISH" if direction=="UP" else "BEARISH"
+            bias_votes=0
+    else:
+        # Legacy path: authoritative 15M bias -> strict M1 structure, with
+        # optional 5M fallback only when explicitly configured.
+        if bias not in {"BULLISH","BEARISH"}:
+            if not ALLOW_5M_CADENCE_FALLBACK:
+                _diag(pair,"otc_15m_bias_rejected",bias=bias,bias_votes=bias_votes,blocks=len(blocks),detail="5m_cadence_fallback_disabled")
+                return None
+            cadence_setup=_five_minute_cadence_setup(cs,None,now=now)
+            if not cadence_setup:
+                _diag(pair,"otc_15m_bias_rejected",bias=bias,bias_votes=bias_votes,blocks=len(blocks))
+                return None
+            setup=cadence_setup
+            cadence_fallback=True
+            direction=str(setup.get("direction") or "").upper()
+            if direction not in {"UP","DOWN"}:
+                _diag(pair,"otc_5m_fallback_invalid_direction",direction=direction)
+                return None
+            bias="BULLISH" if direction=="UP" else "BEARISH"
+            bias_votes=0
+        else:
+            direction="UP" if bias=="BULLISH" else "DOWN"
+            setup=_otc_structure_setup(cs,direction)
+            if not setup:
+                if not ALLOW_5M_CADENCE_FALLBACK:
+                    _diag(pair,"otc_structure_sequence_rejected",direction=direction,detail="strict_m1_required")
+                    return None
+                cadence_setup=_five_minute_cadence_setup(cs,bias,now=now)
+                if not cadence_setup:
+                    _diag(pair,"otc_structure_sequence_rejected",direction=direction)
+                    return None
+                setup=cadence_setup
+                cadence_fallback=True
+                direction=str(setup.get("direction") or direction).upper()
+                derived_bias="BULLISH" if direction=="UP" else "BEARISH"
+                if derived_bias != bias:
+                    _diag(pair,"otc_5m_bias_conflict_rejected",direction=direction,primary_bias=bias)
+                    return None
 
     # The strategy itself is structure/candle based. Broker-reported volume is
     # intentionally not used to create the OTC decision. The final scheduler
