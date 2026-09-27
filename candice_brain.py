@@ -520,6 +520,7 @@ def _alligator_confirmation(cs,direction):
         }
 
     last_close=float(cs[-1]["close"])
+    previous_close=float(cs[-2]["close"])
     if direction=="UP":
         aligned=(
             lips>teeth+ALLIGATOR_MIN_SEPARATION
@@ -531,6 +532,14 @@ def _alligator_confirmation(cs,direction):
         )
         sloping=slope_votes>=2
         price_position=last_close>=lips
+        # "Breakout" means a NEW closed-M1 close crossing the outer Alligator
+        # line (Lips) from below to above on the direction already chosen by
+        # the technical brain. It is event-only: an older breakout does not
+        # remain eligible for later cycles.
+        breakout=(
+            previous_close<=prev_lips
+            and last_close>lips
+        )
     else:
         aligned=(
             lips<teeth-ALLIGATOR_MIN_SEPARATION
@@ -542,6 +551,10 @@ def _alligator_confirmation(cs,direction):
         )
         sloping=slope_votes>=2
         price_position=last_close<=lips
+        breakout=(
+            previous_close>=prev_lips
+            and last_close<lips
+        )
 
     spread=abs(lips-teeth)+abs(teeth-jaw)
     prev_spread=abs(prev_lips-prev_teeth)+abs(prev_teeth-prev_jaw)
@@ -570,6 +583,12 @@ def _alligator_confirmation(cs,direction):
         "aligned":bool(aligned),
         "sloping":bool(sloping),
         "price_position":bool(price_position),
+        "breakout":bool(breakout),
+        "breakout_confirmed":bool(breakout and aligned and sloping and timing_ok),
+        "breakout_direction":direction if breakout else "",
+        "breakout_candle_ts":int(cs[-1]["time"]) if breakout else 0,
+        "breakout_previous_close":float(previous_close),
+        "breakout_current_close":float(last_close),
         "spread":float(spread),
         "prev_spread":float(prev_spread),
         "spread_ratio":float(spread_ratio),
@@ -917,6 +936,10 @@ def analyze_otc_asset(
 
     last=cs[-1]
     previous=cs[-2]
+    # Alligator is an entry-timing event here only. It never changes the OTC
+    # structure direction; the boundary delivery gate decides whether a NEW
+    # breakout exists on the latest closed M1 candle.
+    alligator=_alligator_confirmation(cs,direction)
     # The structure detector already checked the exact closed-candle continuation
     # in the same bounded recent window. Keep the flag explicit for final gating.
     m1_continuation_ok=bool(setup.get("entry_continuation_confirmed"))
@@ -974,6 +997,28 @@ def analyze_otc_asset(
         "m1_sequence_signature":_m1_sequence_signature(cs,6),
         "market_regime":"OTC_TREND_CONTINUATION_"+direction,
         "decision_time_bucket":_decision_time_bucket(last["time"]),
+        "alligator_confirmed":bool(alligator.get("confirmed")),
+        "alligator_alignment_ready":bool(alligator.get("ready")),
+        "alligator_aligned":bool(alligator.get("aligned")),
+        "alligator_sloping":bool(alligator.get("sloping")),
+        "alligator_price_position":bool(alligator.get("price_position")),
+        "alligator_timing_ok":bool(alligator.get("timing_ok")),
+        "alligator_jaw":alligator.get("jaw"),
+        "alligator_teeth":alligator.get("teeth"),
+        "alligator_lips":alligator.get("lips"),
+        "alligator_prev_jaw":alligator.get("prev_jaw"),
+        "alligator_prev_teeth":alligator.get("prev_teeth"),
+        "alligator_prev_lips":alligator.get("prev_lips"),
+        "alligator_breakout":bool(alligator.get("breakout")),
+        "alligator_breakout_confirmed":bool(alligator.get("breakout_confirmed")),
+        "alligator_breakout_direction":alligator.get("breakout_direction"),
+        "alligator_breakout_candle_ts":alligator.get("breakout_candle_ts"),
+        "alligator_breakout_previous_close":alligator.get("breakout_previous_close"),
+        "alligator_breakout_current_close":alligator.get("breakout_current_close"),
+        "alligator_latest_closed_candle_ts":alligator.get("latest_closed_candle_ts"),
+        "alligator_closed_age_seconds":alligator.get("closed_age_seconds"),
+        "alligator_periods":alligator.get("periods","13/8,8/5,5/3"),
+        "alligator_min_spread_ratio":alligator.get("min_spread_ratio"),
     }
 
     return {
@@ -1369,6 +1414,12 @@ def analyze_asset(
         "alligator_closed_age_seconds":alligator.get("closed_age_seconds"),
         "alligator_timing_max_age_seconds":alligator.get("timing_max_age_seconds"),
         "alligator_min_spread_ratio":alligator.get("min_spread_ratio"),
+        "alligator_breakout":bool(alligator.get("breakout")),
+        "alligator_breakout_confirmed":bool(alligator.get("breakout_confirmed")),
+        "alligator_breakout_direction":alligator.get("breakout_direction"),
+        "alligator_breakout_candle_ts":alligator.get("breakout_candle_ts"),
+        "alligator_breakout_previous_close":alligator.get("breakout_previous_close"),
+        "alligator_breakout_current_close":alligator.get("breakout_current_close"),
         "alligator_bonus":alligator_bonus,
         "bb_period":bb.get("bb_period",18),
         "bb_multiplier":bb.get("bb_multiplier",2.0),
