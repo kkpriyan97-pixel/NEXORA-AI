@@ -857,6 +857,38 @@ class BrainState:
             dict(x.get("indicators") or x.get("indicator_context") or {})
         ),2)
 
+        # Pair + strategy + expiry quality is checked separately from the
+        # broad strategy score. This reduces repeated selection of contexts that
+        # have demonstrated persistent weakness without overfitting tiny samples.
+        chosen_expiry=int(x.get("expiry_minutes") or 0)
+        pair_n=pair_w=pair_l=0.0
+        for (pp,ss,dd,ee),bucket in self.stats.items():
+            if str(pp)==pair and str(ss)==strategy and int(ee)==chosen_expiry:
+                pair_n += float(bucket.get("n",0) or 0.0)
+                pair_w += float(bucket.get("win",0) or 0.0)
+                pair_l += float(bucket.get("loss",0) or 0.0)
+        pair_rate=(pair_w/max(1.0,pair_w+pair_l)) if pair_n>0 else 0.5
+        x["pair_expiry_samples"]=int(pair_n)
+        x["pair_expiry_win_rate"]=round(pair_rate,4)
+        x["pair_expiry_quality_block"]=bool(pair_n>=8.0 and pair_rate<0.45)
+
+        # A weak 2m history for this exact pair/strategy is redirected to 1m.
+        # Strongly supported 2m contexts remain eligible.
+        if chosen_expiry==2 and pair_n>=8.0 and pair_rate<0.50:
+            x["expiry_minutes"]=1
+            x["expiry_selection_basis"]="weak_2m_history_fallback_1m"
+            chosen_expiry=1
+            pair_n=pair_w=pair_l=0.0
+            for (pp,ss,dd,ee),bucket in self.stats.items():
+                if str(pp)==pair and str(ss)==strategy and int(ee)==chosen_expiry:
+                    pair_n += float(bucket.get("n",0) or 0.0)
+                    pair_w += float(bucket.get("win",0) or 0.0)
+                    pair_l += float(bucket.get("loss",0) or 0.0)
+            pair_rate=(pair_w/max(1.0,pair_w+pair_l)) if pair_n>0 else 0.5
+            x["pair_expiry_samples"]=int(pair_n)
+            x["pair_expiry_win_rate"]=round(pair_rate,4)
+            x["pair_expiry_quality_block"]=bool(pair_n>=8.0 and pair_rate<0.45)
+
         # self_strategy_stats is intentionally not double-counted when the
         # router strategy equals the actual candidate strategy. The strategy
         # reliability term above is already the canonical learning signal.
@@ -950,7 +982,15 @@ class BrainState:
 
         # Ranking-only lift retained for compatibility with the existing selector.
         x["meta_rank_score"]=round(
-            float(x.get("confidence") or 0)+float(x.get("meta_rank_bonus") or 0.0),
+            float(x.get("confidence") or 0)+float(x.get("meta_rank_bonus") or 0.0)
+            + (
+                2.0 if float(x.get("pair_expiry_win_rate") or 0.5)>=0.65
+                and int(x.get("pair_expiry_samples") or 0)>=5 else 0.0
+            )
+            - (
+                4.0 if float(x.get("pair_expiry_win_rate") or 0.5)<0.50
+                and int(x.get("pair_expiry_samples") or 0)>=5 else 0.0
+            ),
             3
         )
 
@@ -1076,6 +1116,8 @@ def rank_signal_candidates(candidates):
         if int(x.get("confidence") or 0)<MIN_CONFIDENCE:
             continue
         if str(x.get("direction","")).upper() not in {"UP","DOWN"}:
+            continue
+        if bool(x.get("pair_expiry_quality_block")):
             continue
         # History-AI / learning is observability and ranking only. It must not
         # suppress a technically qualified live setup or break the wall-clock
