@@ -5445,41 +5445,70 @@ async def cycle_loop():
             )
 
         if not account_ready_now():
-            # Keep the wall-clock 3-minute scheduler alive even while the broker
-            # session is temporarily unavailable. We do not manufacture a signal
-            # or analyze stale market data; we simply consume this slot cleanly
-            # and enter the next exact 3-minute window. When auth/feed recovers,
-            # the next cycle automatically resumes the full five-pass analysis.
-            STATE["cycle"]=cycle_id
-            STATE["cycle_scan_status"]={
-                "cycle_id":int(cycle_id),
-                "total_passes":CYCLE_SCAN_COUNT,
-                "completed_pass":0,
-                "scan_offsets_seconds":[int(x) for x in SCAN_OFFSETS],
-                "signal_lead_seconds":int(signal_lead),
-                "signal_epoch":float(signal_at),
-                "target_epoch":float(target),
-                "scans":[],
-                "protocol":"FLEX_MANUAL",
-                "signal_expiry_options":list(SIGNAL_EXPIRY_OPTIONS),
-                "status":"WAITING_FOR_AUTH",
-                "reason":"broker_account_not_ready",
-            }
-            log.warning(
-                "CYCLE_ACCOUNT_NOT_READY_CONTINUE cycle=%s signal_utc=%s "
-                "next_boundary_utc=%s cadence=3m reason=broker_account_not_ready",
-                cycle_id,
-                time.strftime("%H:%M:%S",time.gmtime(signal_at)),
-                time.strftime("%H:%M:%S",time.gmtime(target)),
-            )
-            await asyncio.sleep(max(0.0,signal_at-time.time()))
-            log.warning(
-                "CYCLE_SLOT_COMPLETED cycle=%s outcome=ACCOUNT_NOT_READY "
-                "next_cycle_start_utc=%s",
-                cycle_id,
-                time.strftime("%H:%M:%S",time.gmtime(target)),
-            )
-            continue
+            # Do not discard a still-usable 3-minute window just because a
+            # deployment/restart is briefly waiting for the broker session.
+            # Give authentication/feed recovery until signal_at-20s, then resume
+            # the unfinished scans in catch-up mode. This preserves the exact
+            # wall-clock cadence and never manufactures a signal from stale data.
+            recovery_deadline=max(time.time(),signal_at-20.0)
+            if signal_at-time.time()>=20.0:
+                log.info(
+                    "CYCLE_ACCOUNT_RECOVERY_WAIT cycle=%s recovered=%s completed_pass=%s "
+                    "wait_until_utc=%s signal_in=%.2f",
+                    cycle_id,bool(recovered),int(resume_completed_pass or 0),
+                    time.strftime("%H:%M:%S",time.gmtime(recovery_deadline)),
+                    max(0.0,signal_at-time.time()),
+                )
+                while time.time()<recovery_deadline:
+                    if account_ready_now():
+                        break
+                    await asyncio.sleep(min(1.0,max(0.1,recovery_deadline-time.time())))
+                if account_ready_now():
+                    log.info(
+                        "CYCLE_ACCOUNT_RECOVERY_READY cycle=%s completed_pass=%s "
+                        "signal_in=%.2f resume=%s",
+                        cycle_id,int(resume_completed_pass or 0),
+                        max(0.0,signal_at-time.time()),bool(recovered),
+                    )
+                else:
+                    log.warning(
+                        "CYCLE_ACCOUNT_RECOVERY_TIMEOUT cycle=%s completed_pass=%s "
+                        "signal_utc=%s reason=broker_account_not_ready",
+                        cycle_id,int(resume_completed_pass or 0),
+                        time.strftime("%H:%M:%S",time.gmtime(signal_at)),
+                    )
+
+            if not account_ready_now():
+                STATE["cycle"]=cycle_id
+                STATE["cycle_scan_status"]={
+                    "cycle_id":int(cycle_id),
+                    "total_passes":CYCLE_SCAN_COUNT,
+                    "completed_pass":int(resume_completed_pass or 0),
+                    "scan_offsets_seconds":[int(x) for x in SCAN_OFFSETS],
+                    "signal_lead_seconds":int(signal_lead),
+                    "signal_epoch":float(signal_at),
+                    "target_epoch":float(target),
+                    "scans":[],
+                    "protocol":"FLEX_MANUAL",
+                    "signal_expiry_options":list(SIGNAL_EXPIRY_OPTIONS),
+                    "status":"WAITING_FOR_AUTH",
+                    "reason":"broker_account_not_ready",
+                }
+                log.warning(
+                    "CYCLE_ACCOUNT_NOT_READY_CONTINUE cycle=%s signal_utc=%s "
+                    "next_boundary_utc=%s cadence=3m reason=broker_account_not_ready",
+                    cycle_id,
+                    time.strftime("%H:%M:%S",time.gmtime(signal_at)),
+                    time.strftime("%H:%M:%S",time.gmtime(target)),
+                )
+                await asyncio.sleep(max(0.0,signal_at-time.time()))
+                log.warning(
+                    "CYCLE_SLOT_COMPLETED cycle=%s outcome=ACCOUNT_NOT_READY "
+                    "next_cycle_start_utc=%s",
+                    cycle_id,
+                    time.strftime("%H:%M:%S",time.gmtime(target)),
+                )
+                continue
 
         # Account/feed is now authenticated and has a non-empty account asset
         # universe before Brain state for this cycle is created.
