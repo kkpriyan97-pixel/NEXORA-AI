@@ -47,6 +47,9 @@ class ActiveSignal:
     actual_entry_captured:bool=False
     actual_entry_source:str=""
     telegram_eval_counted:bool=False
+    # Result watching is valid only after Telegram delivery is confirmed.
+    # This prevents a result record from ever existing for an undelivered signal.
+    telegram_delivered:bool=False
     # Keep the signal's pre-entry reference separate from any actual DEMO trade quote.
     signal_reference_price:float|None=None
     broker_trade_id:str=""
