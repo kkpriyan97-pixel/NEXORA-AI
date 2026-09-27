@@ -4805,6 +4805,85 @@ async def cycle_loop():
                         cycle_id,p,expected,high_tick_activity
                     )
         elif strategy_name==OTC_STRATEGY:
+            # The OTC structure gate must use the newest closed M1 structure at the
+            # exact delivery boundary. Pass 5 may have prepared the candidate up to
+            # ~30s earlier; during that interval a new closed candle can establish a
+            # newer BOS/retest/confirmation sequence. Recompute locally (no broker
+            # request, no AI call) and keep the original direction only when the
+            # technical brain still confirms that same direction.
+            ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
+            prepared_entry_candle_ts=candidate.get("entry_candle_ts") or ind.get("otc_entry_candle_ts")
+            boundary_closed=_closed_candles(
+                STATE.get("candles",{}).get(p,[]),time.time()
+            )
+            current_entry_candle_ts=(
+                int(_candle_epoch(boundary_closed[-1]))
+                if boundary_closed and _candle_epoch(boundary_closed[-1]) is not None
+                else 0
+            )
+            try:
+                prepared_entry_candle_ts=int(prepared_entry_candle_ts or 0)
+            except (TypeError,ValueError):
+                prepared_entry_candle_ts=0
+
+            if (
+                current_entry_candle_ts>0
+                and current_entry_candle_ts!=prepared_entry_candle_ts
+            ):
+                try:
+                    boundary_asset=next(
+                        (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
+                        None
+                    )
+                    boundary_analysis=_prepare_volume_candles(p,boundary_closed)
+                    boundary_refreshed=analyze_asset(
+                        boundary_asset or {"pair":p,"display_name":p},
+                        boundary_analysis,
+                        entry,
+                        forced_strategy=OTC_STRATEGY,
+                        require_high_volume=False,
+                    )
+                    refreshed_direction=(
+                        str(boundary_refreshed.get("direction") or "").upper()
+                        if boundary_refreshed else ""
+                    )
+                    refreshed_strategy=(
+                        str(boundary_refreshed.get("strategy") or "").upper()
+                        if boundary_refreshed else ""
+                    )
+                    if (
+                        boundary_refreshed
+                        and refreshed_strategy==OTC_STRATEGY
+                        and refreshed_direction==expected
+                    ):
+                        candidate.update(boundary_refreshed)
+                        ind=dict(
+                            boundary_refreshed.get("indicators")
+                            or boundary_refreshed.get("indicator_context")
+                            or {}
+                        )
+                        candidate["indicators"]=ind
+                        log.info(
+                            "FINAL_OTC_BOUNDARY_RECHECKED cycle=%s pair=%s "
+                            "direction=%s old_entry_candle_ts=%s new_entry_candle_ts=%s "
+                            "new_bos=%s extension_rebaseline=TRUE",
+                            cycle_id,p,expected,prepared_entry_candle_ts,
+                            current_entry_candle_ts,ind.get("otc_bos_level")
+                        )
+                    elif boundary_refreshed and refreshed_strategy==OTC_STRATEGY:
+                        log.info(
+                            "FINAL_OTC_BOUNDARY_RECHECK_REJECTED cycle=%s pair=%s "
+                            "old_direction=%s new_direction=%s reason=technical_brain_direction_changed",
+                            cycle_id,p,expected,refreshed_direction
+                        )
+                        return False
+                except Exception as refresh_error:
+                    log.warning(
+                        "FINAL_OTC_BOUNDARY_RECHECK_FAILED cycle=%s pair=%s "
+                        "type=%s message=%s",
+                        cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
+                    )
+
             ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
             bos_level=float(ind.get("otc_bos_level") or 0.0)
             if bos_level<=0.0:
