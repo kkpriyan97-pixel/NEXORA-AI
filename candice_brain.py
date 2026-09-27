@@ -915,10 +915,12 @@ def _five_minute_cadence_setup(cs,primary_bias=None,now=None):
         else (breakout_down or lower_closes or lower_highs)
     )
     entry_ok=(
-        float(cs[-1]["close"])>=float(cs[-1]["open"])
+        float(last["close"])>=float(last["open"])
         if direction=="UP"
-        else float(cs[-1]["close"])<=float(cs[-1]["open"])
+        else float(last["close"])<=float(last["open"])
     )
+    # The 5M bar is the authoritative entry confirmation for the 5M cadence path.
+    # A single opposite 1M candle must not invalidate an otherwise aligned 5M setup.
     if not (directional_ok and momentum_ok and structure_ok and entry_ok):
         return None
 
@@ -954,7 +956,7 @@ def _five_minute_cadence_setup(cs,primary_bias=None,now=None):
         "five_minute_directional_ok":True,
         "five_minute_structure_ok":True,
         "five_minute_momentum_ok":True,
-        "five_minute_entry_candle_ok":True,
+        "five_minute_entry_candle_ok":bool(entry_ok),
         "five_minute_trend_up":bool(trend_up),
         "five_minute_trend_down":bool(trend_down),
         "five_minute_breakout":bool(breakout_up or breakout_down),
