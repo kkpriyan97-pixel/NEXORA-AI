@@ -5554,6 +5554,9 @@ async def cycle_loop():
             _watch_candidates.append((watch_score,_pair))
         _watch_candidates.sort(key=lambda x:(x[0],x[1]),reverse=True)
         breakout_watch_pairs=[p for _,p in _watch_candidates[:10]]
+        # Per-cycle breakout memory is observability/state only. It never relaxes
+        # strategy gates and never reuses a stale breakout at a later cycle.
+        cycle_breakout_events={}
         log.info(
             "BREAKOUT_WATCHLIST cycle=%s top_n=%d pairs=%s",
             cycle_id,len(breakout_watch_pairs),",".join(breakout_watch_pairs)
@@ -5688,6 +5691,11 @@ async def cycle_loop():
                             )
                             if _event and str(_event.get("direction") or "").upper() in {"UP","DOWN"}:
                                 live_breakout_pairs.append(_pair)
+                                cycle_breakout_events[_pair]={
+                                    "direction":str(_event.get("direction") or "").upper(),
+                                    "breakout_candle_ts":_event.get("breakout_candle_ts"),
+                                    "detected_at":time.time(),
+                                }
                                 log.info(
                                     "BREAKOUT_WATCH_HIT cycle=%s scan=SCAN_%s pair=%s direction=%s candle_ts=%s",
                                     cycle_id,pass_no,_pair,_event.get("direction"),
@@ -6579,8 +6587,8 @@ async def cycle_loop():
                 break
         boundary_pool=list(_top10_by_pair.values())
         log.info(
-            "FINAL_BOUNDARY_POOL cycle=%s candidates=%d top10_assets=%d prepared_confirmed=%d total_deep=%d fresh_now=%d cooldown_excluded=%d",
-            cycle_id,len(boundary_pool),len(_top10_by_pair),
+            "FINAL_BOUNDARY_POOL cycle=%s candidates=%d top10_assets=%d breakout_events=%d prepared_confirmed=%d total_deep=%d fresh_now=%d cooldown_excluded=%d",
+            cycle_id,len(boundary_pool),len(breakout_watch_pairs),len(cycle_breakout_events),
             sum(1 for x in boundary_pool if bool(x.get("final_delivery_confirmed"))),
             len(final_candidates),
             sum(1 for x in boundary_pool if has_fresh_live_price(
@@ -6752,7 +6760,10 @@ async def cycle_loop_supervisor():
                 "CYCLE_LOOP_SUPERVISOR_RESTART type=%s message=%s",
                 type(e).__name__, str(e)[:180]
             )
-        await asyncio.sleep(2.0)
+        # A failed cycle task must not enter a tight restart loop. One
+        # second gives transient broker/async resources time to settle while the
+        # next exact wall-clock cycle remains authoritative.
+        await asyncio.sleep(1.0)
 
 async def audit_outbound_network():
     """
