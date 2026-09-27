@@ -4836,6 +4836,7 @@ async def cycle_loop():
         # Alligator final timing is strategy-specific.
         # REAL strict setups may use the NEW-breakout event when available.
         # The five-minute scheduled fallback only requires current Alligator
+        ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
         # alignment/timing. OTC never requires a NEW Alligator crossing because
         # its authoritative direction is the PRO structure engine.
         signal_mode=str(
