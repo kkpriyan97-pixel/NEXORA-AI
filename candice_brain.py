@@ -1196,7 +1196,7 @@ def analyze_otc_asset(
     # the wall-clock 5-minute signal slot.
     if bias not in {"BULLISH","BEARISH"}:
         if not ALLOW_5M_CADENCE_FALLBACK:
-            _diag(pair,"otc_15m_bias_rejected",bias=bias,bias_votes=bias_votes,blocks=len(blocks),reason="5m_cadence_fallback_disabled")
+            _diag(pair,"otc_15m_bias_rejected",bias=bias,bias_votes=bias_votes,blocks=len(blocks),detail="5m_cadence_fallback_disabled")
             return None
         cadence_setup=_five_minute_cadence_setup(cs,None,now=now)
         if not cadence_setup:
@@ -1215,7 +1215,7 @@ def analyze_otc_asset(
         setup=_otc_structure_setup(cs,direction)
         if not setup:
             if not ALLOW_5M_CADENCE_FALLBACK:
-                _diag(pair,"otc_structure_sequence_rejected",direction=direction,reason="strict_m1_required")
+                _diag(pair,"otc_structure_sequence_rejected",direction=direction,detail="strict_m1_required")
                 return None
             cadence_setup=_five_minute_cadence_setup(cs,bias,now=now)
             if not cadence_setup:
