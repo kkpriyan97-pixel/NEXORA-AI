@@ -41,6 +41,12 @@ ALLIGATOR_TEETH_SHIFT=5
 ALLIGATOR_LIPS_PERIOD=5
 ALLIGATOR_LIPS_SHIFT=3
 ALLIGATOR_MIN_SEPARATION=0.0
+# Timing guard: the Alligator confirmation must still refer to the latest
+# completed M1 candle at delivery and the jaw/teeth/lips spread must not be
+# materially contracting. This is a timing/entry-integrity check, not a
+# direction generator.
+ALLIGATOR_TIMING_MAX_AGE_SECONDS=90.0
+ALLIGATOR_MIN_SPREAD_RATIO=0.98
 log=logging.getLogger("candice.brain")
 _DIAG_LAST={}
 
@@ -537,9 +543,23 @@ def _alligator_confirmation(cs,direction):
         sloping=slope_votes>=2
         price_position=last_close<=lips
 
+    spread=abs(lips-teeth)+abs(teeth-jaw)
+    prev_spread=abs(prev_lips-prev_teeth)+abs(prev_teeth-prev_jaw)
+    spread_ratio=(
+        spread/max(prev_spread,1e-12) if prev_spread>0.0 else 1.0
+    )
+    latest_candle_close_ts=float(cs[-1]["time"])+ONE_MINUTE
+    closed_age=max(0.0,time.time()-latest_candle_close_ts)
+    timing_ok=(
+        closed_age<=ALLIGATOR_TIMING_MAX_AGE_SECONDS
+        and spread_ratio>=ALLIGATOR_MIN_SPREAD_RATIO
+    )
+    confirmed=bool(aligned and sloping and price_position and timing_ok)
+
     return {
         "ready":True,
-        "confirmed":bool(aligned and sloping and price_position),
+        "confirmed":confirmed,
+        "timing_ok":bool(timing_ok),
         "direction":direction,
         "jaw":jaw,
         "teeth":teeth,
@@ -550,8 +570,15 @@ def _alligator_confirmation(cs,direction):
         "aligned":bool(aligned),
         "sloping":bool(sloping),
         "price_position":bool(price_position),
+        "spread":float(spread),
+        "prev_spread":float(prev_spread),
+        "spread_ratio":float(spread_ratio),
+        "latest_closed_candle_ts":int(cs[-1]["time"]),
+        "closed_age_seconds":float(closed_age),
+        "timing_max_age_seconds":ALLIGATOR_TIMING_MAX_AGE_SECONDS,
+        "min_spread_ratio":ALLIGATOR_MIN_SPREAD_RATIO,
         "periods":"13/8,8/5,5/3",
-        "confirmation":"CONFIRMED" if (aligned and sloping and price_position) else "REJECTED",
+        "confirmation":"CONFIRMED" if confirmed else "REJECTED",
     }
 
 
@@ -1334,6 +1361,14 @@ def analyze_asset(
         "alligator_aligned":True,
         "alligator_sloping":True,
         "alligator_price_position":True,
+        "alligator_timing_ok":True,
+        "alligator_spread":alligator.get("spread"),
+        "alligator_prev_spread":alligator.get("prev_spread"),
+        "alligator_spread_ratio":alligator.get("spread_ratio"),
+        "alligator_latest_closed_candle_ts":alligator.get("latest_closed_candle_ts"),
+        "alligator_closed_age_seconds":alligator.get("closed_age_seconds"),
+        "alligator_timing_max_age_seconds":alligator.get("timing_max_age_seconds"),
+        "alligator_min_spread_ratio":alligator.get("min_spread_ratio"),
         "alligator_bonus":alligator_bonus,
         "bb_period":bb.get("bb_period",18),
         "bb_multiplier":bb.get("bb_multiplier",2.0),
@@ -1458,7 +1493,7 @@ def analyze_asset(
             "down_qualified":bool(down),
         }],
         "strategy_audit_count":1,
-        "indicator_audit_scope":"AVWAP_VOLUME_PROFILE_WITH_ALLIGATOR_13_8_8_5_5_3_AND_BB18_2_CONFIRMATION",
+        "indicator_audit_scope":"AVWAP_VOLUME_PROFILE_WITH_ALLIGATOR_13_8_8_5_5_3_TIMED_CLOSED_CANDLE_AND_BB18_2_CONFIRMATION",
         "m1_sequence_signature":features["m1_sequence_signature"],
         "market_regime":features["market_regime"],
         "decision_time_bucket":features["decision_time_bucket"],
