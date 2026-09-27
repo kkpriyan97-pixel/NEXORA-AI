@@ -767,6 +767,211 @@ def _otc_median(values):
     return xs[mid] if n%2 else (xs[mid-1]+xs[mid])/2.0
 
 
+FIVE_MINUTES=300
+
+def _complete_5m_blocks(cs,now=None):
+    """Build exact closed 5-minute bars from complete 1-minute candles only."""
+    now=time.time() if now is None else float(now)
+    groups={}
+    for c in cs:
+        minute=int(c["time"])
+        bucket=(minute//FIVE_MINUTES)*FIVE_MINUTES
+        if bucket+FIVE_MINUTES>now-CLOSE_GRACE_SECONDS:
+            continue
+        groups.setdefault(bucket,[]).append(c)
+
+    out=[]
+    for bucket,bars in sorted(groups.items()):
+        bars=sorted(bars,key=lambda x:x["time"])
+        expected=[bucket+i*ONE_MINUTE for i in range(5)]
+        if [int(x["time"]) for x in bars]!=expected:
+            continue
+        out.append({
+            "time":bucket,
+            "open":bars[0]["open"],
+            "high":max(x["high"] for x in bars),
+            "low":min(x["low"] for x in bars),
+            "close":bars[-1]["close"],
+            "volume":sum(x.get("volume",0.0) for x in bars),
+        })
+    return out
+
+
+def _ema_last_value(values,period):
+    xs=[float(x) for x in values if isfinite(float(x))]
+    if len(xs)<period:
+        return None
+    k=2.0/(period+1.0)
+    ema=sum(xs[:period])/period
+    for x in xs[period:]:
+        ema=(x*k)+(ema*(1.0-k))
+    return ema
+
+
+def _five_minute_cadence_setup(cs,primary_bias=None,now=None):
+    """
+    Deterministic 5M continuation path used only when the stricter 1M
+    BOS/retest detector has no setup. It never uses a forming candle.
+    """
+    now=time.time() if now is None else float(now)
+    blocks=_complete_5m_blocks(cs,now)
+    if len(blocks)<12:
+        return None
+
+    closes=[float(x["close"]) for x in blocks]
+    last=blocks[-1]
+    ema9=_ema_last_value(closes,9)
+    ema21=_ema_last_value(closes,21)
+    if ema9 is None or ema21 is None:
+        return None
+
+    ranges=[_otc_range(x) for x in blocks[-9:-1]]
+    baseline=max(_otc_median(ranges),1e-12)
+    last_range=_otc_range(last)
+    body_ratio=_otc_body_ratio(last)
+
+    momentum_up=float(last["close"])>float(blocks[-4]["close"])
+    momentum_down=float(last["close"])<float(blocks[-4]["close"])
+
+    prior_high=max(float(x["high"]) for x in blocks[-4:-1])
+    prior_low=min(float(x["low"]) for x in blocks[-4:-1])
+    breakout_up=float(last["close"])>prior_high and float(last["close"])>float(last["open"])
+    breakout_down=float(last["close"])<prior_low and float(last["close"])<float(last["open"])
+
+    higher_closes=float(blocks[-1]["close"])>float(blocks[-2]["close"])>=float(blocks[-3]["close"])
+    higher_lows=float(blocks[-1]["low"])>=float(blocks[-2]["low"])>=float(blocks[-3]["low"])
+    lower_closes=float(blocks[-1]["close"])<float(blocks[-2]["close"])<=float(blocks[-3]["close"])
+    lower_highs=float(blocks[-1]["high"])<=float(blocks[-2]["high"])<=float(blocks[-3]["high"])
+
+    trend_up=float(last["close"])>float(ema9)>=float(ema21) and (higher_closes or higher_lows)
+    trend_down=float(last["close"])<float(ema9)<=float(ema21) and (lower_closes or lower_highs)
+
+    retest_up=False
+    retest_down=False
+    if len(blocks)>=7:
+        for i in range(max(4,len(blocks)-5),len(blocks)-1):
+            level_up=max(float(x["high"]) for x in blocks[i-3:i])
+            level_down=min(float(x["low"]) for x in blocks[i-3:i])
+            b=blocks[i]
+            if float(b["close"])>level_up and float(b["close"])>float(b["open"]):
+                if any(
+                    float(r["low"])<=level_up<=float(r["high"])
+                    and float(r["close"])>=level_up
+                    for r in blocks[i+1:]
+                ):
+                    retest_up=True
+            if float(b["close"])<level_down and float(b["close"])<float(b["open"]):
+                if any(
+                    float(r["low"])<=level_down<=float(r["high"])
+                    and float(r["close"])<=level_down
+                    for r in blocks[i+1:]
+                ):
+                    retest_down=True
+
+    fvg_up=any(
+        float(blocks[i]["low"])>float(blocks[i-2]["high"])
+        for i in range(max(2,len(blocks)-4),len(blocks))
+    )
+    fvg_down=any(
+        float(blocks[i]["high"])<float(blocks[i-2]["low"])
+        for i in range(max(2,len(blocks)-4),len(blocks))
+    )
+
+    up_score=0
+    down_score=0
+    if primary_bias=="BULLISH": up_score+=6
+    if primary_bias=="BEARISH": down_score+=6
+    if float(last["close"])>float(ema9): up_score+=5
+    if float(last["close"])<float(ema9): down_score+=5
+    if float(ema9)>float(ema21): up_score+=4
+    if float(ema9)<float(ema21): down_score+=4
+    if momentum_up: up_score+=5
+    if momentum_down: down_score+=5
+    if breakout_up: up_score+=6
+    if breakout_down: down_score+=6
+    if higher_closes or higher_lows: up_score+=3
+    if lower_closes or lower_highs: down_score+=3
+    if body_ratio>=0.45 and float(last["close"])>float(last["open"]): up_score+=2
+    if body_ratio>=0.45 and float(last["close"])<float(last["open"]): down_score+=2
+    if last_range>=baseline*1.05 and float(last["close"])>float(last["open"]): up_score+=2
+    if last_range>=baseline*1.05 and float(last["close"])<float(last["open"]): down_score+=2
+    if retest_up: up_score+=3
+    if retest_down: down_score+=3
+    if fvg_up: up_score+=2
+    if fvg_down: down_score+=2
+
+    if primary_bias=="BULLISH" and up_score>=down_score:
+        direction="UP"
+    elif primary_bias=="BEARISH" and down_score>=up_score:
+        direction="DOWN"
+    else:
+        direction="UP" if up_score>down_score else "DOWN"
+
+    directional_ok=(up_score>down_score) if direction=="UP" else (down_score>up_score)
+    momentum_ok=momentum_up if direction=="UP" else momentum_down
+    structure_ok=(
+        (breakout_up or higher_closes or higher_lows)
+        if direction=="UP"
+        else (breakout_down or lower_closes or lower_highs)
+    )
+    entry_ok=(
+        float(cs[-1]["close"])>=float(cs[-1]["open"])
+        if direction=="UP"
+        else float(cs[-1]["close"])<=float(cs[-1]["open"])
+    )
+    if not (directional_ok and momentum_ok and structure_ok and entry_ok):
+        return None
+
+    evidence_score=78.0
+    evidence_score+=4.0 if primary_bias in {"BULLISH","BEARISH"} else 0.0
+    evidence_score+=4.0 if (breakout_up or breakout_down) else 0.0
+    evidence_score+=3.0 if (trend_up if direction=="UP" else trend_down) else 0.0
+    evidence_score+=3.0 if (retest_up if direction=="UP" else retest_down) else 0.0
+    evidence_score+=2.0 if (fvg_up if direction=="UP" else fvg_down) else 0.0
+    evidence_score+=2.0 if last_range>=baseline*1.05 else 0.0
+    confidence=min(96,max(80,int(round(evidence_score))))
+
+    return {
+        "direction":direction,
+        "bos_level":float(prior_high if direction=="UP" else prior_low),
+        "bos_candle_ts":int(last["time"]),
+        "retest_candle_ts":int(last["time"]),
+        "confirmation_candle_ts":int(last["time"]),
+        "entry_candle_ts":int(cs[-1]["time"]),
+        "bos_range":float(last_range),
+        "baseline_range":float(baseline),
+        "bos_body_ratio":float(body_ratio),
+        "displacement_confirmed":bool(last_range>=baseline*1.05 and body_ratio>=0.35),
+        "retest_confirmed":bool(retest_up if direction=="UP" else retest_down),
+        "hold_confirmed":True,
+        "confirmation_candle_confirmed":True,
+        "entry_continuation_confirmed":True,
+        "sequence":(
+            "5M_BREAKOUT_RETEST_CONTINUATION"
+            if (breakout_up or breakout_down or retest_up or retest_down)
+            else "5M_STRUCTURE_CONTINUATION"
+        ),
+        "five_minute_directional_ok":True,
+        "five_minute_structure_ok":True,
+        "five_minute_momentum_ok":True,
+        "five_minute_entry_candle_ok":True,
+        "five_minute_trend_up":bool(trend_up),
+        "five_minute_trend_down":bool(trend_down),
+        "five_minute_breakout":bool(breakout_up or breakout_down),
+        "five_minute_retest":bool(retest_up or retest_down),
+        "five_minute_fvg":bool(fvg_up if direction=="UP" else fvg_down),
+        "five_minute_ema9":float(ema9),
+        "five_minute_ema21":float(ema21),
+        "five_minute_momentum":float(last["close"]-blocks[-4]["close"]),
+        "five_minute_last_range":float(last_range),
+        "five_minute_baseline_range":float(baseline),
+        "five_minute_score_up":int(up_score),
+        "five_minute_score_down":int(down_score),
+        "five_minute_confidence":int(confidence),
+        "five_minute_primary_bias":str(primary_bias or "NEUTRAL"),
+    }
+
+
 def _otc_15m_bias(blocks):
     """Use only complete closed 15M blocks; never include a forming block."""
     if len(blocks)<3:
@@ -963,9 +1168,16 @@ def analyze_otc_asset(
 
     direction="UP" if bias=="BULLISH" else "DOWN"
     setup=_otc_structure_setup(cs,direction)
+    cadence_fallback=False
     if not setup:
-        _diag(pair,"otc_structure_sequence_rejected",direction=direction)
-        return None
+        cadence_setup=_five_minute_cadence_setup(cs,bias,now=now)
+        if not cadence_setup:
+            _diag(pair,"otc_structure_sequence_rejected",direction=direction)
+            return None
+        setup=cadence_setup
+        cadence_fallback=True
+        direction=str(setup.get("direction") or direction).upper()
+        bias="BULLISH" if direction=="UP" else "BEARISH"
 
     # The strategy itself is structure/candle based. Broker-reported volume is
     # intentionally not used to create the OTC decision. The final scheduler
@@ -1000,13 +1212,16 @@ def analyze_otc_asset(
     exact_live_setup=bool(
         bias in {"BULLISH","BEARISH"}
         and setup["displacement_confirmed"]
-        and setup["retest_confirmed"]
+        and (setup["retest_confirmed"] if not cadence_fallback else setup.get("five_minute_directional_ok"))
         and setup["hold_confirmed"]
         and setup["confirmation_candle_confirmed"]
         and m1_continuation_ok
     )
     if not exact_live_setup:
-        _diag(pair,"otc_exact_setup_rejected",direction=direction,m1_continuation_ok=m1_continuation_ok)
+        _diag(
+            pair,"otc_exact_setup_rejected",direction=direction,
+            m1_continuation_ok=m1_continuation_ok,cadence_fallback=cadence_fallback
+        )
         return None
 
     anchor_ts=int(blocks[-1]["time"])
@@ -1031,6 +1246,23 @@ def analyze_otc_asset(
         "otc_sequence":setup["sequence"],
         "m1_continuation_ok":m1_continuation_ok,
         "exact_live_setup":True,
+        "five_minute_mode":"CADENCE_CONTINUATION_V1" if cadence_fallback else "STRICT_1M_STRUCTURE_V1",
+        "five_minute_cadence_fallback":bool(cadence_fallback),
+        "five_minute_directional_ok":bool(setup.get("five_minute_directional_ok",True)),
+        "five_minute_structure_ok":bool(setup.get("five_minute_structure_ok",True)),
+        "five_minute_momentum_ok":bool(setup.get("five_minute_momentum_ok",True)),
+        "five_minute_entry_candle_ok":bool(setup.get("five_minute_entry_candle_ok",True)),
+        "five_minute_trend_up":bool(setup.get("five_minute_trend_up",False)),
+        "five_minute_trend_down":bool(setup.get("five_minute_trend_down",False)),
+        "five_minute_breakout":bool(setup.get("five_minute_breakout",False)),
+        "five_minute_retest":bool(setup.get("five_minute_retest",False)),
+        "five_minute_fvg":bool(setup.get("five_minute_fvg",False)),
+        "five_minute_ema9":float(setup.get("five_minute_ema9") or 0.0),
+        "five_minute_ema21":float(setup.get("five_minute_ema21") or 0.0),
+        "five_minute_momentum":float(setup.get("five_minute_momentum") or 0.0),
+        "five_minute_score_up":int(setup.get("five_minute_score_up") or 0),
+        "five_minute_score_down":int(setup.get("five_minute_score_down") or 0),
+        "five_minute_primary_bias":str(setup.get("five_minute_primary_bias") or bias),
         "volume_mode":"OTC_OBSERVED_TICK_ACTIVITY_AT_ENTRY",
         "volume_quality":"N/A_STRUCTURE_STRATEGY",
         "real_volume_verified":False,
@@ -1105,8 +1337,8 @@ def analyze_otc_asset(
         "closed_15m_ts":anchor_ts,
         "decision_candle_closed":True,
         "price":float(last["close"]),
-        "five_minute_eligible":False,
-        "self_strategy_version":"OTC_STRUCTURE_V1",
+        "five_minute_eligible":True,
+        "self_strategy_version":"OTC_STRUCTURE_5M_V2" if cadence_fallback else "OTC_STRUCTURE_V1",
         "strategy_candidates":[{
             "strategy":OTC_STRATEGY,
             "direction":direction,
