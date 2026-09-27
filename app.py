@@ -93,9 +93,10 @@ UAE_TZ=ZoneInfo("Asia/Dubai")
 
 SIGNAL_SESSION_START_HOUR=0
 SIGNAL_SESSION_END_HOUR=24
-# Fixed five-pass Candice scan window inside every 3-minute cycle.
+# Five-pass Candice scan window inside every 5-minute signal cycle.
 # Offsets are measured backward from the 1-minute entry/expiry boundary.
-CYCLE_SCAN_OFFSETS=(150.0,120.0,90.0,75.0,60.0)
+# Continuous breakout monitoring runs independently between these passes.
+CYCLE_SCAN_OFFSETS=(270.0,210.0,150.0,90.0,60.0)
 CYCLE_SCAN_COUNT=len(CYCLE_SCAN_OFFSETS)
 # The signal scheduler runs continuously across the full UAE day. It does NOT enable broker auto-trading.
 # Production signal expiry is selected by the Brain from these two options.
@@ -108,7 +109,7 @@ OTC_MAX_BOS_EXTENSION_RANGES=max(1.5,min(5.0,float(os.getenv("OTC_MAX_BOS_EXTENS
 ASSET_TRADEABILITY_CACHE_TTL=45.0
 ASSET_TRADEABILITY_HARD_MAX_AGE=50.0
 # Final tick preparation is only an optimization for boundary delivery. It must
-# never be allowed to block the 3-minute scheduler when broker event-12 probes stall.
+# never be allowed to block the 5-minute scheduler when broker event-12 probes stall.
 FINAL_TICK_PREP_TIMEOUT=7.0
 ASSET_TRADEABILITY_CACHE={}
 
@@ -3446,7 +3447,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     # closed-candle structure, live quote checks, duplicate guards, or the final
     # delivery gates. When the broker provides no usable volume field for any asset,
     # the existing candidate path is preserved so volume-data scarcity cannot stop
-    # the 3-minute scheduler.
+    # the 5-minute scheduler.
     volume_priority_top_n=max(1,min(10,int(os.getenv("VOLUME_PRIORITY_TOP_N","10") or 10)))
 
     def _volume_priority_key(candidate):
@@ -4455,8 +4456,100 @@ async def result_watch(key):
     )
 
 
+CONTINUOUS_BREAKOUT_INTERVAL=20.0
+CONTINUOUS_BREAKOUT_CANDLE_COUNT=120
+CONTINUOUS_BREAKOUT_EVENT_TTL=120.0
+
+async def continuous_breakout_monitor():
+    """Continuously watch every signal-eligible asset for NEW closed-M1 Alligator breakouts.
+
+    This worker is independent from the 5-minute delivery cycle. It refreshes the
+    closed-candle dataset on a rolling 20-second cadence, records only the newest
+    breakout event, and never sends Telegram directly. The 5-minute scheduler
+    consumes these fresh events and still applies the full Brain+AI+final gates.
+    """
+    while True:
+        started=time.time()
+        scanned=0
+        hits=0
+        try:
+            client=CLIENT
+            connected=bool(client and getattr(getattr(client,"connection",None),"is_connected",False))
+            assets=[a for a in (STATE.get("assets") or []) if a.get("signal_eligible",True)]
+            if not connected or not assets:
+                log.info("CONTINUOUS_BREAKOUT_MONITOR_READY connected=%s assets=%d next_in=%.1fs",connected,len(assets),CONTINUOUS_BREAKOUT_INTERVAL)
+            else:
+                now=time.time()
+                events=STATE.setdefault("continuous_breakout_events",{})
+                for _pair,_event in list(events.items()):
+                    try:
+                        _age=now-(float(_event.get("breakout_candle_ts"))+60.0)
+                    except (TypeError,ValueError,AttributeError):
+                        _age=9999.0
+                    if _age>CONTINUOUS_BREAKOUT_EVENT_TTL:
+                        events.pop(_pair,None)
+
+                async def _scan_asset(asset):
+                    nonlocal scanned,hits
+                    p=str(asset.get("pair") or "")
+                    if not p:
+                        return
+                    try:
+                        async with CANDLE_FETCH_SEM:
+                            raw=await asyncio.wait_for(
+                                client.market.get_candles(p,size=60,count=CONTINUOUS_BREAKOUT_CANDLE_COUNT),
+                                timeout=3.0,
+                            )
+                        normalized=[]
+                        if isinstance(raw,list):
+                            for item in raw:
+                                if isinstance(item,dict) and isinstance(item.get("candles"),list):
+                                    normalized.extend(x for x in item["candles"] if isinstance(x,dict))
+                                elif isinstance(item,dict) and any(k in item for k in ("open","o","high","h","low","l","close","c")):
+                                    normalized.append(item)
+                        closed=_closed_candles(normalized,time.time())
+                        if len(closed)<60:
+                            return
+                        try:
+                            closed.sort(key=lambda x: float(_candle_epoch(x) or 0))
+                        except Exception:
+                            pass
+                        newest_ts=_candle_epoch(closed[-1])
+                        newest_age=(time.time()-(float(newest_ts)+60.0)) if newest_ts is not None else 9999.0
+                        if 0.0<=newest_age<=75.0:
+                            STATE.setdefault("candles",{})[p]=normalized
+                            CANDLE_FETCH_LAST[p]=time.time()
+                        analysis=_prepare_volume_candles(p,closed)
+                        event=detect_alligator_breakout(analysis,time.time())
+                        scanned+=1
+                        if event and str(event.get("direction") or "").upper() in {"UP","DOWN"}:
+                            direction=str(event.get("direction") or "").upper()
+                            candle_ts=event.get("breakout_candle_ts")
+                            try:
+                                identity=(p,int(float(candle_ts)),direction)
+                            except (TypeError,ValueError):
+                                return
+                            old=events.get(p) or {}
+                            if old.get("identity")!=identity:
+                                events[p]={"pair":p,"direction":direction,"breakout_candle_ts":int(float(candle_ts)),"detected_at":time.time(),"identity":identity,"source":"continuous_closed_m1"}
+                                hits+=1
+                                log.info("CONTINUOUS_BREAKOUT_HIT pair=%s direction=%s candle_ts=%s age=%.2f source=closed_m1",p,direction,candle_ts,max(0.0,time.time()-(float(candle_ts)+60.0)))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        log.debug("CONTINUOUS_BREAKOUT_SCAN_FAILED pair=%s type=%s message=%s",p,type(e).__name__,str(e)[:120])
+
+                await asyncio.gather(*(_scan_asset(a) for a in assets),return_exceptions=True)
+                log.info("CONTINUOUS_BREAKOUT_SCAN scanned=%d hits=%d active_events=%d duration=%.2fs interval=%.1fs",scanned,hits,len(events),time.time()-started,CONTINUOUS_BREAKOUT_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("CONTINUOUS_BREAKOUT_MONITOR_ERROR type=%s message=%s",type(e).__name__,str(e)[:180])
+        await asyncio.sleep(max(1.0,CONTINUOUS_BREAKOUT_INTERVAL-(time.time()-started)))
+
+
 async def cycle_loop():
-    # Fast 3-minute signal scheduler, active 24/7.
+    # 5-minute signal scheduler, active 24/7.
     # For each cycle:
     #   - cycle_start = T - 180s
     #   - Telegram signal = cycle_start + 150s (2m30s after Candice cycle start)
@@ -4468,9 +4561,9 @@ async def cycle_loop():
     #     the scheduler, so one completed signal cannot stop the next cycle.
     # The Brain/AI strategy itself is unchanged; only the scheduling cadence
     # and the requested expiry are changed for DEMO analysis.
-    # Day signal session: every 3 minutes. Signal is fixed at +2m30s from
-    # cycle start; the 1-minute DEMO entry/expiry boundary is +3m00s.
-    SIGNAL_INTERVAL=180.0
+    # Day signal session: every 5 minutes. Signal is fixed at target-30s;
+    # the 1-minute DEMO entry/expiry boundary is the exact 5-minute target.
+    SIGNAL_INTERVAL=300.0
     SIGNAL_LEADS=(30.0,30.0)
     SCAN_OFFSETS=CYCLE_SCAN_OFFSETS
 
@@ -5496,7 +5589,7 @@ async def cycle_loop():
                 }
                 log.warning(
                     "CYCLE_ACCOUNT_NOT_READY_CONTINUE cycle=%s signal_utc=%s "
-                    "next_boundary_utc=%s cadence=3m reason=broker_account_not_ready",
+                    "next_boundary_utc=%s cadence=5m reason=broker_account_not_ready",
                     cycle_id,
                     time.strftime("%H:%M:%S",time.gmtime(signal_at)),
                     time.strftime("%H:%M:%S",time.gmtime(target)),
@@ -5549,7 +5642,7 @@ async def cycle_loop():
         catchup_mode=False
         catchup_next_at=None
 
-        # Breakout-first watchlist. The 3-minute scheduler remains authoritative,
+        # Breakout-first watchlist. The 5-minute scheduler remains authoritative,
         # but the actual Top-10 is refreshed at every scan pass. This prevents a
         # pair that becomes one of the best ten during the cycle from being missed
         # just because it was outside the ranking at cycle start.
@@ -5705,10 +5798,21 @@ async def cycle_loop():
                 # Refresh the Top-10 immediately before each lightweight breakout
                 # probe so the watch set reflects the latest learned/ranking data.
                 breakout_watch_pairs=refresh_breakout_watchlist()
+                _continuous_events=STATE.get("continuous_breakout_events") or {}
+                _continuous_pairs=[]
+                _continuous_now=time.time()
+                for _cp,_ce in list(_continuous_events.items()):
+                    try:
+                        _ce_age=_continuous_now-(float(_ce.get("breakout_candle_ts"))+60.0)
+                    except (TypeError,ValueError,AttributeError):
+                        _ce_age=9999.0
+                    if 0.0<=_ce_age<=90.0:
+                        _continuous_pairs.append(_cp)
+                breakout_probe_pairs=list(dict.fromkeys(_continuous_pairs+breakout_watch_pairs))
                 log.info(
-                    "BREAKOUT_WATCH_REFRESH cycle=%s scan=SCAN_%s top_n=%d pairs=%s",
+                    "BREAKOUT_WATCH_REFRESH cycle=%s scan=SCAN_%s top_n=%d pairs=%s continuous_pairs=%s",
                     cycle_id,pass_no,len(breakout_watch_pairs),
-                    ",".join(breakout_watch_pairs)
+                    ",".join(breakout_watch_pairs),",".join(_continuous_pairs)
                 )
                 if pass_no==5:
                     # PASS_5 is the final current-state breakout opportunity. It
@@ -5718,7 +5822,7 @@ async def cycle_loop():
                     # strategy + AI verification for that breakout pair instead of
                     # reusing a stale candidate pool.
                     live_breakout_pairs=[]
-                    for _pair in breakout_watch_pairs:
+                    for _pair in breakout_probe_pairs:
                         try:
                             _event=detect_alligator_breakout(
                                 _prepare_volume_candles(
@@ -5779,9 +5883,9 @@ async def cycle_loop():
                 else:
                     # Probe only the current Top-10 watchlist for a NEW
                     # closed-M1 Alligator breakout. This probe is local and cheap;
-                    # it never changes the 180s scheduler cadence.
+                    # it never changes the 300s scheduler cadence.
                     live_breakout_pairs=[]
-                    for _pair in breakout_watch_pairs:
+                    for _pair in breakout_probe_pairs:
                         try:
                             _event=detect_alligator_breakout(
                                 _prepare_volume_candles(
@@ -8192,6 +8296,7 @@ async def main():
         market_worker(),
         account_tick_subscription_worker(),
         account_live_feed_worker(),
+        continuous_breakout_monitor(),
         cycle_loop_supervisor(),
         ai_review_worker(),
         world_learning_loop(),
