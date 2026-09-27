@@ -1204,6 +1204,7 @@ LIVE_CANDLE_BRIDGE_MIN_OBSERVED_SECONDS=max(
 LIVE_CANDLE_BRIDGE_LAST_PROMOTE={}
 LIVE_CANDLE_PAGE_LAST_NEWEST={}
 LIVE_CANDLE_PAGE_META_LOG_AT={}
+LIVE_QUOTE_MAX_BROKER_AGE=75.0
 
 def _merge_authenticated_live_candle_page(pair,candles,reference_ts=None):
     """Use the broker's live event-10 page as fresh closed-candle history when it is current."""
@@ -1954,6 +1955,20 @@ async def refresh_broker_live_quote(pair):
                 broker_ts/=1000.0
         except Exception:
             broker_ts=now
+
+        broker_age=max(0.0,now-float(broker_ts))
+        if broker_age>LIVE_QUOTE_MAX_BROKER_AGE:
+            # A response received now is not necessarily current market data.
+            # The broker endpoint can return an old candle page; never relabel
+            # that payload as a fresh signal quote.
+            log.warning(
+                "BROKER_LIVE_QUOTE_STALE_CONTENT pair=%s broker_age=%.1f "
+                "max_age=%.1f broker_ts=%s source=authenticated_event10",
+                pair,broker_age,LIVE_QUOTE_MAX_BROKER_AGE,
+                int(broker_ts)
+            )
+            return False
+
         STATE["prices"][pair]=(price,broker_ts,now)
         STATE["price_source"][pair]="authenticated_broker_live_candle"
         return True
@@ -3256,9 +3271,16 @@ async def refresh_candles(force=False):
 def has_fresh_live_price(pair,reference_ts=None,max_age=LIVE_TICK_MAX_AGE):
     rec=STATE["prices"].get(pair)
     if not rec or len(rec)<1 or rec[0] is None:return False
+    source=str(STATE.get("price_source",{}).get(pair) or "").lower()
+    ref=time.time() if reference_ts is None else float(reference_ts)
+    if "authenticated_broker_live_candle" in source:
+        try:
+            broker_ts=float(rec[1])
+            return 0 <= (ref-broker_ts) <= LIVE_QUOTE_MAX_BROKER_AGE
+        except (TypeError,ValueError,IndexError):
+            return False
     received=tick_received_at(pair)
     if received is None:return False
-    ref=time.time() if reference_ts is None else float(reference_ts)
     try:age=ref-received
     except Exception:return False
     return 0 <= age <= float(max_age)
