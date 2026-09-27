@@ -1272,25 +1272,34 @@ def analyze_otc_asset(
             _diag(pair,"otc_5m_setup_stale",age_seconds=age,max_age=FIVE_MINUTE_MAX_SETUP_AGE_SECONDS)
             return None
     else:
-        # OTC 1/2-minute expiry is extremely sensitive to structural age.
-        # A live candidate must be confirmed by the newest completed M1 candle;
-        # older confirmation/entry candles are never recycled into a new cycle.
+        # OTC 1/2-minute expiry is sensitive to structural age, but the
+        # sequence naturally spans multiple closed M1 candles. The entry
+        # candle MUST be the newest completed M1 candle; supporting BOS,
+        # retest, and confirmation evidence may be older, but only inside
+        # bounded recent windows. This preserves fresh entry timing without
+        # resurrecting an old entry candle into a new cycle.
         bos_age=max(0.0,float(latest_closed_ts)-float(setup.get("bos_candle_ts") or latest_closed_ts))
         retest_age=max(0.0,float(latest_closed_ts)-float(setup.get("retest_candle_ts") or latest_closed_ts))
         confirmation_ts=int(setup.get("confirmation_candle_ts") or 0)
         entry_ts=int(setup.get("entry_candle_ts") or 0)
+        confirmation_age=max(
+            0.0,
+            float(latest_closed_ts)-float(confirmation_ts or latest_closed_ts),
+        )
         latest_close_age=max(0.0,time.time()-(float(latest_closed_ts)+ONE_MINUTE))
         if (
             latest_close_age > 75.0
-            or confirmation_ts != latest_closed_ts
             or entry_ts != latest_closed_ts
-            or bos_age > 4*ONE_MINUTE
-            or retest_age > 3*ONE_MINUTE
+            or confirmation_ts <= 0
+            or confirmation_age > 3*ONE_MINUTE
+            or bos_age > 5*ONE_MINUTE
+            or retest_age > 4*ONE_MINUTE
         ):
             _diag(
                 pair,"otc_m1_structure_stale",
                 bos_age_seconds=bos_age,
                 retest_age_seconds=retest_age,
+                confirmation_age_seconds=confirmation_age,
                 confirmation_is_latest=confirmation_ts==latest_closed_ts,
                 entry_is_latest=entry_ts==latest_closed_ts,
                 latest_close_age_seconds=latest_close_age,
