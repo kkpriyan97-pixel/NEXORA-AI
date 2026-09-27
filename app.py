@@ -3870,7 +3870,48 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
             except Exception as e:
                 log.warning("AI_PRE_SIGNAL_VERIFY_FAILED pair=%s local_direction=%s type=%s message=%s",
                             x["pair"],x.get("direction"),type(e).__name__,str(e)[:120])
-                AI_REVIEW_CACHE[cache_key]=(time.time(),None)
+                # Provider outage/timeout must not freeze a 5-minute cycle.
+                # For an already-qualified OTC 5M setup, use a zero-network
+                # deterministic local verifier as a bounded safety fallback.
+                # This does NOT invent or change direction; it only verifies the
+                # locked Brain's same-candle structure while external AI recovers.
+                local_direction_fallback=str(x.get("direction") or "").upper()
+                local_confidence_fallback=int(x.get("confidence") or 0)
+                fallback_ind=dict(x.get("indicators") or x.get("indicator_context") or {})
+                fallback_mode=str(fallback_ind.get("five_minute_mode") or "").upper()
+                fallback_entry_ts=x.get("entry_candle_ts")
+                fallback_latest_ts=(closed[-1].get("time") if closed else None)
+                fallback_ok=(
+                    FIVE_MINUTE_EXPIRY_MODE
+                    and str(x.get("strategy") or "").upper()==OTC_STRATEGY
+                    and local_direction_fallback in {"UP","DOWN"}
+                    and local_confidence_fallback>=90
+                    and fallback_mode=="CADENCE_CONTINUATION_V1"
+                    and fallback_entry_ts==fallback_latest_ts
+                    and fallback_ind.get("five_minute_directional_ok") is True
+                    and fallback_ind.get("five_minute_structure_ok") is True
+                    and fallback_ind.get("five_minute_momentum_ok") is True
+                    and fallback_ind.get("five_minute_entry_candle_ok") is True
+                    and str(fallback_ind.get("five_minute_primary_bias") or "").upper()==(
+                        "BULLISH" if local_direction_fallback=="UP" else "BEARISH"
+                    )
+                )
+                if fallback_ok:
+                    d={
+                        "direction":local_direction_fallback,
+                        "confidence":max(75,local_confidence_fallback),
+                        "reason":"Local zero-network 5M structure verifier; external AI unavailable",
+                        "provider":"CANDICE_LOCAL_5M_FAILSAFE",
+                    }
+                    log.info(
+                        "AI_PRE_SIGNAL_VERIFY_LOCAL_FAILSAFE pair=%s direction=%s "
+                        "confidence=%s entry_candle_ts=%s reason=external_ai_timeout",
+                        x["pair"],local_direction_fallback,local_confidence_fallback,
+                        fallback_entry_ts
+                    )
+                else:
+                    d=None
+                AI_REVIEW_CACHE[cache_key]=(time.time(),d)
 
         local_confidence=int(x.get("confidence") or 0)
         local=x.copy()
@@ -3882,6 +3923,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
             "ai_verified_direction":"",
             "ai_verified_confidence":0,
             "ai_verified_entry_candle_ts":None,
+            "ai_verification_mode":"NONE",
         })
 
         # Final lightweight setup-strength guard. This is intentionally scoped
@@ -4067,6 +4109,10 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                 local["ai_verified_direction"]=ai_direction
                 local["ai_verified_confidence"]=ai_confidence
                 local["ai_verified_entry_candle_ts"]=x.get("entry_candle_ts")
+                local["ai_verification_mode"]=(
+                    "LOCAL_FAILSAFE" if str(d.get("provider") or "").upper()=="CANDICE_LOCAL_5M_FAILSAFE"
+                    else "EXTERNAL_AI"
+                )
             else:
                 log.info(
                     "AI_PRE_SIGNAL_VERIFY pair=%s local_direction=%s local_confidence=%s verdict=LOCAL_FALLBACK",
