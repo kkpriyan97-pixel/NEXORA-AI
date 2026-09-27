@@ -4618,13 +4618,74 @@ async def cycle_loop():
                 cycle_id,p,closure_reason
             )
             return False
-        if not broker_tradeability_fresh(p,time.time()):
+        # A missing/stale tradeability probe is not itself evidence that an
+        # authenticated account asset is closed. At the exact delivery boundary,
+        # refresh the probe once (bounded) and block only on an explicit CLOSED
+        # state or an explicit broker/account-unavailable flag. This prevents a
+        # stale 45/50s probe cache from suppressing an otherwise fully-qualified
+        # signal while preserving the broker-closure safety gate.
+        boundary_asset=next(
+            (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
+            None
+        )
+        boundary_unavailable=broker_unavailable_reason(boundary_asset) if boundary_asset else ""
+        if boundary_unavailable:
             log.info(
-                "SIGNAL_DELIVERY_BLOCKED_BROKER_NOT_TRADABLE cycle=%s pair=%s "
-                "reason=missing_stale_or_negative_probe next_asset=TRUE",
+                "SIGNAL_DELIVERY_BLOCKED_BROKER_CLOSED cycle=%s pair=%s "
+                "reason=account_asset_%s",
+                cycle_id,p,boundary_unavailable
+            )
+            return False
+
+        tradeability_rec=ASSET_TRADEABILITY_CACHE.get(p) or {}
+        tradeability_state=str(tradeability_rec.get("state") or "UNKNOWN").upper()
+        if tradeability_state=="CLOSED":
+            log.info(
+                "SIGNAL_DELIVERY_BLOCKED_BROKER_CLOSED cycle=%s pair=%s "
+                "reason=cached_explicit_closed",
                 cycle_id,p
             )
             return False
+
+        if not broker_tradeability_fresh(p,time.time()):
+            refreshed_tradeable=True
+            try:
+                refreshed_tradeable=await asyncio.wait_for(
+                    check_broker_asset_tradeability(
+                        p,cycle_id=cycle_id,force=True
+                    ),
+                    timeout=1.8,
+                )
+            except Exception as tradeability_error:
+                log.info(
+                    "BROKER_TRADEABILITY_BOUNDARY_REFRESH_FAILED cycle=%s pair=%s "
+                    "type=%s message=%s action=allow_unless_explicit_closed",
+                    cycle_id,p,type(tradeability_error).__name__,
+                    str(tradeability_error)[:120]
+                )
+                refreshed_tradeable=True
+
+            tradeability_rec=ASSET_TRADEABILITY_CACHE.get(p) or {}
+            tradeability_state=str(
+                tradeability_rec.get("state") or "UNKNOWN"
+            ).upper()
+
+            if tradeability_state=="CLOSED" or refreshed_tradeable is False:
+                log.info(
+                    "SIGNAL_DELIVERY_BLOCKED_BROKER_NOT_TRADABLE cycle=%s pair=%s "
+                    "reason=explicit_broker_closed_after_boundary_probe",
+                    cycle_id,p
+                )
+                return False
+
+            log.info(
+                "BROKER_TRADEABILITY_BOUNDARY_ALLOW cycle=%s pair=%s "
+                "state=%s fresh=%s source=%s reason=stale_or_missing_probe_is_not_close",
+                cycle_id,p,tradeability_state,
+                broker_tradeability_fresh(p,time.time()),
+                tradeability_rec.get("source") or "unavailable"
+            )
+
         now=time.time()
 
         # Delivery boundary must be zero-network and bounded. Pass 5 is
