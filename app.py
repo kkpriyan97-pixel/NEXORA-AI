@@ -6635,10 +6635,118 @@ async def cycle_loop():
             ))
             if catchup_mode and pass_no<5:
                 catchup_next_at=target-SCAN_OFFSETS[pass_no]
+        # The continuous watcher can discover a NEW breakout after SCAN_5 has
+        # already completed (for example at T-25s). Poll the event store during
+        # the remaining pre-signal window so that a late breakout is analyzed and
+        # can still enter the exact 30-second delivery boundary. This does not
+        # move the 5-minute clock or weaken the final Alligator/strategy gates.
+        _late_event_seen=set()
+        _late_sweep_end=max(time.time(),signal_at)
+        while time.time() < _late_sweep_end:
+            _late_now=time.time()
+            _late_events=STATE.get("continuous_breakout_events") or {}
+            _late_pairs=[]
+            for _lp,_le in list(_late_events.items()):
+                try:
+                    _late_ts=float(_le.get("breakout_candle_ts"))
+                    _late_age=_late_now-(_late_ts+60.0)
+                except (TypeError,ValueError,AttributeError):
+                    _late_age=9999.0
+                _late_dir=str(_le.get("direction") or "").upper()
+                _late_identity=(_lp,int(_late_ts),_late_dir) if _late_ts else (_lp,0,_late_dir)
+                if 0.0<=_late_age<=90.0 and _late_identity not in _late_event_seen:
+                    _late_event_seen.add(_late_identity)
+                    _late_pairs.append(_lp)
+            for _late_pair in _late_pairs[:ACCOUNT_TICK_FINAL_PROBE_LIMIT]:
+                if max(0.0,signal_at-time.time()) < 4.0:
+                    break
+                try:
+                    _late_ranked=await asyncio.wait_for(
+                        final_candidate(
+                            require_live_price=False,
+                            deep_analysis=True,
+                            use_cached_only=False,
+                            return_ranked=True,
+                            focus_pairs=[_late_pair],
+                        ),
+                        timeout=max(1.0,min(5.0,signal_at-time.time()-1.0))
+                    )
+                    _late_list=_late_ranked if isinstance(_late_ranked,list) else (
+                        [_late_ranked] if isinstance(_late_ranked,dict) else []
+                    )
+                    _late_reference=time.time()
+                    for _late_candidate in _late_list[:ACCOUNT_TICK_FINAL_PROBE_LIMIT]:
+                        if not isinstance(_late_candidate,dict) or not _late_candidate.get("pair"):
+                            continue
+                        _late_item=normalize_live_expiry(_late_candidate)
+                        _late_item["expiry_minutes"]=int(_late_item.get("expiry_minutes") or 1)
+                        if _late_item["expiry_minutes"] not in SIGNAL_EXPIRY_OPTIONS:
+                            _late_item["expiry_minutes"]=1
+                        _late_item["qualified_pass"]=5
+                        _late_item["deep_verified"]=True
+                        _late_item["final_prepared_pass"]=5
+                        _late_item["final_delivery_prepared_at"]=_late_reference
+                        _late_item["final_delivery_confirmed"]=True
+                        _late_item["final_delivery_confirmation_reason"]="continuous_breakout_late_boundary"
+                        _late_item["final_delivery_diagnostic"]={
+                            "source":"continuous_breakout_event_store",
+                            "breakout_event_age_seconds":round(
+                                max(0.0,time.time()-(float(
+                                    (_late_events.get(str(_late_item.get("pair"))) or {}).get("breakout_candle_ts") or 0
+                                )+60.0)),3
+                            ),
+                        }
+                        _late_item["final_delivery_precheck"]=_final_delivery_precheck(
+                            _late_item,_late_reference
+                        )
+                        # Refresh the broker tradeability state now so the exact
+                        # send boundary does not reject a newly discovered asset merely
+                        # because its 45/50-second cache was never warmed this cycle.
+                        try:
+                            await asyncio.wait_for(
+                                check_broker_asset_tradeability(
+                                    str(_late_item.get("pair")),cycle_id=cycle_id,force=True
+                                ),
+                                timeout=2.0,
+                            )
+                        except Exception as _late_probe_error:
+                            log.info(
+                                "LATE_BREAKOUT_TRADEABILITY_PROBE_SKIPPED cycle=%s pair=%s type=%s",
+                                cycle_id,_late_item.get("pair"),type(_late_probe_error).__name__
+                            )
+                        _late_key=(
+                            _late_item.get("pair"),
+                            str(_late_item.get("entry_candle_ts")),
+                            str(_late_item.get("direction") or "").upper(),
+                            str(_late_item.get("strategy") or "").upper(),
+                            str(_late_item.get("self_strategy_version") or "")
+                        )
+                        candidate_pool[_late_key]=_late_item
+                        log.info(
+                            "LATE_CONTINUOUS_BREAKOUT_CANDIDATE_READY cycle=%s pair=%s direction=%s "
+                            "strategy=%s confidence=%s seconds_to_signal=%.2f",
+                            cycle_id,_late_item.get("pair"),_late_item.get("direction"),
+                            _late_item.get("strategy"),_late_item.get("confidence"),
+                            max(0.0,signal_at-time.time())
+                        )
+                except asyncio.TimeoutError:
+                    log.info(
+                        "LATE_CONTINUOUS_BREAKOUT_ANALYSIS_TIMEOUT cycle=%s pair=%s seconds_to_signal=%.2f",
+                        cycle_id,_late_pair,max(0.0,signal_at-time.time())
+                    )
+                except Exception as _late_error:
+                    log.info(
+                        "LATE_CONTINUOUS_BREAKOUT_ANALYSIS_FAILED cycle=%s pair=%s type=%s message=%s",
+                        cycle_id,_late_pair,type(_late_error).__name__,str(_late_error)[:120]
+                    )
+            _remaining_late=max(0.0,signal_at-time.time())
+            if _remaining_late<=0.0:
+                break
+            await asyncio.sleep(min(1.0,_remaining_late))
+
         # Final delivery prefers pass 5, but a pass-4 candidate that completed
         # the same deep Brain+AI review and tick preparation is an explicit safe
         # fallback. Earlier passes remain selection input only.
-        await asyncio.sleep(max(0,signal_at-time.time()))
         sent=False
 
         final_candidates=[
@@ -6707,9 +6815,10 @@ async def cycle_loop():
             _boundary_unique.append(_x)
         boundary_pool=_boundary_unique
 
-        # Entry timing is event-driven, but the scheduler remains a strict
-        # 3-minute wall-clock cycle. Keep only the best 10 unique assets for
-        # the boundary decision; each is checked for a NEW Alligator breakout.
+        # Entry timing is event-driven, while delivery remains on the strict
+        # 5-minute wall-clock cycle. Keep only the best 10 unique assets for
+        # the boundary decision; continuous events are already injected when
+        # discovered during the final pre-signal sweep.
         _top10_by_pair={}
         for _x in sorted(
             boundary_pool,
@@ -6730,9 +6839,12 @@ async def cycle_loop():
             if len(_top10_by_pair)>=10:
                 break
         boundary_pool=list(_top10_by_pair.values())
+        _all_boundary_breakout_events=set(cycle_breakout_events)
+        for _ep in (STATE.get("continuous_breakout_events") or {}):
+            _all_boundary_breakout_events.add(str(_ep))
         log.info(
             "FINAL_BOUNDARY_POOL cycle=%s candidates=%d top10_assets=%d breakout_events=%d prepared_confirmed=%d total_deep=%d fresh_now=%d cooldown_excluded=%d",
-            cycle_id,len(boundary_pool),len(breakout_watch_pairs),len(cycle_breakout_events),
+            cycle_id,len(boundary_pool),len(breakout_watch_pairs),len(_all_boundary_breakout_events),
             sum(1 for x in boundary_pool if bool(x.get("final_delivery_confirmed"))),
             len(final_candidates),
             sum(1 for x in boundary_pool if has_fresh_live_price(
