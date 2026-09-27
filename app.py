@@ -731,6 +731,7 @@ def _result_watch_payload(s):
         "indicator_context":dict(s.indicator_context or {}),
         "actual_entry_captured":bool(getattr(s,"actual_entry_captured",False)),
         "actual_entry_source":str(getattr(s,"actual_entry_source","") or ""),
+        "telegram_delivered":bool(getattr(s,"telegram_delivered",False)),
         "signal_reference_price":getattr(s,"signal_reference_price",None),
         "broker_trade_id":str(getattr(s,"broker_trade_id","") or ""),
         "broker_trade_open_ts":getattr(s,"broker_trade_open_ts",None),
@@ -922,6 +923,7 @@ async def restore_pending_result_watches():
                         indicator_context=dict(record.get("indicator_context") or {}),
                         actual_entry_captured=bool(record.get("actual_entry_captured",False)),
                         actual_entry_source=str(record.get("actual_entry_source") or ""),
+                        telegram_delivered=bool(record.get("telegram_delivered",False)),
                         signal_reference_price=(float(record.get("signal_reference_price")) if record.get("signal_reference_price") is not None else None),
                         broker_trade_id=str(record.get("broker_trade_id") or ""),
                         broker_trade_open_ts=(float(record.get("broker_trade_open_ts")) if record.get("broker_trade_open_ts") is not None else None),
@@ -4845,11 +4847,14 @@ async def cycle_loop():
             )
             return False
 
+        # Result tracking is downstream of confirmed Telegram delivery.
+        # This prevents an undelivered signal from ever producing a later result.
+        s.telegram_delivered=True
         signal_lag_seconds=time.time()-ts
         log.info(
-            "TELEGRAM_SIGNAL_DELIVERY cycle=%s pair=%s sent=True latency_ms=%.1f "
+            "TELEGRAM_SIGNAL_DELIVERY cycle=%s pair=%s sent=True expiry=%s latency_ms=%.1f "
             "signal_lag_seconds=%.3f entry_in_seconds=%.3f",
-            cycle_id,p,delivery_latency_ms,signal_lag_seconds,
+            cycle_id,p,s.expiry_minutes,delivery_latency_ms,signal_lag_seconds,
             max(0.0,target-time.time())
         )
         log.info(
@@ -4864,6 +4869,16 @@ async def cycle_loop():
             datetime.fromtimestamp(ts,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
             datetime.fromtimestamp(target,tz=timezone.utc).strftime("%H:%M:%S.%f")[:-3],
             target-time.time()
+        )
+        if not bool(getattr(s,"telegram_delivered",False)):
+            log.error(
+                "RESULT_WATCH_NOT_STARTED cycle=%s pair=%s expiry=%s reason=telegram_delivery_not_confirmed",
+                cycle_id,p,s.expiry_minutes
+            )
+            return True
+        log.info(
+            "RESULT_WATCH_LINKED_TO_DELIVERED_SIGNAL cycle=%s pair=%s expiry=%s key=%s",
+            cycle_id,p,s.expiry_minutes,key
         )
         asyncio.create_task(persist_result_watch_background(key,s))
         start_result_watch(key)
