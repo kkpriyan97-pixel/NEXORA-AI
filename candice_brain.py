@@ -1393,7 +1393,11 @@ def analyze_otc_asset(
         "otc_sequence":setup["sequence"],
         "m1_continuation_ok":m1_continuation_ok,
         "exact_live_setup":True,
-        "five_minute_mode":"CADENCE_CONTINUATION_V1" if cadence_fallback else "STRICT_1M_STRUCTURE_V1",
+        "five_minute_mode":(
+            "CADENCE_CONTINUATION_V1" if cadence_fallback
+            else "M1_STRUCTURE_5M_EXPIRY_FALLBACK_V1" if FIVE_MINUTE_EXPIRY_MODE
+            else "STRICT_1M_STRUCTURE_V1"
+        ),
         "five_minute_cadence_fallback":bool(cadence_fallback),
         "five_minute_directional_ok":bool(setup.get("five_minute_directional_ok",True)),
         "five_minute_structure_ok":bool(setup.get("five_minute_structure_ok",True)),
@@ -1477,11 +1481,13 @@ def analyze_otc_asset(
         "direction_agreement":1.0,
         "value_area_acceptance":True,
         "reason":(
-            f"OTC {bias} 15M; M1 BOS level={setup['bos_level']:.8f}; "
+            f"OTC {bias} 15M; "
+            f"{'5M' if cadence_fallback else 'M1'} structure={setup['sequence']}; "
             f"displacement={setup['displacement_confirmed']}; "
             f"retest={setup['retest_confirmed']}; hold={setup['hold_confirmed']}; "
             f"confirmation={setup['confirmation_candle_confirmed']}; "
             f"M1_continuation={m1_continuation_ok}; "
+            f"expiry={'5M' if FIVE_MINUTE_EXPIRY_MODE else '1/2M'}; "
             f"entry activity=observed Event-1 tick gate."
         ),
         "indicator_features":features,
@@ -1492,7 +1498,11 @@ def analyze_otc_asset(
         "decision_candle_closed":True,
         "price":float(last["close"]),
         "five_minute_eligible":True,
-        "self_strategy_version":"OTC_STRUCTURE_5M_V2" if cadence_fallback else "OTC_STRUCTURE_V1",
+        "self_strategy_version":(
+            "OTC_STRUCTURE_5M_V2" if cadence_fallback
+            else "OTC_STRUCTURE_5M_M1_FALLBACK_V1" if FIVE_MINUTE_EXPIRY_MODE
+            else "OTC_STRUCTURE_V1"
+        ),
         "strategy_candidates":[{
             "strategy":OTC_STRATEGY,
             "direction":direction,
@@ -1508,7 +1518,11 @@ def analyze_otc_asset(
             "down_qualified":direction=="DOWN",
         }],
         "strategy_audit_count":1,
-        "indicator_audit_scope":"OTC_15M_BIAS_1M_BOS_DISPLACEMENT_RETEST_HOLD_CONFIRMATION",
+        "indicator_audit_scope":(
+            "OTC_15M_BIAS_5M_BOS_DISPLACEMENT_RETEST_HOLD_1M_CONFIRMATION"
+            if cadence_fallback and FIVE_MINUTE_EXPIRY_MODE
+            else "OTC_15M_BIAS_1M_BOS_DISPLACEMENT_RETEST_HOLD_CONFIRMATION"
+        ),
         "m1_sequence_signature":features["m1_sequence_signature"],
         "market_regime":features["market_regime"],
         "decision_time_bucket":features["decision_time_bucket"],
