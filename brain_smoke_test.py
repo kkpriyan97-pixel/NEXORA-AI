@@ -8,10 +8,15 @@ def up_candles(n=120, start=1_000_000):
     out=[]
     for i in range(n):
         t=start+i*60
-        base=100+(i-99)*0.45 if i>=100 else 100+(i%5)*0.01
+        # Long, clean bullish regime so AVWAP/VP + Alligator confirmation
+        # remains deterministic across time-aligned 15M blocks.
+        base=100+(i-59)*0.12 if i>=60 else 100+(i%5)*0.01
         o=base
         c=o+0.08
-        out.append({"time":t,"open":o,"high":c+0.03,"low":o-0.03,"close":c,"volume":100})
+        out.append({
+            "time":t,"open":o,"high":c+0.01,"low":o-0.01,
+            "close":c,"volume":100
+        })
     return out
 
 
@@ -19,10 +24,13 @@ def down_candles(n=120, start=1_000_000):
     out=[]
     for i in range(n):
         t=start+i*60
-        base=110-(i-99)*0.45 if i>=100 else 110+(i%5)*0.01
+        base=110-(i-59)*0.12 if i>=60 else 110+(i%5)*0.01
         o=base
         c=o-0.08
-        out.append({"time":t,"open":o,"high":o+0.03,"low":c-0.03,"close":c,"volume":100})
+        out.append({
+            "time":t,"open":o,"high":o+0.01,"low":c-0.01,
+            "close":c,"volume":100
+        })
     return out
 
 
