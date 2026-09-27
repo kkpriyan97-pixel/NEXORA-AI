@@ -1830,8 +1830,21 @@ async def refresh_broker_live_quote(pair):
         now=time.time()
         price=float(q["price"])
         broker_candle=q.get("candle") or {}
-        _record_live_candle_snapshot(pair,broker_candle,now)
+        live_page=q.get("candles") or []
+        live_recorded=0
+        if isinstance(live_page,list):
+            for raw_candle in live_page:
+                if _record_live_candle_snapshot(pair,raw_candle,now):
+                    live_recorded+=1
+        if live_recorded==0:
+            _record_live_candle_snapshot(pair,broker_candle,now)
         broker_ts=broker_candle.get("time",broker_candle.get("t"))
+        if live_recorded>1:
+            _promote_live_closed_candles(pair,now)
+            log.info(
+                "LIVE_CANDLE_PAGE_BRIDGE pair=%s candles=%d",
+                pair,live_recorded
+            )
         try:
             broker_ts=float(broker_ts)
             if broker_ts>10000000000:
