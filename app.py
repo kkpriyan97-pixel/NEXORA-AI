@@ -5551,7 +5551,7 @@ async def cycle_loop():
                 + learned_rate*100.0*0.45
                 + min(100.0,float(recent_ticks))*0.20
             )
-            _watch_candidates.append((_watch_score,_pair))
+            _watch_candidates.append((watch_score,_pair))
         _watch_candidates.sort(key=lambda x:(x[0],x[1]),reverse=True)
         breakout_watch_pairs=[p for _,p in _watch_candidates[:10]]
         log.info(
