@@ -1235,7 +1235,10 @@ QUOTE_SNAPSHOT_SEM=asyncio.Semaphore(48)
 QUOTE_SNAPSHOT_LAST={}
 AI_REVIEW_CACHE={}
 AI_REVIEW_TTL=90.0
-AI_REVIEW_FAIL_TTL=90.0
+# Retry a failed external-AI verification quickly inside the same 5-minute
+# cycle. The verifier is time-boxed and runs in the pre-signal passes, so this
+# never extends the wall-clock signal boundary.
+AI_REVIEW_FAIL_TTL=12.0
 # A zero-volume Volume Profile is an equal-activity price-distribution proxy,
 # not verified real volume. Proxy live signals remain clearly marked and are
 # admitted only after strict Brain setup gates; external AI is a verifier, not
@@ -3872,7 +3875,11 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         local.update({
             "confidence":local_confidence,
             "reason":x.get("reason") or "Candice local Brain verified closed-candle evidence",
-            "ai_provider":"CANDICE_LOCAL_BRAIN_PRIMARY"
+            "ai_provider":"CANDICE_LOCAL_BRAIN_PRIMARY",
+            "ai_verified":False,
+            "ai_verified_direction":"",
+            "ai_verified_confidence":0,
+            "ai_verified_entry_candle_ts":None,
         })
 
         # Final lightweight setup-strength guard. This is intentionally scoped
@@ -3904,6 +3911,33 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         strategy_name=str(x.get("strategy") or "").upper()
         trend_name=str(x.get("trend_15m") or "").upper()
         evidence=x.get("evidence") or {}
+
+        # OTC short-expiry signals require a real external-AI verification at
+        # the same candidate/candle. AI may veto the Brain, but it may never
+        # replace or rewrite the Brain direction. Provider failure simply removes
+        # this candidate; the 5-minute scheduler continues with other candidates
+        # and never waits past its existing bounded verifier timeout.
+        if strategy_name==OTC_STRATEGY and deep_analysis:
+            ai_direction=str(d.get("direction") or "").upper() if isinstance(d,dict) else ""
+            try:
+                ai_confidence=max(0,min(100,int(float(d.get("confidence") or 0)))) if isinstance(d,dict) else 0
+            except (TypeError,ValueError):
+                ai_confidence=0
+            local_direction=str(x.get("direction") or "").upper()
+            if (
+                ai_direction not in {"UP","DOWN"}
+                or ai_direction!=local_direction
+                or ai_confidence<75
+            ):
+                log.info(
+                    "OTC_AI_HARD_GATE_REJECTED pair=%s local_direction=%s ai_direction=%s "
+                    "local_confidence=%s ai_confidence=%s provider=%s reason=same_candle_brain_ai_agreement_required",
+                    x.get("pair"),local_direction,ai_direction,
+                    local_confidence,ai_confidence,
+                    d.get("provider") if isinstance(d,dict) else "UNAVAILABLE"
+                )
+                CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
+                return None
 
         # Strict proxy-volume fallback for brokers that expose zero candle volume.
         # Preliminary scans may carry the candidate, but a proxy-volume setup is
@@ -4027,6 +4061,10 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                 # Never let the external model inflate or rewrite the Brain's
                 # technical confidence; it is only a verifier here.
                 local["ai_provider"]=d.get("provider")
+                local["ai_verified"]=True
+                local["ai_verified_direction"]=ai_direction
+                local["ai_verified_confidence"]=ai_confidence
+                local["ai_verified_entry_candle_ts"]=x.get("entry_candle_ts")
             else:
                 log.info(
                     "AI_PRE_SIGNAL_VERIFY pair=%s local_direction=%s local_confidence=%s verdict=LOCAL_FALLBACK",
@@ -4553,7 +4591,7 @@ async def result_watch(key):
         f"📈 15M Bias → <b>{trend_label}</b>\n"
         f"🕯️ {structure_tf} Structure → <b>{structure_label}</b>\n"
         f"📐 Engine → <b>{engine_label}</b>\n"
-        f"🎯 Confidence → <b>{rec['confidence']}%</b>\n"
+        f"🎯 Technical Score → <b>{rec['confidence']}/100</b>\n"
         f"🔎 Verification → <b>{verification_label}</b>\n\n"
         "🟣 <b>DEMO • MANUAL ENTRY</b>\n"
         "🤖 <b>CANDICE BRAIN • LIVE</b>"
@@ -4884,7 +4922,10 @@ async def cycle_loop():
         # multi-timeframe/volume/body delivery gates to this strategy.
         # Fresh authenticated price + closed-candle decision + confidence remain
         # mandatory.
-        if not prepared_ok and str(candidate.get("strategy") or "").upper() not in {ALLOWED_STRATEGY,OTC_STRATEGY}:
+        # A candidate that failed the exact pass-5 closed-candle preparation
+        # is never resurrected by the boundary cache. This closes the stale-setup
+        # path that previously allowed an older OTC structure to reach Telegram.
+        if not prepared_ok:
             log.info(
                 "FINAL_DELIVERY_CONFIRMATION_REJECTED cycle=%s pair=%s strategy=%s reason=%s diagnostic=%s next_asset=TRUE",
                 cycle_id,p,str(candidate.get("strategy") or ""),
@@ -8398,7 +8439,7 @@ def format_candice_signal_message(s, indicator_check, ts, target):
         f"🎯 <b>𝗘𝗡𝗧𝗥𝗬</b>\n"
         f"<b>{entry_time} UAE</b>\n\n"
         f"💰 Reference → <code>{s.entry_price}</code>\n"
-        f"⚡ Confidence → <b>{s.confidence}%</b>\n\n"
+        f"⚡ Technical Score → <b>{s.confidence}/100</b>\n\n"
         f"📈 15M Bias → <b>{trend_label}</b>\n"
         f"🕯️ {structure_tf} Structure → <b>{structure_label}</b>\n"
         f"🧠 Engine → <b>{engine_label}</b>\n"
