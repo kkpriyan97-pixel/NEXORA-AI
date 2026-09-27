@@ -3035,8 +3035,17 @@ async def refresh_candles(force=False):
     reference=time.time()
     analyzed_count=0
     live_price_count=0
+    bridge_promoted=0
     for a in assets:
         p=a["pair"]
+        if FIVE_MINUTE_EXPIRY_MODE:
+            try:
+                bridge_promoted += _promote_live_closed_candles(p,reference)
+            except Exception as e:
+                log.debug(
+                    "LIVE_CANDLE_BRIDGE_PROMOTE_FAILED pair=%s type=%s message=%s",
+                    p,type(e).__name__,str(e)[:120]
+                )
         price=STATE["prices"].get(p,(None,None))[0]
         if price is not None:
             live_price_count+=1
@@ -3082,6 +3091,12 @@ async def refresh_candles(force=False):
         sum(1 for a in assets if a.get("signal_eligible",True)),
         len(due),stale_count,len(STATE["analyses"])
     )
+    if FIVE_MINUTE_EXPIRY_MODE:
+        log.info(
+            "LIVE_CANDLE_BRIDGE_AUDIT promoted=%d active_pairs=%d",
+            bridge_promoted,
+            sum(1 for p in STATE.get("candles",{}) if LIVE_CANDLE_BRIDGE.get(p))
+        )
 
 
 def has_fresh_live_price(pair,reference_ts=None,max_age=LIVE_TICK_MAX_AGE):
