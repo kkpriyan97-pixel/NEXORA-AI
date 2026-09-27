@@ -4513,15 +4513,25 @@ async def result_watch(key):
     trend=str(rec.get("trend_15m") or "").upper()
     trend_label="BULLISH" if "BULL" in trend else "BEARISH" if "BEAR" in trend else "—"
     structure=str(rec.get("structure_1m") or "").upper()
+    indicator_ctx=dict(rec.get("indicator_context") or {})
     is_otc=str(rec.get("strategy") or "").upper()==OTC_STRATEGY
-    structure_label=(
-        "BOS → DISPLACEMENT → RETEST → HOLD → CONFIRM"
-        if is_otc
-        else "ABOVE AVWAP + POC" if "ABOVE_AVWAP_POC" in structure
-        else "BELOW AVWAP + POC" if "BELOW_AVWAP_POC" in structure
-        else "—"
-    )
-    engine_label="PRO OTC STRUCTURE CONTINUATION" if is_otc else "AVWAP + VOLUME PROFILE"
+    is_5m_otc=is_otc and str(indicator_ctx.get("five_minute_mode") or "").upper()=="CADENCE_CONTINUATION_V1"
+    if is_5m_otc:
+        structure_label="BOS → DISPLACEMENT → RETEST → HOLD → CONFIRM"
+        structure_tf="5M"
+        engine_label="PRO OTC STRUCTURE CONTINUATION • 5M"
+    elif is_otc:
+        structure_label="BOS → DISPLACEMENT → RETEST → HOLD → CONFIRM"
+        structure_tf="1M"
+        engine_label="PRO OTC STRUCTURE CONTINUATION"
+    else:
+        structure_tf="1M"
+        structure_label=(
+            "ABOVE AVWAP + POC" if "ABOVE_AVWAP_POC" in structure
+            else "BELOW AVWAP + POC" if "BELOW_AVWAP_POC" in structure
+            else "—"
+        )
+        engine_label="AVWAP + VOLUME PROFILE"
     verification_label=(
         "BROKER EVENT 26 • ACTUAL DEMO TRADE" if rec.get("result_source")=="broker_event26"
         else "candle-closed • signal market outcome"
@@ -4541,7 +4551,7 @@ async def result_watch(key):
         f"{result_icon} <b>{rec['result']}</b>\n"
         "\n"
         f"📈 15M Bias → <b>{trend_label}</b>\n"
-        f"🕯️ 1M Structure → <b>{structure_label}</b>\n"
+        f"🕯️ {structure_tf} Structure → <b>{structure_label}</b>\n"
         f"📐 Engine → <b>{engine_label}</b>\n"
         f"🎯 Confidence → <b>{rec['confidence']}%</b>\n"
         f"🔎 Verification → <b>{verification_label}</b>\n\n"
@@ -5414,6 +5424,48 @@ async def cycle_loop():
                         )
     
                 ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
+                expected_bias="BULLISH" if expected=="UP" else "BEARISH"
+                if str(ind.get("otc_market_bias") or "").upper() != expected_bias:
+                    log.info(
+                        "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s reason=15m_bias_direction_conflict bias=%s expected_bias=%s next_asset=TRUE",
+                        cycle_id,p,expected,ind.get("otc_market_bias"),expected_bias
+                    )
+                    return False
+                if str(ind.get("five_minute_mode") or "").upper()=="CADENCE_CONTINUATION_V1":
+                    five_bias=str(ind.get("five_minute_primary_bias") or "").upper()
+                    if five_bias != expected_bias or five_bias != str(ind.get("otc_market_bias") or "").upper():
+                        log.info(
+                            "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s reason=5m_15m_bias_conflict five_bias=%s otc_bias=%s next_asset=TRUE",
+                            cycle_id,p,expected,five_bias,ind.get("otc_market_bias")
+                        )
+                        return False
+                    five_age=float(ind.get("five_minute_setup_age_seconds") or 9999.0)
+                    if five_age > 120.0:
+                        log.info(
+                            "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s reason=5m_setup_stale age_seconds=%.2f max_age=120 next_asset=TRUE",
+                            cycle_id,p,expected,five_age
+                        )
+                        return False
+                else:
+                    latest_closed_ts=max(
+                        int(_candle_epoch(x) or 0) for x in _closed_candles(
+                            STATE.get("candles",{}).get(p,[]),time.time()
+                        )[-5:]
+                    ) if STATE.get("candles",{}).get(p) else 0
+                    bos_ts=int(ind.get("otc_bos_candle_ts") or 0)
+                    conf_ts=int(ind.get("otc_confirmation_candle_ts") or 0)
+                    if latest_closed_ts and (
+                        latest_closed_ts-bos_ts > 5*60
+                        or latest_closed_ts-conf_ts > 4*60
+                    ):
+                        log.info(
+                            "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s reason=m1_structure_stale bos_age=%s confirmation_age=%s next_asset=TRUE",
+                            cycle_id,p,expected,
+                            latest_closed_ts-bos_ts if bos_ts else 9999,
+                            latest_closed_ts-conf_ts if conf_ts else 9999
+                        )
+                        return False
+
                 bos_level=float(ind.get("otc_bos_level") or 0.0)
                 if bos_level<=0.0:
                     log.info(
@@ -8309,10 +8361,20 @@ def format_candice_signal_message(s, indicator_check, ts, target):
     )
     structure=str(s.structure_1m or "").upper()
     is_otc=str(s.strategy or "").upper()==OTC_STRATEGY
-    if is_otc:
+    indicator_ctx=dict(getattr(s,"indicator_context",{}) or {})
+    is_5m_otc=is_otc and str(indicator_ctx.get("five_minute_mode") or "").upper()=="CADENCE_CONTINUATION_V1"
+    if is_5m_otc:
         structure_label="BOS → DISPLACEMENT → RETEST → HOLD → CONFIRM"
+        structure_tf="5M"
+        engine_label="PRO OTC STRUCTURE CONTINUATION • 5M"
+        confluence_label="15M + 5M BIAS ALIGNED"
+    elif is_otc:
+        structure_label="BOS → DISPLACEMENT → RETEST → HOLD → CONFIRM"
+        structure_tf="1M"
         engine_label="PRO OTC STRUCTURE CONTINUATION"
         confluence_label="15M BIAS + 1M STRUCTURE CONFIRMED"
+    else:
+        structure_tf="1M"
     else:
         structure_label=(
             "ABOVE AVWAP + POC" if "ABOVE_AVWAP_POC" in structure
@@ -8339,7 +8401,7 @@ def format_candice_signal_message(s, indicator_check, ts, target):
         f"💰 Reference → <code>{s.entry_price}</code>\n"
         f"⚡ Confidence → <b>{s.confidence}%</b>\n\n"
         f"📈 15M Bias → <b>{trend_label}</b>\n"
-        f"🕯️ 1M Structure → <b>{structure_label}</b>\n"
+        f"🕯️ {structure_tf} Structure → <b>{structure_label}</b>\n"
         f"🧠 Engine → <b>{engine_label}</b>\n"
         f"✓ Confluence → <b>{confluence_label}</b>\n\n"
         "🟣 <b>DEMO • MANUAL ENTRY</b>\n"
