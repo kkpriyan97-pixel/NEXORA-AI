@@ -3686,7 +3686,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
     # refresh_candles() already evaluates the full authenticated account asset set.
     # When deep_analysis is enabled, review every currently Brain-qualified setup
     # so one failed candidate can fall through to the next valid asset.
-    # Preliminary passes remain intentionally narrow to protect the 3-minute timing window.
+    # Preliminary passes remain intentionally narrow to protect the 5-minute timing window.
     review_scope_n=min(
         len(raw),
         max(
@@ -3841,7 +3841,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                 else:
                     # The external verifier is a confirmation layer, not a scheduler
                     # dependency. Provider outage/quota exhaustion must not erase every
-                    # otherwise-qualified local setup from the 3-minute cycle. Fall back
+                    # otherwise-qualified local setup from the 5-minute cycle. Fall back
                     # only when the locked Brain setup remains exceptionally strong and
                     # all exact AVWAP/VP gates have already passed.
                     ind_fallback=dict(x.get("indicators") or x.get("indicator_context") or {})
@@ -4803,7 +4803,7 @@ async def cycle_loop():
             )
             if not alligator_breakout_ok or breakout_age<0.0 or breakout_age>90.0:
                 # Recompute the same deterministic brain on the latest closed M1
-                # candles. This is local-only and does not alter the 3-minute
+                # candles. This is local-only and does not alter the 5-minute
                 # scheduler timing.
                 try:
                     boundary_asset=next(
@@ -4912,7 +4912,7 @@ async def cycle_loop():
             # Re-validate the Alligator timing at the actual Telegram boundary.
             # The terminal parameters are 13/8, 8/5 and 5/3. This is a local
             # closed-candle integrity check; it does not create another scheduler
-            # or timer, so the 3-minute wall-clock cadence remains unchanged.
+            # or timer, so the 5-minute wall-clock cadence remains unchanged.
             if ind.get("alligator_timing_ok") is not True:
                 log.info(
                     "FINAL_LIVE_ALLIGATOR_TIMING_REJECTED cycle=%s pair=%s direction=%s "
@@ -5318,7 +5318,7 @@ async def cycle_loop():
             return False
 
         try:
-            # The 3-minute value is the cycle interval only. The Brain chooses
+            # The 5-minute value is the cycle interval only. The Brain chooses
             # the individual signal expiry from the locked 1m/2m production options.
             try:
                 candidate=normalize_live_expiry(candidate)
@@ -5585,7 +5585,7 @@ async def cycle_loop():
         # Root-cause guard: cycle analysis must never start with an empty or
         # unauthenticated account snapshot. A restart immediately before the
         # signal boundary cannot complete five passes safely, so skip that
-        # boundary and preserve the next full 3-minute cycle window.
+        # boundary and preserve the next full 5-minute cycle window.
         signal_in=max(0.0,signal_at-time.time())
         log.info(
             "CYCLE_ACCOUNT_READY_GUARD cycle=%s account_ready=%s assets=%d "
@@ -5615,7 +5615,7 @@ async def cycle_loop():
             )
 
         if not account_ready_now():
-            # Do not discard a still-usable 3-minute window just because a
+            # Do not discard a still-usable 5-minute window just because a
             # deployment/restart is briefly waiting for the broker session.
             # Give authentication/feed recovery until signal_at-20s, then resume
             # the unfinished scans in catch-up mode. This preserves the exact
@@ -5704,7 +5704,7 @@ async def cycle_loop():
         ))
 
         log.info(
-            "CYCLE_WINDOW_START cycle=%s sequence=%s interval=%ss cycle_start_offset=0s signal_offset=150s signal_lead=%ss "
+            "CYCLE_WINDOW_START cycle=%s sequence=%s interval=%ss cycle_start_offset=0s signal_offset=%ss signal_lead=%ss "
             "signal_utc=%s target_utc=%s analysis_passes=5 frames=5s,1m..15m",
             cycle_id,cycle_sequence,int(SIGNAL_INTERVAL),int(signal_lead),
             time.strftime("%H:%M:%S",time.gmtime(signal_at)),
@@ -6716,7 +6716,7 @@ async def cycle_loop():
         # already completed (for example at T-25s). Poll the event store during
         # the remaining pre-signal window so that a late breakout is analyzed and
         # can still enter the exact 30-second delivery boundary. This does not
-        # move the 3-minute clock or weaken the final Alligator/strategy gates.
+        # move the 5-minute clock or weaken the final Alligator/strategy gates.
         _late_event_seen=set()
         _late_sweep_end=max(time.time(),signal_at)
         while time.time() < _late_sweep_end:
@@ -6893,7 +6893,7 @@ async def cycle_loop():
         boundary_pool=_boundary_unique
 
         # Entry timing is event-driven, while delivery remains on the strict
-        # 3-minute wall-clock cycle. Keep only the best 10 unique assets for
+        # 5-minute wall-clock cycle. Keep only the best 10 unique assets for
         # the boundary decision; continuous events are already injected when
         # discovered during the final pre-signal sweep.
         _top10_by_pair={}
