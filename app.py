@@ -4557,7 +4557,7 @@ async def continuous_breakout_monitor():
 
 
 async def cycle_loop():
-    # 5-minute signal scheduler, active 24/7.
+    # 5-minute signal scheduler, active 24/7. Each available slot uses the best validated candidate and a cadence-safe 5M fallback when strict 1M setup data is unavailable.
     # For each cycle:
     #   - cycle_start = T - 300s
     #   - Telegram signal = cycle_start + 270s (4m30s after Candice cycle start)
@@ -5115,168 +5115,287 @@ async def cycle_loop():
                         cycle_id,p,expected,high_tick_activity
                     )
         elif strategy_name==OTC_STRATEGY:
-            # The OTC structure gate must use the newest closed M1 structure at the
-            # exact delivery boundary. Pass 5 may have prepared the candidate up to
-            # ~30s earlier; during that interval a new closed candle can establish a
-            # newer BOS/retest/confirmation sequence. Recompute locally (no broker
-            # request, no AI call) and keep the original direction only when the
-            # technical brain still confirms that same direction.
             ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
-            prepared_entry_candle_ts=candidate.get("entry_candle_ts") or ind.get("otc_entry_candle_ts")
-            boundary_closed=_closed_candles(
-                STATE.get("candles",{}).get(p,[]),time.time()
-            )
-            current_entry_candle_ts=(
-                int(_candle_epoch(boundary_closed[-1]))
-                if boundary_closed and _candle_epoch(boundary_closed[-1]) is not None
-                else 0
-            )
-            try:
-                prepared_entry_candle_ts=int(prepared_entry_candle_ts or 0)
-            except (TypeError,ValueError):
-                prepared_entry_candle_ts=0
+            five_minute_mode=str(ind.get("five_minute_mode") or "").upper()
 
-            if (
-                current_entry_candle_ts>0
-                and current_entry_candle_ts!=prepared_entry_candle_ts
-            ):
+            if five_minute_mode=="CADENCE_CONTINUATION_V1":
+                # 5M cadence path: the strict 1M sequence remains preferred,
+                # but it can no longer starve the 5-minute wall-clock slot.
+                required_flags=(
+                    "otc_strategy",
+                    "five_minute_directional_ok",
+                    "five_minute_structure_ok",
+                    "five_minute_momentum_ok",
+                    "five_minute_entry_candle_ok",
+                )
+                if any(ind.get(flag) is not True for flag in required_flags):
+                    log.info(
+                        "FINAL_5M_CADENCE_REJECTED cycle=%s pair=%s direction=%s reason=5m_flags_missing",
+                        cycle_id,p,expected
+                    )
+                    return False
+
+                boundary_closed=_closed_candles(
+                    STATE.get("candles",{}).get(p,[]),time.time()
+                )
+                current_closed_ts=(
+                    int(_candle_epoch(boundary_closed[-1]))
+                    if boundary_closed and _candle_epoch(boundary_closed[-1]) is not None
+                    else 0
+                )
+                prepared_entry_candle_ts=candidate.get("entry_candle_ts") or ind.get("otc_entry_candle_ts")
                 try:
+                    prepared_entry_candle_ts=int(prepared_entry_candle_ts or 0)
+                except (TypeError,ValueError):
+                    prepared_entry_candle_ts=0
+
+                # Recompute once if a newer closed 1m candle arrived after preparation.
+                # Only the same 5M strategy family/direction may survive the refresh.
+                if current_closed_ts>0 and current_closed_ts!=prepared_entry_candle_ts:
                     boundary_asset=next(
                         (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
                         None
                     )
-                    boundary_analysis=_prepare_volume_candles(p,boundary_closed)
-                    boundary_refreshed=analyze_asset(
-                        boundary_asset or {"pair":p,"display_name":p},
-                        boundary_analysis,
-                        entry,
-                        forced_strategy=OTC_STRATEGY,
-                        require_high_volume=False,
-                    )
-                    refreshed_direction=(
-                        str(boundary_refreshed.get("direction") or "").upper()
-                        if boundary_refreshed else ""
-                    )
-                    refreshed_strategy=(
-                        str(boundary_refreshed.get("strategy") or "").upper()
-                        if boundary_refreshed else ""
-                    )
-                    if (
-                        boundary_refreshed
-                        and refreshed_strategy==OTC_STRATEGY
-                        and refreshed_direction==expected
-                    ):
-                        candidate.update(boundary_refreshed)
-                        ind=dict(
-                            boundary_refreshed.get("indicators")
-                            or boundary_refreshed.get("indicator_context")
-                            or {}
+                    try:
+                        refreshed=analyze_asset(
+                            boundary_asset or {"pair":p,"display_name":p},
+                            boundary_closed,
+                            entry,
+                            forced_strategy=OTC_STRATEGY,
+                            require_high_volume=False,
                         )
-                        candidate["indicators"]=ind
+                    except Exception as refresh_error:
                         log.info(
-                            "FINAL_OTC_BOUNDARY_RECHECKED cycle=%s pair=%s "
-                            "direction=%s old_entry_candle_ts=%s new_entry_candle_ts=%s "
-                            "new_bos=%s extension_rebaseline=TRUE",
-                            cycle_id,p,expected,prepared_entry_candle_ts,
-                            current_entry_candle_ts,ind.get("otc_bos_level")
-                        )
-                    elif boundary_refreshed and refreshed_strategy==OTC_STRATEGY:
-                        log.info(
-                            "FINAL_OTC_BOUNDARY_RECHECK_REJECTED cycle=%s pair=%s "
-                            "old_direction=%s new_direction=%s reason=technical_brain_direction_changed",
-                            cycle_id,p,expected,refreshed_direction
+                            "FINAL_5M_CADENCE_RECHECK_FAILED cycle=%s pair=%s type=%s message=%s",
+                            cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
                         )
                         return False
-                except Exception as refresh_error:
-                    log.warning(
-                        "FINAL_OTC_BOUNDARY_RECHECK_FAILED cycle=%s pair=%s "
-                        "type=%s message=%s",
-                        cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
+
+                    refreshed_direction=str(refreshed.get("direction") or "").upper() if refreshed else ""
+                    refreshed_ind=dict(refreshed.get("indicators") or {}) if refreshed else {}
+                    refreshed_mode=str(refreshed_ind.get("five_minute_mode") or "").upper()
+                    if not refreshed or refreshed_direction!=expected or refreshed_mode not in {
+                        "CADENCE_CONTINUATION_V1","STRICT_1M_STRUCTURE_V1"
+                    }:
+                        log.info(
+                            "FINAL_5M_CADENCE_REJECTED cycle=%s pair=%s expected=%s refreshed=%s mode=%s reason=boundary_strategy_changed",
+                            cycle_id,p,expected,refreshed_direction,refreshed_mode
+                        )
+                        return False
+                    candidate.update(refreshed)
+                    ind=refreshed_ind
+                    candidate["indicators"]=ind
+
+                # The latest closed 1m candle must still point in the selected direction.
+                latest_closed=boundary_closed[-1] if boundary_closed else None
+                if latest_closed:
+                    latest_close=float(latest_closed.get("close",latest_closed.get("c")))
+                    latest_open=float(latest_closed.get("open",latest_closed.get("o")))
+                    if not (
+                        latest_close>=latest_open if expected=="UP" else latest_close<=latest_open
+                    ):
+                        log.info(
+                            "FINAL_5M_CADENCE_REJECTED cycle=%s pair=%s direction=%s reason=latest_closed_1m_direction_changed",
+                            cycle_id,p,expected
+                        )
+                        return False
+
+                # Preserve authenticated live-activity integrity; never manufacture a quote.
+                high_tick_activity=_high_tick_activity_status(p,time.time())
+                candidate["high_tick_activity"]=high_tick_activity
+                candidate["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
+                live_quote_source=str(STATE["price_source"].get(p,"") or "").lower()
+                authenticated_candle_fresh=(
+                    ALLOW_AUTHENTICATED_CANDLE_LIVE_FALLBACK
+                    and live_quote_source=="authenticated_broker_live_candle"
+                    and has_fresh_live_price(p,time.time(),QUOTE_SNAPSHOT_MAX_AGE)
+                )
+                if not bool(high_tick_activity.get("confirmed")) and not authenticated_candle_fresh:
+                    log.info(
+                        "FINAL_5M_CADENCE_REJECTED cycle=%s pair=%s direction=%s reason=fresh_market_activity_missing diagnostic=%s",
+                        cycle_id,p,expected,high_tick_activity
                     )
+                    return False
 
-            ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
-            bos_level=float(ind.get("otc_bos_level") or 0.0)
-            if bos_level<=0.0:
+                ind["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
+                ind["authenticated_candle_live_fallback"]=bool(authenticated_candle_fresh)
+                ind["authenticated_candle_live_fallback_source"]=live_quote_source
+                ind["high_tick_activity_recent_ticks"]=int(high_tick_activity.get("recent_ticks") or 0)
+                ind["high_tick_activity_total_ticks"]=int(high_tick_activity.get("total_ticks") or 0)
+                ind["high_tick_activity_burst_ratio"]=float(high_tick_activity.get("burst_ratio") or 0.0)
+                ind["five_minute_final_verified"]=True
+                candidate["indicators"]=ind
                 log.info(
-                    "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s reason=bos_level_missing next_asset=TRUE",
-                    cycle_id,p,expected
+                    "FINAL_5M_CADENCE_CONFIRMED cycle=%s pair=%s direction=%s "
+                    "mode=%s score_up=%s score_down=%s",
+                    cycle_id,p,expected,ind.get("five_minute_mode"),
+                    ind.get("five_minute_score_up"),ind.get("five_minute_score_down")
                 )
-                return False
-            structure_holds=(entry>bos_level) if expected=="UP" else (entry<bos_level)
-            if not structure_holds:
-                log.info(
-                    "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
-                    "reason=live_quote_below_or_above_bos_level entry=%s bos_level=%s next_asset=TRUE",
-                    cycle_id,p,expected,entry,bos_level
-                )
-                return False
 
-            # 1-minute expiry is highly sensitive to a late/chased entry.
-            # Measure live distance from BOS against the setup's own M1 baseline
-            # range; reject clearly stretched entries and let the fallback continue.
-            baseline_range=float(ind.get("otc_baseline_range") or 0.0)
-            extension_norm=(
-                ((entry-bos_level)/baseline_range) if expected=="UP"
-                else ((bos_level-entry)/baseline_range)
-            ) if baseline_range>0.0 else 0.0
-            candidate["otc_entry_extension_norm"]=float(extension_norm)
-            candidate["otc_entry_extension_threshold"]=float(OTC_MAX_BOS_EXTENSION_RANGES)
-            ind["otc_entry_extension_norm"]=float(extension_norm)
-            ind["otc_entry_extension_threshold"]=float(OTC_MAX_BOS_EXTENSION_RANGES)
-            if baseline_range>0.0 and extension_norm>OTC_MAX_BOS_EXTENSION_RANGES:
-                log.info(
-                    "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
-                    "reason=entry_overextended_from_bos entry=%s bos_level=%s "
-                    "baseline_range=%s extension_norm=%.3f max_ranges=%.3f next_asset=TRUE",
-                    cycle_id,p,expected,entry,bos_level,baseline_range,
-                    extension_norm,OTC_MAX_BOS_EXTENSION_RANGES
+            else:
+                # The OTC structure gate must use the newest closed M1 structure at the
+                # exact delivery boundary. Pass 5 may have prepared the candidate up to
+                # ~30s earlier; during that interval a new closed candle can establish a
+                # newer BOS/retest/confirmation sequence. Recompute locally (no broker
+                # request, no AI call) and keep the original direction only when the
+                # technical brain still confirms that same direction.
+                ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
+                prepared_entry_candle_ts=candidate.get("entry_candle_ts") or ind.get("otc_entry_candle_ts")
+                boundary_closed=_closed_candles(
+                    STATE.get("candles",{}).get(p,[]),time.time()
                 )
-                return False
-
-            required_flags=(
-                "otc_strategy","otc_bos_confirmed","otc_displacement_confirmed",
-                "otc_retest_confirmed","otc_hold_confirmed",
-                "otc_confirmation_candle_confirmed","m1_continuation_ok",
-                "exact_live_setup"
-            )
-            if any(ind.get(flag) is not True for flag in required_flags):
-                log.info(
-                    "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
-                    "reason=structure_confirmation_missing next_asset=TRUE",
-                    cycle_id,p,expected
+                current_entry_candle_ts=(
+                    int(_candle_epoch(boundary_closed[-1]))
+                    if boundary_closed and _candle_epoch(boundary_closed[-1]) is not None
+                    else 0
                 )
-                return False
-            high_tick_activity=_high_tick_activity_status(p,time.time())
-            candidate["high_tick_activity"]=high_tick_activity
-            candidate["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
-            live_quote_source=str(STATE["price_source"].get(p,"") or "").lower()
-            authenticated_candle_fresh=(
-                ALLOW_AUTHENTICATED_CANDLE_LIVE_FALLBACK
-                and live_quote_source=="authenticated_broker_live_candle"
-                and has_fresh_live_price(p,time.time(),QUOTE_SNAPSHOT_MAX_AGE)
-            )
-            if not bool(high_tick_activity.get("confirmed")) and not (
-                authenticated_candle_fresh and bool(ind.get("m1_continuation_ok"))
-            ):
+                try:
+                    prepared_entry_candle_ts=int(prepared_entry_candle_ts or 0)
+                except (TypeError,ValueError):
+                    prepared_entry_candle_ts=0
+    
+                if (
+                    current_entry_candle_ts>0
+                    and current_entry_candle_ts!=prepared_entry_candle_ts
+                ):
+                    try:
+                        boundary_asset=next(
+                            (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
+                            None
+                        )
+                        boundary_analysis=_prepare_volume_candles(p,boundary_closed)
+                        boundary_refreshed=analyze_asset(
+                            boundary_asset or {"pair":p,"display_name":p},
+                            boundary_analysis,
+                            entry,
+                            forced_strategy=OTC_STRATEGY,
+                            require_high_volume=False,
+                        )
+                        refreshed_direction=(
+                            str(boundary_refreshed.get("direction") or "").upper()
+                            if boundary_refreshed else ""
+                        )
+                        refreshed_strategy=(
+                            str(boundary_refreshed.get("strategy") or "").upper()
+                            if boundary_refreshed else ""
+                        )
+                        if (
+                            boundary_refreshed
+                            and refreshed_strategy==OTC_STRATEGY
+                            and refreshed_direction==expected
+                        ):
+                            candidate.update(boundary_refreshed)
+                            ind=dict(
+                                boundary_refreshed.get("indicators")
+                                or boundary_refreshed.get("indicator_context")
+                                or {}
+                            )
+                            candidate["indicators"]=ind
+                            log.info(
+                                "FINAL_OTC_BOUNDARY_RECHECKED cycle=%s pair=%s "
+                                "direction=%s old_entry_candle_ts=%s new_entry_candle_ts=%s "
+                                "new_bos=%s extension_rebaseline=TRUE",
+                                cycle_id,p,expected,prepared_entry_candle_ts,
+                                current_entry_candle_ts,ind.get("otc_bos_level")
+                            )
+                        elif boundary_refreshed and refreshed_strategy==OTC_STRATEGY:
+                            log.info(
+                                "FINAL_OTC_BOUNDARY_RECHECK_REJECTED cycle=%s pair=%s "
+                                "old_direction=%s new_direction=%s reason=technical_brain_direction_changed",
+                                cycle_id,p,expected,refreshed_direction
+                            )
+                            return False
+                    except Exception as refresh_error:
+                        log.warning(
+                            "FINAL_OTC_BOUNDARY_RECHECK_FAILED cycle=%s pair=%s "
+                            "type=%s message=%s",
+                            cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
+                        )
+    
+                ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
+                bos_level=float(ind.get("otc_bos_level") or 0.0)
+                if bos_level<=0.0:
+                    log.info(
+                        "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s reason=bos_level_missing next_asset=TRUE",
+                        cycle_id,p,expected
+                    )
+                    return False
+                structure_holds=(entry>bos_level) if expected=="UP" else (entry<bos_level)
+                if not structure_holds:
+                    log.info(
+                        "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
+                        "reason=live_quote_below_or_above_bos_level entry=%s bos_level=%s next_asset=TRUE",
+                        cycle_id,p,expected,entry,bos_level
+                    )
+                    return False
+    
+                # 1-minute expiry is highly sensitive to a late/chased entry.
+                # Measure live distance from BOS against the setup's own M1 baseline
+                # range; reject clearly stretched entries and let the fallback continue.
+                baseline_range=float(ind.get("otc_baseline_range") or 0.0)
+                extension_norm=(
+                    ((entry-bos_level)/baseline_range) if expected=="UP"
+                    else ((bos_level-entry)/baseline_range)
+                ) if baseline_range>0.0 else 0.0
+                candidate["otc_entry_extension_norm"]=float(extension_norm)
+                candidate["otc_entry_extension_threshold"]=float(OTC_MAX_BOS_EXTENSION_RANGES)
+                ind["otc_entry_extension_norm"]=float(extension_norm)
+                ind["otc_entry_extension_threshold"]=float(OTC_MAX_BOS_EXTENSION_RANGES)
+                if baseline_range>0.0 and extension_norm>OTC_MAX_BOS_EXTENSION_RANGES:
+                    log.info(
+                        "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
+                        "reason=entry_overextended_from_bos entry=%s bos_level=%s "
+                        "baseline_range=%s extension_norm=%.3f max_ranges=%.3f next_asset=TRUE",
+                        cycle_id,p,expected,entry,bos_level,baseline_range,
+                        extension_norm,OTC_MAX_BOS_EXTENSION_RANGES
+                    )
+                    return False
+    
+                required_flags=(
+                    "otc_strategy","otc_bos_confirmed","otc_displacement_confirmed",
+                    "otc_retest_confirmed","otc_hold_confirmed",
+                    "otc_confirmation_candle_confirmed","m1_continuation_ok",
+                    "exact_live_setup"
+                )
+                if any(ind.get(flag) is not True for flag in required_flags):
+                    log.info(
+                        "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
+                        "reason=structure_confirmation_missing next_asset=TRUE",
+                        cycle_id,p,expected
+                    )
+                    return False
+                high_tick_activity=_high_tick_activity_status(p,time.time())
+                candidate["high_tick_activity"]=high_tick_activity
+                candidate["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
+                live_quote_source=str(STATE["price_source"].get(p,"") or "").lower()
+                authenticated_candle_fresh=(
+                    ALLOW_AUTHENTICATED_CANDLE_LIVE_FALLBACK
+                    and live_quote_source=="authenticated_broker_live_candle"
+                    and has_fresh_live_price(p,time.time(),QUOTE_SNAPSHOT_MAX_AGE)
+                )
+                if not bool(high_tick_activity.get("confirmed")) and not (
+                    authenticated_candle_fresh and bool(ind.get("m1_continuation_ok"))
+                ):
+                    log.info(
+                        "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
+                        "reason=high_tick_activity_not_confirmed diagnostic=%s next_asset=TRUE",
+                        cycle_id,p,expected,high_tick_activity
+                    )
+                    return False
+                ind["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
+                ind["authenticated_candle_live_fallback"]=bool(
+                    authenticated_candle_fresh and bool(ind.get("m1_continuation_ok"))
+                )
+                ind["authenticated_candle_live_fallback_source"]=live_quote_source
+                ind["high_tick_activity_recent_ticks"]=int(high_tick_activity.get("recent_ticks") or 0)
+                ind["high_tick_activity_total_ticks"]=int(high_tick_activity.get("total_ticks") or 0)
+                ind["high_tick_activity_burst_ratio"]=float(high_tick_activity.get("burst_ratio") or 0.0)
+                candidate["indicators"]=ind
                 log.info(
-                    "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s "
-                    "reason=high_tick_activity_not_confirmed diagnostic=%s next_asset=TRUE",
+                    "HIGH_TICK_ACTIVITY_OTC_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
                     cycle_id,p,expected,high_tick_activity
                 )
-                return False
-            ind["high_tick_activity_confirmed"]=bool(high_tick_activity.get("confirmed"))
-            ind["authenticated_candle_live_fallback"]=bool(
-                authenticated_candle_fresh and bool(ind.get("m1_continuation_ok"))
-            )
-            ind["authenticated_candle_live_fallback_source"]=live_quote_source
-            ind["high_tick_activity_recent_ticks"]=int(high_tick_activity.get("recent_ticks") or 0)
-            ind["high_tick_activity_total_ticks"]=int(high_tick_activity.get("total_ticks") or 0)
-            ind["high_tick_activity_burst_ratio"]=float(high_tick_activity.get("burst_ratio") or 0.0)
-            candidate["indicators"]=ind
-            log.info(
-                "HIGH_TICK_ACTIVITY_OTC_CONFIRMED cycle=%s pair=%s direction=%s diagnostic=%s",
-                cycle_id,p,expected,high_tick_activity
-            )
+
         else:
             log.info(
                 "FINAL_STRATEGY_REJECTED cycle=%s pair=%s strategy=%s reason=unsupported_live_strategy",
@@ -5288,10 +5407,17 @@ async def cycle_loop():
             "FINAL_LIVE_STRATEGY_CONFIRMED cycle=%s pair=%s strategy=%s direction=%s diagnostic=%s",
             cycle_id,p,strategy_name,expected,candidate.get("final_delivery_diagnostic") or {}
         )
-        if confidence < 90:
+        is_5m_cadence_fallback=(
+            str(
+                (candidate.get("indicators") or candidate.get("indicator_context") or {}).get("five_minute_mode")
+                or ""
+            ).upper()=="CADENCE_CONTINUATION_V1"
+        )
+        minimum_send_confidence=75 if is_5m_cadence_fallback else 90
+        if confidence < minimum_send_confidence:
             log.info(
-                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=confidence_%s",
-                cycle_id,p,confidence
+                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=confidence_%s minimum=%s cadence_fallback=%s",
+                cycle_id,p,confidence,minimum_send_confidence,is_5m_cadence_fallback
             )
             return False
 
