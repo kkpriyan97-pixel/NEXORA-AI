@@ -772,8 +772,10 @@ def _otc_median(values):
 
 FIVE_MINUTES=300
 
-# The legacy 5M cadence fallback was introduced to keep wall-clock slots populated,
-# but it can use a completed 5M bar that is too old for a 1M/2M production entry.
+# The legacy 5M cadence fallback was introduced to keep wall-clock slots populated.
+# In explicit 5M-expiry mode, a completed 5M context may be up to six minutes old
+# because the signal itself is a five-minute horizon; the actual entry still uses
+# the newest completed M1 candle and is never allowed to use a forming candle.
 # In explicit 5M-expiry mode the validated 5M continuation fallback is
 # enabled by default for OTC assets. It never blocks the scheduler and still
 # requires a complete closed 5M structure/momentum sequence.
@@ -783,7 +785,15 @@ ALLOW_5M_CADENCE_FALLBACK = os.getenv(
 ).strip().lower() in {"1","true","yes","on"}
 FIVE_MINUTE_MAX_SETUP_AGE_SECONDS = max(
     60.0,
-    min(180.0,float(os.getenv("FIVE_MINUTE_MAX_SETUP_AGE_SECONDS","120") or 120.0))
+    min(
+        360.0,
+        float(
+            os.getenv(
+                "FIVE_MINUTE_MAX_SETUP_AGE_SECONDS",
+                "360" if FIVE_MINUTE_EXPIRY_MODE else "120",
+            ) or (360 if FIVE_MINUTE_EXPIRY_MODE else 120)
+        )
+    )
 )
 
 def _complete_5m_blocks(cs,now=None):
