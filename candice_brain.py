@@ -1211,8 +1211,8 @@ def analyze_otc_asset(
     # The complete strategy sequence is the authoritative live gate.
     exact_live_setup=bool(
         bias in {"BULLISH","BEARISH"}
-        and setup["displacement_confirmed"]
-        and (setup["retest_confirmed"] if not cadence_fallback else setup.get("five_minute_directional_ok"))
+        and (setup["displacement_confirmed"] if not cadence_fallback else setup.get("five_minute_directional_ok"))
+        and (setup["retest_confirmed"] if not cadence_fallback else setup.get("five_minute_structure_ok"))
         and setup["hold_confirmed"]
         and setup["confirmation_candle_confirmed"]
         and m1_continuation_ok
