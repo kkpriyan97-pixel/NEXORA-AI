@@ -1202,6 +1202,72 @@ LIVE_CANDLE_BRIDGE_MIN_OBSERVED_SECONDS=max(
     30.0,min(59.0,float(os.getenv("LIVE_CANDLE_BRIDGE_MIN_OBSERVED_SECONDS","45") or 45.0))
 )
 LIVE_CANDLE_BRIDGE_LAST_PROMOTE={}
+LIVE_CANDLE_PAGE_LAST_NEWEST={}
+
+def _merge_authenticated_live_candle_page(pair,candles,reference_ts=None):
+    """Use the broker's live event-10 page as fresh closed-candle history when it is current."""
+    p=str(pair or "").strip()
+    if not p or not isinstance(candles,list):
+        return 0
+    now=time.time() if reference_ts is None else float(reference_ts)
+    normalized=[]
+    for raw in candles:
+        if not isinstance(raw,dict):
+            continue
+        try:
+            ts=float(raw.get("time",raw.get("t")))
+            if ts>20_000_000_000:
+                ts/=1000.0
+            op=float(raw.get("open",raw.get("o")))
+            hi=float(raw.get("high",raw.get("h")))
+            lo=float(raw.get("low",raw.get("l")))
+            cl=float(raw.get("close",raw.get("c")))
+            if not all(isfinite(v) for v in (ts,op,hi,lo,cl)):
+                continue
+        except (TypeError,ValueError):
+            continue
+        item=dict(raw)
+        item["time"]=int(ts//60)*60
+        item["open"]=op
+        item["high"]=hi
+        item["low"]=lo
+        item["close"]=cl
+        normalized.append(item)
+    if len(normalized)<60:
+        return 0
+    normalized.sort(key=lambda x:int(x["time"]))
+    latest_closed=[x for x in normalized if int(x["time"])+60<=now]
+    if len(latest_closed)<60:
+        return 0
+    latest_closed_ts=int(latest_closed[-1]["time"])
+    latest_closed_age=max(0.0,now-(latest_closed_ts+60.0))
+    # This endpoint is only a valid live-history source when its newest completed
+    # bar is genuinely current. Older/stale pages remain historical seeds only.
+    if latest_closed_age>75.0:
+        return 0
+    # Merge/deduplicate the complete broker page without allowing a forming candle
+    # to masquerade as closed analysis data.
+    existing=STATE.get("candles",{}).get(p,[]) or []
+    by_ts={}
+    for raw in existing:
+        try:
+            ts=_candle_epoch(raw)
+        except Exception:
+            ts=None
+        if ts is not None:
+            by_ts[int(ts//60)*60]=dict(raw)
+    for item in normalized:
+        ts=int(item["time"])
+        by_ts[ts]=item
+    merged=[by_ts[k] for k in sorted(by_ts)]
+    if len(merged)>180:
+        merged=merged[-180:]
+    previous_latest=LIVE_CANDLE_PAGE_LAST_NEWEST.get(p)
+    STATE["candles"][p]=merged
+    LIVE_CANDLE_PAGE_LAST_NEWEST[p]=latest_closed_ts
+    if previous_latest!=latest_closed_ts:
+        return len(latest_closed)
+    return 0
 
 def _record_live_candle_snapshot(pair,candle,received_at=None):
     p=str(pair or "").strip()
@@ -1831,6 +1897,7 @@ async def refresh_broker_live_quote(pair):
         price=float(q["price"])
         broker_candle=q.get("candle") or {}
         live_page=q.get("candles") or []
+        page_closed_accepted=_merge_authenticated_live_candle_page(pair,live_page,now)
         live_recorded=0
         if isinstance(live_page,list):
             for raw_candle in live_page:
@@ -1838,6 +1905,11 @@ async def refresh_broker_live_quote(pair):
                     live_recorded+=1
         if live_recorded==0:
             _record_live_candle_snapshot(pair,broker_candle,now)
+        if page_closed_accepted:
+            log.info(
+                "LIVE_CANDLE_HISTORY_ACCEPTED pair=%s closed=%d source=authenticated_event10_solid_false",
+                pair,page_closed_accepted
+            )
         broker_ts=broker_candle.get("time",broker_candle.get("t"))
         if live_recorded>1:
             _promote_live_closed_candles(pair,now)
