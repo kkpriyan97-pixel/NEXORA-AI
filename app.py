@@ -1190,6 +1190,126 @@ TICK_HISTORY=defaultdict(lambda: deque(maxlen=720))
 # micro-candle aggregation remains backward-compatible.
 ENTRY_TICK_HISTORY=defaultdict(lambda: deque(maxlen=720))
 
+# Broker current-candle bridge used when the historical event-10 candle endpoint
+# is delayed. Each snapshot comes from the authenticated broker's own current
+# candle. Only minutes that are fully in the past, have enough observations,
+# and have been observed late enough in the minute are promoted to closed M1
+# history. This is a recovery path, not synthetic market data.
+LIVE_CANDLE_BRIDGE=defaultdict(dict)
+LIVE_CANDLE_BRIDGE_MAX_MINUTES=180
+LIVE_CANDLE_BRIDGE_MIN_SAMPLES=max(3,min(12,int(os.getenv("LIVE_CANDLE_BRIDGE_MIN_SAMPLES","5") or 5)))
+LIVE_CANDLE_BRIDGE_MIN_OBSERVED_SECONDS=max(
+    30.0,min(59.0,float(os.getenv("LIVE_CANDLE_BRIDGE_MIN_OBSERVED_SECONDS","45") or 45.0))
+)
+LIVE_CANDLE_BRIDGE_LAST_PROMOTE={}
+
+def _record_live_candle_snapshot(pair,candle,received_at=None):
+    p=str(pair or "").strip()
+    if not p or not isinstance(candle,dict):
+        return False
+    try:
+        ts=float(candle.get("time",candle.get("t")))
+        if ts>20_000_000_000:
+            ts/=1000.0
+        minute=int(ts//60)*60
+        open_px=float(candle.get("open",candle.get("o")))
+        high_px=float(candle.get("high",candle.get("h")))
+        low_px=float(candle.get("low",candle.get("l")))
+        close_px=float(candle.get("close",candle.get("c")))
+        if not all(isfinite(v) for v in (open_px,high_px,low_px,close_px)):
+            return False
+    except (TypeError,ValueError):
+        return False
+    now=time.time() if received_at is None else float(received_at)
+    rec=LIVE_CANDLE_BRIDGE[p].get(minute)
+    if rec is None:
+        rec={
+            "time":minute,
+            "open":open_px,
+            "high":high_px,
+            "low":low_px,
+            "close":close_px,
+            "first_seen_at":now,
+            "last_seen_at":now,
+            "samples":0,
+            "source":"authenticated_broker_current_candle",
+        }
+        LIVE_CANDLE_BRIDGE[p][minute]=rec
+    else:
+        rec["open"]=float(rec.get("open") or open_px)
+        rec["high"]=max(float(rec.get("high") or high_px),high_px)
+        rec["low"]=min(float(rec.get("low") or low_px),low_px)
+        rec["close"]=close_px
+        rec["last_seen_at"]=now
+    rec["samples"]=int(rec.get("samples") or 0)+1
+    # Bound memory without affecting the durable result/history stores.
+    cutoff=minute-(LIVE_CANDLE_BRIDGE_MAX_MINUTES*60)
+    for old_minute in list(LIVE_CANDLE_BRIDGE[p]):
+        if int(old_minute)<cutoff:
+            LIVE_CANDLE_BRIDGE[p].pop(old_minute,None)
+    return True
+
+def _promote_live_closed_candles(pair,reference_ts=None):
+    p=str(pair or "").strip()
+    if not p:
+        return 0
+    now=time.time() if reference_ts is None else float(reference_ts)
+    current_minute=(int(now)//60)*60
+    bridge=LIVE_CANDLE_BRIDGE.get(p) or {}
+    if not bridge:
+        return 0
+    existing=list(STATE.get("candles",{}).get(p,[]) or [])
+    by_ts={}
+    for raw in existing:
+        try:
+            ts=_candle_epoch(raw)
+        except Exception:
+            ts=None
+        if ts is not None:
+            by_ts[int(ts//60)*60]=dict(raw)
+    promoted=0
+    for minute,rec in sorted(bridge.items()):
+        minute=int(minute)
+        if minute>=current_minute:
+            continue
+        samples=int(rec.get("samples") or 0)
+        first_seen=float(rec.get("first_seen_at") or 0.0)
+        last_seen=float(rec.get("last_seen_at") or 0.0)
+        observed_span=max(0.0,last_seen-first_seen)
+        # Do not promote a barely-observed minute: the final snapshot should
+        # cover most of the minute so its broker-reported OHLC is meaningful.
+        if samples<LIVE_CANDLE_BRIDGE_MIN_SAMPLES or observed_span<LIVE_CANDLE_BRIDGE_MIN_OBSERVED_SECONDS:
+            continue
+        prev=by_ts.get(minute)
+        item={
+            "time":minute,
+            "open":float(rec["open"]),
+            "high":float(rec["high"]),
+            "low":float(rec["low"]),
+            "close":float(rec["close"]),
+            "volume":0.0,
+            "volume_source":"NONE",
+            "live_candle_bridge":True,
+            "live_candle_bridge_samples":samples,
+            "live_candle_bridge_observed_seconds":round(observed_span,3),
+            "live_candle_bridge_source":"authenticated_broker_current_candle",
+        }
+        if prev and not prev.get("live_candle_bridge"):
+            # Never overwrite an existing broker historical candle with a sampled
+            # bridge unless the historical copy is absent. Preserve the original
+            # provider data when both are present.
+            continue
+        by_ts[minute]=item
+        if prev is None:
+            promoted+=1
+    merged=[by_ts[k] for k in sorted(by_ts)]
+    if len(merged)>180:
+        merged=merged[-180:]
+    STATE["candles"][p]=merged
+    if promoted:
+        LIVE_CANDLE_BRIDGE_LAST_PROMOTE[p]=now
+    return promoted
+
 # Persistent M1 tick-activity ledger. This is observed broker tick activity only;
 # it is never labelled as traded/notional volume.
 VOLUME_M1_CACHE=defaultdict(dict)
@@ -1710,6 +1830,7 @@ async def refresh_broker_live_quote(pair):
         now=time.time()
         price=float(q["price"])
         broker_candle=q.get("candle") or {}
+        _record_live_candle_snapshot(pair,broker_candle,now)
         broker_ts=broker_candle.get("time",broker_candle.get("t"))
         try:
             broker_ts=float(broker_ts)
