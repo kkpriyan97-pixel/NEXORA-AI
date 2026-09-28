@@ -273,8 +273,12 @@ class NewsCalendarClient:
             horizon = float(self.lookahead_hours * 3600)
             events = [e for e in events if -900.0 <= e.timestamp_utc - now <= horizon]
             return events, ("tradingeconomics" if self.api_key and not self.custom_url else "custom")
-        except Exception as exc:
-            return [], f"error:{type(exc).__name__}"
+        except Exception:
+            # Propagate transient feed failures so the isolated app-level news
+            # worker preserves the last known-good calendar instead of replacing
+            # valid context with an empty event set. This path never owns the
+            # 5-minute scheduler and cannot change Brain direction.
+            raise
 
 
 def compact_event_line(context: dict[str, Any]) -> str:
