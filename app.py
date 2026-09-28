@@ -6190,10 +6190,11 @@ async def cycle_loop():
                         )
                         return False
                     five_age=float(ind.get("five_minute_setup_age_seconds") or 9999.0)
-                    if five_age > 120.0:
+                    _five_max_age=float(FIVE_MINUTE_MAX_SETUP_AGE_SECONDS)
+                    if five_age > _five_max_age:
                         log.info(
-                            "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s reason=5m_setup_stale age_seconds=%.2f max_age=120 next_asset=TRUE",
-                            cycle_id,p,expected,five_age
+                            "FINAL_OTC_REJECTED cycle=%s pair=%s direction=%s reason=5m_setup_stale age_seconds=%.2f max_age=%.2f next_asset=TRUE",
+                            cycle_id,p,expected,five_age,_five_max_age
                         )
                         return False
                 else:
@@ -8213,42 +8214,15 @@ async def cycle_loop():
                     break
 
         if not sent:
-            # Do not turn a strict trade-grade rejection into a user-facing NO SIGNAL.
-            # Produce exactly one bounded 5-minute direction forecast from available
-            # closed-candle/Brain evidence. This path never reserves a trade, never
-            # starts a result watch, and never changes the deterministic Brain.
-            try:
-                forecast=await asyncio.wait_for(
-                    build_always_on_forecast(cycle_id,target),
-                    timeout=max(0.5,min(3.0,max(0.5,signal_at-time.time()+0.75)))
-                )
-            except asyncio.TimeoutError:
-                forecast=None
-                log.info("FIVE_MINUTE_FORECAST_TIMEOUT cycle=%s",cycle_id)
-            except Exception as forecast_error:
-                forecast=None
-                log.info(
-                    "FIVE_MINUTE_FORECAST_FAILED cycle=%s type=%s message=%s",
-                    cycle_id,type(forecast_error).__name__,str(forecast_error)[:160]
-                )
-            if forecast:
-                forecast_message=format_5m_forecast_message(forecast,target)
-                forecast_sent=await telegram(
-                    forecast_message,
-                    timeout_seconds=min(TELEGRAM_SIGNAL_TIMEOUT,5.0)
-                )
-                if forecast_sent:
-                    FORECAST_SENT_CYCLES.append(int(cycle_id))
-                log.info(
-                    "FIVE_MINUTE_FORECAST_DELIVERY cycle=%s pair=%s direction=%s confidence=%s "
-                    "score=%s sent=%s news_phase=%s forecast_source=%s",
-                    cycle_id,forecast.get("pair"),forecast.get("direction"),
-                    forecast.get("forecast_confidence") or forecast.get("confidence"),
-                    forecast.get("forecast_score"),forecast_sent,
-                    (forecast.get("news_context") or {}).get("phase"),
-                    forecast.get("forecast_source")
-                )
-
+            # Telegram is reserved for trade-grade PRO signals only.
+            # Never send the calibrated FORECAST fallback as a user-facing signal.
+            # The scheduler still completes this 5-minute cycle and immediately
+            # advances to the next fixed wall-clock target.
+            forecast_sent=False
+            log.info(
+                "FIVE_MINUTE_FORECAST_SUPPRESSED cycle=%s reason=no_trade_grade_pro_signal",
+                cycle_id
+            )
             if boundary_lag>1.00:
                 log.warning(
                     "FINAL_BOUNDARY_MISSED cycle=%s lag_seconds=%.3f candidates=%s max_lag=1.00",
@@ -8267,7 +8241,6 @@ async def cycle_loop():
                     "FIVE_SCAN_NO_TRADE_GRADE_SETUP cycle=%s scans=5 analyzed=%d forecast_sent=%s",
                     cycle_id,len(STATE["analyses"]),forecast_sent
                 )
-
         # Do not let the current cycle's durable DB status update block
         # the 24/7 scheduler after a signal/no-signal decision. The next
         # 5-minute target must be scheduled immediately; persistence runs
@@ -8277,21 +8250,16 @@ async def cycle_loop():
                 mark_cycle_state(cycle_id,"SENT","signal_delivered")
             )
             cycle_outcome="SENT"
-        elif forecast_sent:
-            asyncio.create_task(
-                mark_cycle_state(cycle_id,"FORECAST","forecast_delivered_trade_grade_unavailable")
-            )
-            cycle_outcome="FORECAST"
         elif ranked_pool:
             asyncio.create_task(
-                mark_cycle_state(cycle_id,"SKIPPED","final_candidate_failed_delivery_and_forecast_failed")
+                mark_cycle_state(cycle_id,"SKIPPED","no_trade_grade_signal_survived_final_delivery_gate")
             )
             cycle_outcome="SKIPPED_DELIVERY"
         else:
             asyncio.create_task(
-                mark_cycle_state(cycle_id,"SKIPPED","no_forecast_source_available")
+                mark_cycle_state(cycle_id,"SKIPPED","no_trade_grade_setup_available")
             )
-            cycle_outcome="SKIPPED_NO_FORECAST"
+            cycle_outcome="SKIPPED_NO_SETUP"
 
         next_target=(int(time.time())//int(SIGNAL_INTERVAL)+1)*int(SIGNAL_INTERVAL)
         next_cycle_id=int(next_target//SIGNAL_INTERVAL)
