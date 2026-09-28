@@ -5966,10 +5966,17 @@ async def cycle_loop():
             return False
 
         ts=target-signal_lead
-        if time.time() > ts+1.00:
+        # Keep the wall-clock 5-minute cycle authoritative while allowing a
+        # small scheduler/jitter grace at the 30-second delivery point. A
+        # sub-second/low-second event-loop slip must not discard an otherwise
+        # fully prepared signal; the entry/expiry timestamp remains the exact
+        # cycle target and the actual lag is logged for audit.
+        SIGNAL_DISPATCH_GRACE_SECONDS=3.0
+        if time.time() > ts+SIGNAL_DISPATCH_GRACE_SECONDS:
             log.info(
-                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=deadline_passed",
-                cycle_id,p
+                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=deadline_passed "
+                "dispatch_grace=%.1fs",
+                cycle_id,p,SIGNAL_DISPATCH_GRACE_SECONDS
             )
             return False
 
@@ -7737,9 +7744,14 @@ async def cycle_loop():
                     break
 
         if not sent:
-            if boundary_lag>1.00:
+            if boundary_lag>3.00:
                 log.warning(
-                    "FINAL_BOUNDARY_MISSED cycle=%s lag_seconds=%.3f candidates=%s max_lag=1.00",
+                    "FINAL_BOUNDARY_MISSED cycle=%s lag_seconds=%.3f candidates=%s max_lag=3.00",
+                    cycle_id,boundary_lag,len(ranked_pool)
+                )
+            elif boundary_lag>1.00:
+                log.info(
+                    "FINAL_BOUNDARY_LATE_WITHIN_GRACE cycle=%s lag_seconds=%.3f candidates=%s max_lag=3.00",
                     cycle_id,boundary_lag,len(ranked_pool)
                 )
             if ranked_pool:
