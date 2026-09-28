@@ -4561,12 +4561,11 @@ def _exact_expiry_candle(candles,target_ts,reference_ts=None):
 
 
 def _exact_expiry_window_price(candles,target_ts,expiry_minutes,reference_ts=None):
-    """Return the close of the exact closed M1 candle window for a 1m/2m signal.
+    """Return the close of the exact closed M1 candle window for the configured expiry.
 
-    The configured expiry is part of the result contract. For 2m, both exact
-    one-minute candles beginning at target_ts and target_ts+60s must be present
-    and fully closed; the second candle close is the only valid expiry price.
-    Missing/gapped minutes never fall back to a newer candle.
+    For a 5m signal, all five exact one-minute candles beginning at target_ts
+    must be present and fully closed; the fifth candle close is the only valid
+    expiry price. Missing/gapped minutes never fall back to a newer candle.
     """
     reference=time.time() if reference_ts is None else float(reference_ts)
     try:
@@ -4802,7 +4801,7 @@ async def result_watch(key):
         )
     else:
         # No user trade was matched: measure the signal itself over the exact
-        # configured expiry horizon using fully closed 1m candles.
+        # configured 5-minute expiry horizon using fully closed 1m candles.
         expiry_price=None
         expiry_source=""
         expiry_minutes=int(s.expiry_minutes)
@@ -5076,10 +5075,10 @@ async def cycle_loop():
     #   - 5s + every complete 1m..15m frame are checked in each pass
     #   - result watching and History-AI remain background tasks and never block
     #     the scheduler, so one completed signal cannot stop the next cycle.
-    # The Brain/AI strategy itself is unchanged; only the scheduling cadence
-    # and the requested expiry are changed for DEMO analysis.
-    # Day signal session: every 5 minutes. Signal is fixed at target-30s;
-    # the 1-minute DEMO entry/expiry boundary is the exact 5-minute target.
+    # The 5-minute wall-clock scheduler is independent from signal expiry.
+    # Signal evaluation is fixed at target-30s; target is the entry boundary.
+    # Production expiry is now a separate 5-minute outcome horizon so overlapping
+    # result watchers never block or delay the next 5-minute cycle.
     SIGNAL_INTERVAL=300.0
     SIGNAL_LEADS=(30.0,30.0)
     SCAN_OFFSETS=CYCLE_SCAN_OFFSETS
@@ -5107,7 +5106,7 @@ async def cycle_loop():
         elif strategy in {"AVWAP_VOLUME_PROFILE","PRO_OTC_STRUCTURE_CONTINUATION"} and direction in {"UP","DOWN"}:
             x["expiry_minutes"]=int(BRAIN.choose_expiry(strategy=strategy,pair=x.get("pair"),direction=direction,live_quality=technical))
             if int(x["expiry_minutes"]) not in SIGNAL_EXPIRY_OPTIONS:
-                x["expiry_minutes"]=2 if technical>=97 else 1
+                x["expiry_minutes"]=5
             x["expiry_selection_basis"]="technical_boundary"
         else:
             x["expiry_minutes"]=5 if FIVE_MINUTE_EXPIRY_MODE else 1
