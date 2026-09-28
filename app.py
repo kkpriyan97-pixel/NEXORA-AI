@@ -10,7 +10,7 @@ import httpx
 from olymptrade_ws import OlympTradeClient
 from olymptrade_ws.olympconfig import parameters
 from brain_rules import ActiveSignal,BrainState,rank_signal_candidates,COOLDOWN_SECONDS
-from candice_brain import analyze_asset,OTC_STRATEGY,ALLOWED_STRATEGY,detect_alligator_breakout,_alligator_confirmation
+from candice_brain import analyze_asset,OTC_STRATEGY,ALLOWED_STRATEGY,detect_alligator_breakout
 from ai_engine import snapshot_from_asset,ai_environment_status
 from ai_router import analyze_with_fallback,review_result_with_fallback
 from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot_async, world_learning_loop
@@ -4561,11 +4561,12 @@ def _exact_expiry_candle(candles,target_ts,reference_ts=None):
 
 
 def _exact_expiry_window_price(candles,target_ts,expiry_minutes,reference_ts=None):
-    """Return the close of the exact closed M1 candle window for the configured expiry.
+    """Return the close of the exact closed M1 candle window for a 1m/2m signal.
 
-    For a 5m signal, all five exact one-minute candles beginning at target_ts
-    must be present and fully closed; the fifth candle close is the only valid
-    expiry price. Missing/gapped minutes never fall back to a newer candle.
+    The configured expiry is part of the result contract. For 2m, both exact
+    one-minute candles beginning at target_ts and target_ts+60s must be present
+    and fully closed; the second candle close is the only valid expiry price.
+    Missing/gapped minutes never fall back to a newer candle.
     """
     reference=time.time() if reference_ts is None else float(reference_ts)
     try:
@@ -4801,7 +4802,7 @@ async def result_watch(key):
         )
     else:
         # No user trade was matched: measure the signal itself over the exact
-        # configured 5-minute expiry horizon using fully closed 1m candles.
+        # configured expiry horizon using fully closed 1m candles.
         expiry_price=None
         expiry_source=""
         expiry_minutes=int(s.expiry_minutes)
@@ -5075,10 +5076,10 @@ async def cycle_loop():
     #   - 5s + every complete 1m..15m frame are checked in each pass
     #   - result watching and History-AI remain background tasks and never block
     #     the scheduler, so one completed signal cannot stop the next cycle.
-    # The 5-minute wall-clock scheduler is independent from signal expiry.
-    # Signal evaluation is fixed at target-30s; target is the entry boundary.
-    # Production expiry is now a separate 5-minute outcome horizon so overlapping
-    # result watchers never block or delay the next 5-minute cycle.
+    # The Brain/AI strategy itself is unchanged; only the scheduling cadence
+    # and the requested expiry are changed for DEMO analysis.
+    # Day signal session: every 5 minutes. Signal is fixed at target-30s;
+    # the 1-minute DEMO entry/expiry boundary is the exact 5-minute target.
     SIGNAL_INTERVAL=300.0
     SIGNAL_LEADS=(30.0,30.0)
     SCAN_OFFSETS=CYCLE_SCAN_OFFSETS
@@ -5106,7 +5107,7 @@ async def cycle_loop():
         elif strategy in {"AVWAP_VOLUME_PROFILE","PRO_OTC_STRUCTURE_CONTINUATION"} and direction in {"UP","DOWN"}:
             x["expiry_minutes"]=int(BRAIN.choose_expiry(strategy=strategy,pair=x.get("pair"),direction=direction,live_quality=technical))
             if int(x["expiry_minutes"]) not in SIGNAL_EXPIRY_OPTIONS:
-                x["expiry_minutes"]=5
+                x["expiry_minutes"]=2 if technical>=97 else 1
             x["expiry_selection_basis"]="technical_boundary"
         else:
             x["expiry_minutes"]=5 if FIVE_MINUTE_EXPIRY_MODE else 1
@@ -5329,90 +5330,85 @@ async def cycle_loop():
                 return False
 
         if strategy_name==ALLOWED_STRATEGY:
-            # Alligator is a confirmation/timing layer for AVWAP+Volume Profile.
-            # A NEW Alligator breakout is NOT required at the Telegram boundary.
-            # Pass-5 already validated the strategy; the boundary only rechecks
-            # that the Alligator state still belongs to the newest closed M1 candle.
+            # Exact Alligator breakout timing gate.
+            # The direction is still owned by the strategy brain. Alligator only
+            # decides whether a NEW breakout event is happening on this latest
+            # closed M1 candle, preventing old breakouts from generating late entry.
             ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
-            if ind.get("alligator_timing_ok") is not True:
+            alligator_breakout_ok=(
+                ind.get("alligator_breakout_confirmed") is True
+                and str(ind.get("alligator_breakout_direction") or "").upper()==expected
+            )
+            breakout_ts=ind.get("alligator_breakout_candle_ts")
+            breakout_age=(
+                time.time()-(float(breakout_ts)+60.0)
+                if breakout_ts else 9999.0
+            )
+            if not alligator_breakout_ok or breakout_age<0.0 or breakout_age>90.0:
+                # Recompute the same deterministic brain on the latest closed M1
+                # candles. This is local-only and does not alter the 5-minute
+                # scheduler timing.
+                try:
+                    boundary_asset=next(
+                        (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
+                        None
+                    )
+                    boundary_closed=_closed_candles(
+                        STATE.get("candles",{}).get(p,[]),time.time()
+                    )
+                    boundary_analysis=_prepare_volume_candles(p,boundary_closed)
+                    boundary_refreshed=analyze_asset(
+                        boundary_asset or {"pair":p,"display_name":p},
+                        boundary_analysis,
+                        entry,
+                        forced_strategy=strategy_name,
+                        require_high_volume=False,
+                    )
+                    refreshed_ind=dict(
+                        boundary_refreshed.get("indicators")
+                        or boundary_refreshed.get("indicator_context")
+                        or {}
+                    ) if boundary_refreshed else {}
+                    refreshed_direction=(
+                        str(boundary_refreshed.get("direction") or "").upper()
+                        if boundary_refreshed else ""
+                    )
+                    if (
+                        boundary_refreshed
+                        and refreshed_direction==expected
+                        and bool(refreshed_ind.get("alligator_breakout_confirmed"))
+                    ):
+                        candidate.update(boundary_refreshed)
+                        ind=refreshed_ind
+                        breakout_ts=ind.get("alligator_breakout_candle_ts")
+                        breakout_age=(
+                            time.time()-(float(breakout_ts)+60.0)
+                            if breakout_ts else 9999.0
+                        )
+                        alligator_breakout_ok=(
+                            str(ind.get("alligator_breakout_direction") or "").upper()==expected
+                        )
+                        log.info(
+                            "FINAL_ALLIGATOR_BREAKOUT_BOUNDARY_RECHECKED cycle=%s pair=%s "
+                            "direction=%s candle_ts=%s age=%.3f",
+                            cycle_id,p,expected,breakout_ts,float(breakout_age)
+                        )
+                except Exception as refresh_error:
+                    log.warning(
+                        "FINAL_ALLIGATOR_BREAKOUT_RECHECK_FAILED cycle=%s pair=%s type=%s message=%s",
+                        cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
+                    )
+            if (
+                not alligator_breakout_ok
+                or breakout_age<0.0
+                or breakout_age>90.0
+            ):
                 log.info(
-                    "FINAL_LIVE_ALLIGATOR_TIMING_REJECTED cycle=%s pair=%s direction=%s "
-                    "reason=timing_flag_not_confirmed next_asset=TRUE",
-                    cycle_id,p,expected
+                    "FINAL_ALLIGATOR_BREAKOUT_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=no_new_closed_m1_breakout breakout_candle_ts=%s age=%.3f next_asset=TRUE",
+                    cycle_id,p,expected,breakout_ts,float(breakout_age)
                 )
                 return False
-            try:
-                alligator_candle_ts=int(
-                    ind.get("alligator_latest_closed_candle_ts")
-                    or candidate.get("entry_candle_ts") or 0
-                )
-            except (TypeError,ValueError):
-                alligator_candle_ts=0
-            current_closed=_closed_candles(
-                STATE.get("candles",{}).get(p,[]),time.time()
-            )
-            current_closed_ts=(
-                int(_candle_epoch(current_closed[-1]))
-                if current_closed and _candle_epoch(current_closed[-1]) is not None
-                else 0
-            )
-            if alligator_candle_ts<=0 or (current_closed_ts and alligator_candle_ts!=current_closed_ts):
-                # A new M1 candle can legitimately close during the 30-second
-                # pre-signal window. Re-evaluate the Alligator confirmation on
-                # the newest fully-closed candle instead of discarding the whole
-                # 5-minute slot. This is a confirmation refresh only: it cannot
-                # change the AVWAP+VP Brain direction.
-                if current_closed and current_closed_ts and alligator_candle_ts>0 and current_closed_ts-alligator_candle_ts<=60:
-                    try:
-                        refreshed_alligator=_alligator_confirmation(current_closed,expected)
-                    except Exception as refresh_error:
-                        refreshed_alligator={}
-                        log.info(
-                            "FINAL_LIVE_ALLIGATOR_REFRESH_FAILED cycle=%s pair=%s direction=%s "
-                            "type=%s message=%s next_asset=TRUE",
-                            cycle_id,p,expected,type(refresh_error).__name__,str(refresh_error)[:120]
-                        )
-                    if (
-                        bool(refreshed_alligator.get("ready"))
-                        and bool(refreshed_alligator.get("confirmed"))
-                        and bool(refreshed_alligator.get("timing_ok"))
-                    ):
-                        ind["alligator_timing_ok"]=True
-                        ind["alligator_confirmed"]=True
-                        ind["alligator_alignment_ready"]=True
-                        ind["alligator_aligned"]=bool(refreshed_alligator.get("aligned"))
-                        ind["alligator_sloping"]=bool(refreshed_alligator.get("sloping"))
-                        ind["alligator_price_position"]=bool(refreshed_alligator.get("price_position"))
-                        ind["alligator_jaw"]=refreshed_alligator.get("jaw")
-                        ind["alligator_teeth"]=refreshed_alligator.get("teeth")
-                        ind["alligator_lips"]=refreshed_alligator.get("lips")
-                        ind["alligator_latest_closed_candle_ts"]=refreshed_alligator.get("latest_closed_candle_ts")
-                        ind["alligator_closed_age_seconds"]=refreshed_alligator.get("closed_age_seconds")
-                        candidate["indicators"]=ind
-                        log.info(
-                            "FINAL_LIVE_ALLIGATOR_REFRESH_OK cycle=%s pair=%s direction=%s "
-                            "old_closed_ts=%s new_closed_ts=%s next_asset=TRUE",
-                            cycle_id,p,expected,alligator_candle_ts,current_closed_ts
-                        )
-                    else:
-                        log.info(
-                            "FINAL_LIVE_ALLIGATOR_REFRESH_REJECTED cycle=%s pair=%s direction=%s "
-                            "old_closed_ts=%s new_closed_ts=%s next_asset=TRUE",
-                            cycle_id,p,expected,alligator_candle_ts,current_closed_ts
-                        )
-                        return False
-                else:
-                    log.info(
-                        "FINAL_LIVE_ALLIGATOR_FRESHNESS_REJECTED cycle=%s pair=%s direction=%s "
-                        "alligator_candle_ts=%s current_closed_ts=%s next_asset=TRUE",
-                        cycle_id,p,expected,alligator_candle_ts,current_closed_ts
-                    )
-                    return False
-            log.info(
-                "FINAL_ALLIGATOR_CONFIRMATION_OK cycle=%s pair=%s direction=%s "
-                "fresh_closed_m1=%s breakout_required=False next_asset=TRUE",
-                cycle_id,p,expected,current_closed_ts or alligator_candle_ts
-            )
 
         else:
             log.info(
@@ -5733,24 +5729,19 @@ async def cycle_loop():
                     ind=refreshed_ind
                     candidate["indicators"]=ind
 
-                # In explicit 5M-expiry mode the completed 5M structure is
-                # authoritative. The currently closed M1 candle may pull back
-                # inside that 5M bar without invalidating the 5M continuation.
-                # Keep the M1 state as diagnostics only; do not let one M1 candle
-                # erase an otherwise valid 5M entry and starve the wall-clock slot.
+                # The latest closed 1m candle must still point in the selected direction.
                 latest_closed=boundary_closed[-1] if boundary_closed else None
                 if latest_closed:
                     latest_close=float(latest_closed.get("close",latest_closed.get("c")))
                     latest_open=float(latest_closed.get("open",latest_closed.get("o")))
-                    m1_same_direction=(
+                    if not (
                         latest_close>=latest_open if expected=="UP" else latest_close<=latest_open
-                    )
-                    if not m1_same_direction:
+                    ):
                         log.info(
-                            "FINAL_5M_CADENCE_M1_PULLBACK_ALLOWED cycle=%s pair=%s direction=%s "
-                            "reason=5m_structure_is_authoritative latest_open=%s latest_close=%s",
-                            cycle_id,p,expected,latest_open,latest_close
+                            "FINAL_5M_CADENCE_REJECTED cycle=%s pair=%s direction=%s reason=latest_closed_1m_direction_changed",
+                            cycle_id,p,expected
                         )
+                        return False
 
                 # Preserve authenticated live-activity integrity; never manufacture a quote.
                 high_tick_activity=_high_tick_activity_status(p,time.time())
@@ -6016,17 +6007,10 @@ async def cycle_loop():
             return False
 
         ts=target-signal_lead
-        # Keep the wall-clock 5-minute cycle authoritative while allowing a
-        # small scheduler/jitter grace at the 30-second delivery point. A
-        # sub-second/low-second event-loop slip must not discard an otherwise
-        # fully prepared signal; the entry/expiry timestamp remains the exact
-        # cycle target and the actual lag is logged for audit.
-        SIGNAL_DISPATCH_GRACE_SECONDS=3.0
-        if time.time() > ts+SIGNAL_DISPATCH_GRACE_SECONDS:
+        if time.time() > ts+1.00:
             log.info(
-                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=deadline_passed "
-                "dispatch_grace=%.1fs",
-                cycle_id,p,SIGNAL_DISPATCH_GRACE_SECONDS
+                "NO_VALID_SIGNAL_AT_SEND cycle=%s pair=%s reason=deadline_passed",
+                cycle_id,p
             )
             return False
 
@@ -7794,14 +7778,9 @@ async def cycle_loop():
                     break
 
         if not sent:
-            if boundary_lag>3.00:
+            if boundary_lag>1.00:
                 log.warning(
-                    "FINAL_BOUNDARY_MISSED cycle=%s lag_seconds=%.3f candidates=%s max_lag=3.00",
-                    cycle_id,boundary_lag,len(ranked_pool)
-                )
-            elif boundary_lag>1.00:
-                log.info(
-                    "FINAL_BOUNDARY_LATE_WITHIN_GRACE cycle=%s lag_seconds=%.3f candidates=%s max_lag=3.00",
+                    "FINAL_BOUNDARY_MISSED cycle=%s lag_seconds=%.3f candidates=%s max_lag=1.00",
                     cycle_id,boundary_lag,len(ranked_pool)
                 )
             if ranked_pool:
@@ -7837,10 +7816,7 @@ async def cycle_loop():
             )
             cycle_outcome="SKIPPED_NO_SETUP"
 
-        # Advance strictly from this cycle's target. Computing from current wall-clock
-        # time can point back to the same target when the signal is emitted near
-        # its boundary, causing a duplicate/late restart alignment.
-        next_target=int(target)+int(SIGNAL_INTERVAL)
+        next_target=(int(time.time())//int(SIGNAL_INTERVAL)+1)*int(SIGNAL_INTERVAL)
         next_cycle_id=int(next_target//SIGNAL_INTERVAL)
         next_signal=next_target-SIGNAL_LEADS[0 if (next_cycle_id%20 or 20)<=10 else 1]
         log.info(
