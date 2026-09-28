@@ -4416,7 +4416,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         len(raw),
         max(
             AI_DEEP_REVIEW_TOP_N,
-            volume_priority_top_n if volume_selected else 0
+            volume_priority_top_n if volume_enabled else 0
         )
     )
     top=raw if not deep_analysis else raw[:review_scope_n]
@@ -4425,7 +4425,7 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
             "AI_DEEP_REVIEW_SCOPE candidates=%d configured_top_n=%d volume_top_n=%d "
             "review_scope=%d volume_priority=%s",
             len(raw),AI_DEEP_REVIEW_TOP_N,volume_priority_top_n,
-            review_scope_n,bool(volume_selected)
+            review_scope_n,bool(volume_enabled)
         )
     if require_live_price:
         log.info(            "LIVE_PRICE_SELECTION_MODE source=authenticated_event1 candidates=%d deep=%s",
