@@ -5733,19 +5733,24 @@ async def cycle_loop():
                     ind=refreshed_ind
                     candidate["indicators"]=ind
 
-                # The latest closed 1m candle must still point in the selected direction.
+                # In explicit 5M-expiry mode the completed 5M structure is
+                # authoritative. The currently closed M1 candle may pull back
+                # inside that 5M bar without invalidating the 5M continuation.
+                # Keep the M1 state as diagnostics only; do not let one M1 candle
+                # erase an otherwise valid 5M entry and starve the wall-clock slot.
                 latest_closed=boundary_closed[-1] if boundary_closed else None
                 if latest_closed:
                     latest_close=float(latest_closed.get("close",latest_closed.get("c")))
                     latest_open=float(latest_closed.get("open",latest_closed.get("o")))
-                    if not (
+                    m1_same_direction=(
                         latest_close>=latest_open if expected=="UP" else latest_close<=latest_open
-                    ):
+                    )
+                    if not m1_same_direction:
                         log.info(
-                            "FINAL_5M_CADENCE_REJECTED cycle=%s pair=%s direction=%s reason=latest_closed_1m_direction_changed",
-                            cycle_id,p,expected
+                            "FINAL_5M_CADENCE_M1_PULLBACK_ALLOWED cycle=%s pair=%s direction=%s "
+                            "reason=5m_structure_is_authoritative latest_open=%s latest_close=%s",
+                            cycle_id,p,expected,latest_open,latest_close
                         )
-                        return False
 
                 # Preserve authenticated live-activity integrity; never manufacture a quote.
                 high_tick_activity=_high_tick_activity_status(p,time.time())
