@@ -1456,7 +1456,7 @@ ALLOW_PROXY_LIVE_FALLBACK=os.getenv("ALLOW_PROXY_LIVE_FALLBACK","1").strip().low
 # current 1-minute candle as the live-quote activity fallback. This does not create
 # synthetic data; it only removes the false dependency on an Event-1 subscription.
 ALLOW_AUTHENTICATED_CANDLE_LIVE_FALLBACK=os.getenv("ALLOW_AUTHENTICATED_CANDLE_LIVE_FALLBACK","1").strip().lower() in {"1","true","yes","on"}
-AI_DEEP_REVIEW_TOP_N=max(1,min(5,int(os.getenv("AI_DEEP_REVIEW_TOP_N","5") or 5)))
+AI_DEEP_REVIEW_TOP_N=max(1,min(8,int(os.getenv("AI_DEEP_REVIEW_TOP_N","8") or 8)))
 # Preserve a fully reviewed candidate for the short exact-boundary window.
 # This prevents a transient provider/cache refresh from erasing a valid setup
 # after it has already passed the Brain + live-price gates.
@@ -1468,7 +1468,7 @@ CANDIDATE_CACHE_TTL=75.0
 # when a new closed candle forms.
 CANDIDATE_CACHE_HARD_REJECTED={}
 AI_PROVIDER_COOLDOWN={}
-AI_REVIEW_TIMEOUT=3.2
+AI_REVIEW_TIMEOUT=2.0
 # Rotating account-wide live quote scan. It does not touch Brain timing; it only
 # keeps current account prices warm for analysis/candidate selection.
 ACCOUNT_LIVE_SCAN_BATCH=32
@@ -3373,6 +3373,65 @@ def _forecast_closed_direction(closed):
     return direction,float(score),float(d15/scale),float(d5/scale)
 
 
+def _strict_otc_5m_local_failsafe(candidate, closed):
+    """Confirm an already-qualified same-candle OTC 5M Brain setup locally.
+    
+    External AI is a corroboration/veto layer. This verifier never creates or
+    reverses direction and never bypasses the locked Candice Brain structure.
+    """
+    if (
+        not FIVE_MINUTE_EXPIRY_MODE
+        or not isinstance(candidate,dict)
+        or str(candidate.get("strategy") or "").upper()!=OTC_STRATEGY
+    ):
+        return None
+    closed=list(closed or [])
+    if not closed:
+        return None
+    ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
+    direction=str(candidate.get("direction") or "").upper()
+    if direction not in {"UP","DOWN"}:
+        return None
+    try:
+        confidence=int(candidate.get("confidence") or 0)
+        latest_ts=int(float(closed[-1].get("time")))
+        entry_ts=int(float(ind.get("otc_entry_candle_ts") or candidate.get("entry_candle_ts")))
+    except (TypeError,ValueError):
+        return None
+    if entry_ts!=latest_ts or confidence<90:
+        return None
+    mode=str(ind.get("five_minute_mode") or "").upper()
+    if mode not in {"CADENCE_CONTINUATION_V1","M1_STRUCTURE_5M_EXPIRY_FALLBACK_V1"}:
+        return None
+    expected_bias="BULLISH" if direction=="UP" else "BEARISH"
+    primary_bias=str(ind.get("five_minute_primary_bias") or ind.get("otc_market_bias") or "").upper()
+    if primary_bias!=expected_bias:
+        return None
+    try:
+        setup_age=float(ind.get("five_minute_setup_age_seconds") or 9999.0)
+    except (TypeError,ValueError):
+        setup_age=9999.0
+    if setup_age>FIVE_MINUTE_MAX_SETUP_AGE_SECONDS:
+        return None
+    if not all(ind.get(k) is True for k in (
+        "five_minute_directional_ok","five_minute_structure_ok",
+        "five_minute_momentum_ok","five_minute_entry_candle_ok",
+        "otc_bos_confirmed","otc_displacement_confirmed",
+        "otc_retest_confirmed","otc_hold_confirmed",
+        "otc_confirmation_candle_confirmed","m1_continuation_ok",
+        "exact_live_setup",
+    )):
+        return None
+    return {
+        "direction":direction,
+        "confidence":confidence,
+        "reason":"Deterministic same-candle 5M OTC Brain verifier; external AI unavailable",
+        "provider":"CANDICE_LOCAL_5M_FAILSAFE",
+        "mode":mode,
+        "entry_candle_ts":latest_ts,
+    }
+
+
 def _score_forecast_candidate(candidate, now_ts):
     if not isinstance(candidate,dict) or not candidate.get("pair"):
         return None
@@ -4492,47 +4551,22 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                     d=None
                 AI_REVIEW_CACHE[cache_key]=(time.time(),d)
 
-        # If the AI router short-circuits with None during its global/provider
-        # cooldown, the exception-based local failsafe above is never reached.
-        # Re-run the same deterministic 5M checks here so provider outages cannot
-        # erase an otherwise-qualified OTC setup without changing direction/strategy.
+        # Provider cooldown/outage must not erase a strict OTC 5M setup.
         if (
             d is None
             and deep_analysis
             and FIVE_MINUTE_EXPIRY_MODE
             and str(x.get("strategy") or "").upper()==OTC_STRATEGY
         ):
-            _fb_direction=str(x.get("direction") or "").upper()
-            _fb_confidence=int(x.get("confidence") or 0)
-            _fb_ind=dict(x.get("indicators") or x.get("indicator_context") or {})
-            _fb_mode=str(_fb_ind.get("five_minute_mode") or "").upper()
-            _fb_entry_ts=x.get("entry_candle_ts")
-            _fb_latest_ts=(closed[-1].get("time") if closed else None)
-            _fb_ok=(
-                _fb_direction in {"UP","DOWN"}
-                and _fb_confidence>=90
-                and _fb_mode=="CADENCE_CONTINUATION_V1"
-                and _fb_entry_ts==_fb_latest_ts
-                and _fb_ind.get("five_minute_directional_ok") is True
-                and _fb_ind.get("five_minute_structure_ok") is True
-                and _fb_ind.get("five_minute_momentum_ok") is True
-                and _fb_ind.get("five_minute_entry_candle_ok") is True
-                and str(_fb_ind.get("five_minute_primary_bias") or "").upper()==(
-                    "BULLISH" if _fb_direction=="UP" else "BEARISH"
-                )
-            )
-            if _fb_ok:
-                d={
-                    "direction":_fb_direction,
-                    "confidence":max(75,_fb_confidence),
-                    "reason":"Local zero-network 5M structure verifier; external AI unavailable",
-                    "provider":"CANDICE_LOCAL_5M_FAILSAFE",
-                }
+            _local_failsafe=_strict_otc_5m_local_failsafe(x,closed)
+            if _local_failsafe:
+                d=_local_failsafe
                 AI_REVIEW_CACHE[cache_key]=(time.time(),d)
                 log.info(
                     "AI_PRE_SIGNAL_VERIFY_LOCAL_FAILSAFE pair=%s direction=%s "
-                    "confidence=%s entry_candle_ts=%s reason=provider_short_circuit",
-                    x["pair"],_fb_direction,_fb_confidence,_fb_entry_ts
+                    "confidence=%s entry_candle_ts=%s mode=%s reason=provider_unavailable",
+                    x["pair"],d["direction"],d["confidence"],
+                    d.get("entry_candle_ts"),d.get("mode")
                 )
 
         local_confidence=int(x.get("confidence") or 0)
@@ -4602,7 +4636,11 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                     local_confidence,ai_confidence,
                     d.get("provider") if isinstance(d,dict) else "UNAVAILABLE"
                 )
-                CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
+                if (
+                    isinstance(d,dict)
+                    and str(d.get("direction") or "").upper() in {"UP","DOWN"}
+                ):
+                    CANDIDATE_CACHE_HARD_REJECTED[cache_key]=time.time()
                 return None
 
         # Strict proxy-volume fallback for brokers that expose zero candle volume.
@@ -7317,10 +7355,9 @@ async def cycle_loop():
                                         _item["ai_verified_confidence"]=_ai_verified_confidence_before
                                         _item["ai_verified_entry_candle_ts"]=_ai_verified_entry_before
 
-                                        # The current closed M1 candle can advance after pass 4.
-                                        # When external AI is unavailable, re-validate that NEW
-                                        # same-candle entry with the existing deterministic 5M
-                                        # failsafe rather than carrying a stale AI verdict forward.
+                                        # Re-validate a new same-candle OTC entry locally when
+                                        # external AI is unavailable or its earlier verdict is stale.
+                                        # Both explicit 5M modes use the same strict Brain gates.
                                         if (
                                             strategy_name==OTC_STRATEGY
                                             and FIVE_MINUTE_EXPIRY_MODE
@@ -7329,35 +7366,42 @@ async def cycle_loop():
                                                 or _ai_verified_entry_before!=refreshed.get("entry_candle_ts")
                                             )
                                         ):
-                                            _ri=dict(refreshed.get("indicators") or refreshed.get("indicator_features") or {})
-                                            _rd=str(refreshed.get("direction") or "").upper()
-                                            _rc=int(refreshed.get("confidence") or 0)
-                                            _re=str(_ri.get("five_minute_mode") or "").upper()
-                                            _rt=refreshed.get("entry_candle_ts")
-                                            _rlatest=(closed_1m[-1].get("time") if closed_1m else None)
-                                            _rok=(
-                                                _rd==expected
-                                                and _rc>=90
-                                                and _re=="CADENCE_CONTINUATION_V1"
-                                                and _rt==_rlatest
-                                                and _ri.get("five_minute_directional_ok") is True
-                                                and _ri.get("five_minute_structure_ok") is True
-                                                and _ri.get("five_minute_momentum_ok") is True
-                                                and _ri.get("five_minute_entry_candle_ok") is True
-                                                and str(_ri.get("five_minute_primary_bias") or "").upper()==(
-                                                    "BULLISH" if expected=="UP" else "BEARISH"
-                                                )
-                                            )
-                                            if _rok:
+                                            _local_gate=_strict_otc_5m_local_failsafe(refreshed,closed_1m)
+                                            if _local_gate and str(_local_gate.get("direction") or "").upper()==expected:
                                                 _item["ai_verified"]=True
                                                 _item["ai_verified_direction"]=expected
-                                                _item["ai_verified_confidence"]=_rc
-                                                _item["ai_verified_entry_candle_ts"]=_rt
+                                                _item["ai_verified_confidence"]=int(_local_gate.get("confidence") or 0)
+                                                _item["ai_verified_entry_candle_ts"]=refreshed.get("entry_candle_ts")
                                                 _item["ai_verification_mode"]="LOCAL_FAILSAFE"
                                                 log.info(
                                                     "FINAL_OTC_LOCAL_FAILSAFE_REFRESHED cycle=%s pair=%s "
-                                                    "direction=%s entry_candle_ts=%s confidence=%s",
-                                                    cycle_id,p,expected,_rt,_rc
+                                                    "direction=%s entry_candle_ts=%s confidence=%s mode=%s",
+                                                    cycle_id,p,expected,
+                                                    refreshed.get("entry_candle_ts"),
+                                                    _local_gate.get("confidence"),
+                                                    _local_gate.get("mode")
+                                                )
+
+                                        # One last local recovery is intentionally performed just
+                                        # before the authoritative OTC AI-consistency check.
+                                        if (
+                                            strategy_name==OTC_STRATEGY
+                                            and FIVE_MINUTE_EXPIRY_MODE
+                                            and not _item["ai_verified"]
+                                        ):
+                                            _boundary_local_gate=_strict_otc_5m_local_failsafe(refreshed,closed_1m)
+                                            if _boundary_local_gate and str(_boundary_local_gate.get("direction") or "").upper()==expected:
+                                                _item["ai_verified"]=True
+                                                _item["ai_verified_direction"]=expected
+                                                _item["ai_verified_confidence"]=int(_boundary_local_gate.get("confidence") or 0)
+                                                _item["ai_verified_entry_candle_ts"]=refreshed.get("entry_candle_ts")
+                                                _item["ai_verification_mode"]="LOCAL_FAILSAFE"
+                                                log.info(
+                                                    "FINAL_OTC_LOCAL_FAILSAFE_BOUNDARY_RECOVERY cycle=%s pair=%s "
+                                                    "direction=%s confidence=%s mode=%s",
+                                                    cycle_id,p,expected,
+                                                    _boundary_local_gate.get("confidence"),
+                                                    _boundary_local_gate.get("mode")
                                                 )
 
                                         if (
