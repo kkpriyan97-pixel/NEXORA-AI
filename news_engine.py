@@ -67,9 +67,9 @@ def _parse_ts(value: Any) -> float | None:
 
 
 def _currency_from_row(row: dict[str, Any]) -> str:
-    for key in ("Currency", "currency", "CountryCode", "country_code"):
+    for key in ("Currency", "currency", "CountryCode", "country_code", "country"):
         value = str(row.get(key) or "").strip().upper()
-        if value and len(value) == 3:
+        if value and len(value) == 3 and value.isalpha():
             return value
     country = str(row.get("Country") or row.get("country") or "").strip().lower()
     mapping = {
@@ -98,7 +98,8 @@ def normalize_event(row: dict[str, Any], source: str = "") -> NewsEvent | None:
     try:
         impact = int(float(impact_raw or 0))
     except (TypeError, ValueError):
-        impact = 0
+        impact_name = str(impact_raw or "").strip().lower()
+        impact = {"high": 3, "medium": 2, "med": 2, "low": 1, "holiday": 0}.get(impact_name, 0)
     if impact >= 3:
         impact = 3
     elif impact == 2:
@@ -111,6 +112,8 @@ def normalize_event(row: dict[str, Any], source: str = "") -> NewsEvent | None:
         or row.get("event")
         or row.get("Category")
         or row.get("category")
+        or row.get("Title")
+        or row.get("title")
         or "Economic event"
     ).strip()
     country = str(row.get("Country") or row.get("country") or "").strip()
@@ -118,6 +121,7 @@ def normalize_event(row: dict[str, Any], source: str = "") -> NewsEvent | None:
         row.get("CalendarID")
         or row.get("CalendarId")
         or row.get("calendar_id")
+        or row.get("id")
         or f"{country}:{event_name}:{int(ts)}"
     )
     return NewsEvent(
@@ -226,7 +230,13 @@ def news_context(pair: str, now_ts: float, events: list[NewsEvent]) -> dict[str,
 class NewsCalendarClient:
     def __init__(self) -> None:
         self.api_key = os.getenv("TRADING_ECONOMICS_API_KEY", "").strip()
-        self.custom_url = os.getenv("NEXORA_NEWS_CALENDAR_URL", "").strip()
+        # A public weekly ForexFactory/FairEconomy JSON feed can provide the
+        # scheduled calendar without a paid key. It is polled conservatively;
+        # Trading Economics remains preferred when its API key is configured.
+        self.custom_url = os.getenv(
+            "NEXORA_NEWS_CALENDAR_URL",
+            "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+        ).strip()
         self.timeout = max(2.0, min(8.0, float(os.getenv("NEXORA_NEWS_TIMEOUT", "5") or 5)))
         self.lookahead_hours = max(2, min(48, int(os.getenv("NEXORA_NEWS_LOOKAHEAD_HOURS", "24") or 24)))
 
@@ -255,7 +265,10 @@ class NewsCalendarClient:
                 response = await client.get(url)
                 response.raise_for_status()
                 payload = response.json()
-            events = parse_calendar_payload(payload, source="tradingeconomics" if self.api_key and not self.custom_url else "custom")
+            source_name = "tradingeconomics" if self.api_key and not self.custom_url else (
+                "forexfactory_weekly" if "faireconomy.media" in url else "custom"
+            )
+            events = parse_calendar_payload(payload, source=source_name)
             now = datetime.now(timezone.utc).timestamp()
             horizon = float(self.lookahead_hours * 3600)
             events = [e for e in events if -900.0 <= e.timestamp_utc - now <= horizon]
