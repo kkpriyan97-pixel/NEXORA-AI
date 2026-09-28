@@ -10,7 +10,7 @@ import httpx
 from olymptrade_ws import OlympTradeClient
 from olymptrade_ws.olympconfig import parameters
 from brain_rules import ActiveSignal,BrainState,rank_signal_candidates,COOLDOWN_SECONDS
-from candice_brain import analyze_asset,OTC_STRATEGY,ALLOWED_STRATEGY,detect_alligator_breakout
+from candice_brain import analyze_asset,OTC_STRATEGY,ALLOWED_STRATEGY,detect_alligator_breakout,FIVE_MINUTE_MAX_SETUP_AGE_SECONDS
 from ai_engine import snapshot_from_asset,ai_environment_status
 from ai_router import analyze_with_fallback,review_result_with_fallback
 from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot_async, world_learning_loop
