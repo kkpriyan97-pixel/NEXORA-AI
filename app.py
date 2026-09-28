@@ -4225,6 +4225,49 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
                     d=None
                 AI_REVIEW_CACHE[cache_key]=(time.time(),d)
 
+        # If the AI router short-circuits with None during its global/provider
+        # cooldown, the exception-based local failsafe above is never reached.
+        # Re-run the same deterministic 5M checks here so provider outages cannot
+        # erase an otherwise-qualified OTC setup without changing direction/strategy.
+        if (
+            d is None
+            and deep_analysis
+            and FIVE_MINUTE_EXPIRY_MODE
+            and str(x.get("strategy") or "").upper()==OTC_STRATEGY
+        ):
+            _fb_direction=str(x.get("direction") or "").upper()
+            _fb_confidence=int(x.get("confidence") or 0)
+            _fb_ind=dict(x.get("indicators") or x.get("indicator_context") or {})
+            _fb_mode=str(_fb_ind.get("five_minute_mode") or "").upper()
+            _fb_entry_ts=x.get("entry_candle_ts")
+            _fb_latest_ts=(closed[-1].get("time") if closed else None)
+            _fb_ok=(
+                _fb_direction in {"UP","DOWN"}
+                and _fb_confidence>=90
+                and _fb_mode=="CADENCE_CONTINUATION_V1"
+                and _fb_entry_ts==_fb_latest_ts
+                and _fb_ind.get("five_minute_directional_ok") is True
+                and _fb_ind.get("five_minute_structure_ok") is True
+                and _fb_ind.get("five_minute_momentum_ok") is True
+                and _fb_ind.get("five_minute_entry_candle_ok") is True
+                and str(_fb_ind.get("five_minute_primary_bias") or "").upper()==(
+                    "BULLISH" if _fb_direction=="UP" else "BEARISH"
+                )
+            )
+            if _fb_ok:
+                d={
+                    "direction":_fb_direction,
+                    "confidence":max(75,_fb_confidence),
+                    "reason":"Local zero-network 5M structure verifier; external AI unavailable",
+                    "provider":"CANDICE_LOCAL_5M_FAILSAFE",
+                }
+                AI_REVIEW_CACHE[cache_key]=(time.time(),d)
+                log.info(
+                    "AI_PRE_SIGNAL_VERIFY_LOCAL_FAILSAFE pair=%s direction=%s "
+                    "confidence=%s entry_candle_ts=%s reason=provider_short_circuit",
+                    x["pair"],_fb_direction,_fb_confidence,_fb_entry_ts
+                )
+
         local_confidence=int(x.get("confidence") or 0)
         local=x.copy()
         local.update({
@@ -6647,8 +6690,8 @@ async def cycle_loop():
                         candidate=await asyncio.wait_for(
                             final_candidate(
                                 require_live_price=False,
-                                deep_analysis=True,
-                                use_cached_only=False,
+                                deep_analysis=False,
+                                use_cached_only=True,
                                 return_ranked=True,
                                 focus_pairs=live_breakout_pairs,
                             ),
@@ -6662,8 +6705,8 @@ async def cycle_loop():
                         candidate=await asyncio.wait_for(
                             final_candidate(
                                 require_live_price=False,
-                                deep_analysis=True,
-                                use_cached_only=False,
+                                deep_analysis=False,
+                                use_cached_only=True,
                                 return_ranked=True,
                             ),
                             timeout=max(1.0,remaining-0.50)
@@ -6721,6 +6764,37 @@ async def cycle_loop():
                             ),
                             timeout=max(1.0,remaining-0.50)
                         )
+
+                if pass_no==5:
+                    # Preserve any pass-4 candidates that already completed deep Brain+AI
+                    # verification. Pass 5 may discover a newer local candidate, but it must
+                    # not discard a previously verified candidate simply because this local-only
+                    # refresh did not carry external-AI metadata forward.
+                    _deep_pool=[
+                        x.copy() for x in candidate_pool.values()
+                        if isinstance(x,dict) and bool(x.get("deep_verified"))
+                    ]
+                    _current_pool=(
+                        [x for x in candidate if isinstance(x,dict)]
+                        if isinstance(candidate,list)
+                        else [candidate] if isinstance(candidate,dict) else []
+                    )
+                    _seen_ids=set()
+                    _merged_pool=[]
+                    for _entry in _deep_pool+_current_pool:
+                        _identity=(
+                            str(_entry.get("pair") or ""),
+                            str(_entry.get("entry_candle_ts")),
+                            str(_entry.get("direction") or "").upper(),
+                            str(_entry.get("strategy") or "").upper(),
+                            str(_entry.get("self_strategy_version") or ""),
+                        )
+                        if not _identity[0] or _identity in _seen_ids:
+                            continue
+                        _seen_ids.add(_identity)
+                        _merged_pool.append(_entry)
+                    if _merged_pool:
+                        candidate=rank_signal_candidates(_merged_pool)[:100]
 
                 if isinstance(candidate,list):
                     selected=candidate[:100]
@@ -6820,10 +6894,10 @@ async def cycle_loop():
                                         pass_no,type(e).__name__,str(e)[:120]
                                     )
                         if pass_no==5:
-                            # Pass 5 is deliberately 15 seconds before the exact signal
-                            # boundary. Perform the expensive closed-candle/higher-timeframe
-                            # confirmation here and reserve the boundary itself for only
-                            # fresh-tick validation + Telegram delivery.
+                            # Pass 5 is deliberately 60 seconds before the exact signal
+                            # boundary. Reuse deep-verified candidates from pass 4 and keep
+                            # this pass local-only so the exact 30-second delivery boundary
+                            # cannot be consumed by external AI/network latency.
                             remaining_to_signal=max(0.0,signal_at-time.time())
                             final_reference=time.time()
                             _final_ranked=sorted(
@@ -6975,12 +7049,56 @@ async def cycle_loop():
                                         _item["ai_verified_direction"]=_ai_verified_direction_before
                                         _item["ai_verified_confidence"]=_ai_verified_confidence_before
                                         _item["ai_verified_entry_candle_ts"]=_ai_verified_entry_before
+
+                                        # The current closed M1 candle can advance after pass 4.
+                                        # When external AI is unavailable, re-validate that NEW
+                                        # same-candle entry with the existing deterministic 5M
+                                        # failsafe rather than carrying a stale AI verdict forward.
+                                        if (
+                                            strategy_name==OTC_STRATEGY
+                                            and FIVE_MINUTE_EXPIRY_MODE
+                                            and (
+                                                not _ai_verified_before
+                                                or _ai_verified_entry_before!=refreshed.get("entry_candle_ts")
+                                            )
+                                        ):
+                                            _ri=dict(refreshed.get("indicators") or refreshed.get("indicator_features") or {})
+                                            _rd=str(refreshed.get("direction") or "").upper()
+                                            _rc=int(refreshed.get("confidence") or 0)
+                                            _re=str(_ri.get("five_minute_mode") or "").upper()
+                                            _rt=refreshed.get("entry_candle_ts")
+                                            _rlatest=(closed_1m[-1].get("time") if closed_1m else None)
+                                            _rok=(
+                                                _rd==expected
+                                                and _rc>=90
+                                                and _re=="CADENCE_CONTINUATION_V1"
+                                                and _rt==_rlatest
+                                                and _ri.get("five_minute_directional_ok") is True
+                                                and _ri.get("five_minute_structure_ok") is True
+                                                and _ri.get("five_minute_momentum_ok") is True
+                                                and _ri.get("five_minute_entry_candle_ok") is True
+                                                and str(_ri.get("five_minute_primary_bias") or "").upper()==(
+                                                    "BULLISH" if expected=="UP" else "BEARISH"
+                                                )
+                                            )
+                                            if _rok:
+                                                _item["ai_verified"]=True
+                                                _item["ai_verified_direction"]=expected
+                                                _item["ai_verified_confidence"]=_rc
+                                                _item["ai_verified_entry_candle_ts"]=_rt
+                                                _item["ai_verification_mode"]="LOCAL_FAILSAFE"
+                                                log.info(
+                                                    "FINAL_OTC_LOCAL_FAILSAFE_REFRESHED cycle=%s pair=%s "
+                                                    "direction=%s entry_candle_ts=%s confidence=%s",
+                                                    cycle_id,p,expected,_rt,_rc
+                                                )
+
                                         if (
                                             strategy_name==OTC_STRATEGY
                                             and (
-                                                not _ai_verified_before
-                                                or str(_ai_verified_direction_before or "")!=expected
-                                                or _ai_verified_entry_before!=refreshed.get("entry_candle_ts")
+                                                not _item["ai_verified"]
+                                                or str(_item.get("ai_verified_direction") or "")!=expected
+                                                or _item.get("ai_verified_entry_candle_ts")!=refreshed.get("entry_candle_ts")
                                             )
                                         ):
                                             reason="otc_ai_verification_missing_or_stale"
