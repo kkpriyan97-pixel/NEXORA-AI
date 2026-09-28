@@ -10,7 +10,7 @@ import httpx
 from olymptrade_ws import OlympTradeClient
 from olymptrade_ws.olympconfig import parameters
 from brain_rules import ActiveSignal,BrainState,rank_signal_candidates,COOLDOWN_SECONDS
-from candice_brain import analyze_asset,OTC_STRATEGY,ALLOWED_STRATEGY,detect_alligator_breakout,FIVE_MINUTE_MAX_SETUP_AGE_SECONDS
+from candice_brain import analyze_asset,OTC_STRATEGY,ALLOWED_STRATEGY,detect_alligator_breakout,FIVE_MINUTE_MAX_SETUP_AGE_SECONDS,FIVE_MINUTE_MAX_SETUP_AGE_SECONDS
 from ai_engine import snapshot_from_asset,ai_environment_status
 from ai_router import analyze_with_fallback,review_result_with_fallback
 from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot_async, world_learning_loop
@@ -5614,6 +5614,73 @@ async def cycle_loop():
         # 15 seconds before the exact signal boundary. The signal second itself is
         # reserved for the fresh authenticated quote + delivery, eliminating the
         # previous ~200-300ms boundary race that caused valid setups to miss.
+        # FINAL OTC 5M boundary rescue:
+        # external AI/prep metadata may arrive late, so at the exact signal boundary
+        # re-run the locked deterministic Brain once on the latest closed M1 candles.
+        # This path is zero-network and cannot change/reverse Brain direction.
+        try:
+            _boundary_strategy=str(candidate.get("strategy") or "").upper()
+            if _boundary_strategy==OTC_STRATEGY and FIVE_MINUTE_EXPIRY_MODE:
+                _boundary_closed=_closed_candles(
+                    STATE.get("candles",{}).get(p,[]),time.time()
+                )
+                _boundary_asset=next(
+                    (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
+                    None
+                )
+                if _boundary_asset and len(_boundary_closed)>=60:
+                    _boundary_refreshed=analyze_asset(
+                        _boundary_asset,
+                        _prepare_volume_candles(p,_boundary_closed),
+                        entry,
+                        forced_strategy=OTC_STRATEGY,
+                        require_high_volume=False,
+                    )
+                    if (
+                        _boundary_refreshed
+                        and str(_boundary_refreshed.get("direction") or "").upper()==expected
+                        and str(_boundary_refreshed.get("strategy") or "").upper()==OTC_STRATEGY
+                    ):
+                        _boundary_gate=_strict_otc_5m_local_failsafe(
+                            _boundary_refreshed,_boundary_closed
+                        )
+                        if _boundary_gate:
+                            candidate.update(_boundary_refreshed)
+                            _boundary_ind=dict(
+                                _boundary_refreshed.get("indicators")
+                                or _boundary_refreshed.get("indicator_context")
+                                or {}
+                            )
+                            candidate["indicators"]=_boundary_ind
+                            candidate["ai_verified"]=True
+                            candidate["ai_verified_direction"]=expected
+                            candidate["ai_verified_confidence"]=int(_boundary_gate.get("confidence") or 0)
+                            candidate["ai_verified_entry_candle_ts"]=_boundary_refreshed.get("entry_candle_ts")
+                            candidate["ai_verification_mode"]="LOCAL_FAILSAFE_BOUNDARY"
+                            candidate["final_delivery_prepared_at"]=time.time()
+                            candidate["final_delivery_confirmed"]=True
+                            candidate["final_delivery_confirmation_reason"]="boundary_local_5m_failsafe"
+                            candidate["final_delivery_diagnostic"]={
+                                "engine":"CANDICE_LOCAL_5M_FAILSAFE",
+                                "entry_candle_ts":_boundary_refreshed.get("entry_candle_ts"),
+                                "mode":_boundary_gate.get("mode"),
+                                "confidence":_boundary_gate.get("confidence"),
+                            }
+                            log.info(
+                                "FINAL_OTC_LOCAL_FAILSAFE_BOUNDARY_SEND_GUARD cycle=%s pair=%s "
+                                "direction=%s confidence=%s entry_candle_ts=%s mode=%s",
+                                cycle_id,p,expected,_boundary_gate.get("confidence"),
+                                _boundary_refreshed.get("entry_candle_ts"),
+                                _boundary_gate.get("mode")
+                            )
+        except Exception as _boundary_guard_error:
+            log.info(
+                "FINAL_OTC_LOCAL_FAILSAFE_BOUNDARY_GUARD_FAILED cycle=%s pair=%s "
+                "type=%s message=%s",
+                cycle_id,p,type(_boundary_guard_error).__name__,
+                str(_boundary_guard_error)[:120]
+            )
+
         prepared_at=candidate.get("final_delivery_prepared_at")
         prepared_ok=bool(candidate.get("final_delivery_confirmed"))
         # Pass 5 is intentionally prepared at the configured signal lead
@@ -5678,90 +5745,13 @@ async def cycle_loop():
                 return False
 
         if strategy_name==ALLOWED_STRATEGY:
-            # Exact Alligator breakout timing gate.
-            # The direction is still owned by the strategy brain. Alligator only
-            # decides whether a NEW breakout event is happening on this latest
-            # closed M1 candle, preventing old breakouts from generating late entry.
-            ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
-            alligator_breakout_ok=(
-                ind.get("alligator_breakout_confirmed") is True
-                and str(ind.get("alligator_breakout_direction") or "").upper()==expected
-            )
-            breakout_ts=ind.get("alligator_breakout_candle_ts")
-            breakout_age=(
-                time.time()-(float(breakout_ts)+60.0)
-                if breakout_ts else 9999.0
-            )
-            if not alligator_breakout_ok or breakout_age<0.0 or breakout_age>90.0:
-                # Recompute the same deterministic brain on the latest closed M1
-                # candles. This is local-only and does not alter the 5-minute
-                # scheduler timing.
-                try:
-                    boundary_asset=next(
-                        (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
-                        None
-                    )
-                    boundary_closed=_closed_candles(
-                        STATE.get("candles",{}).get(p,[]),time.time()
-                    )
-                    boundary_analysis=_prepare_volume_candles(p,boundary_closed)
-                    boundary_refreshed=analyze_asset(
-                        boundary_asset or {"pair":p,"display_name":p},
-                        boundary_analysis,
-                        entry,
-                        forced_strategy=strategy_name,
-                        require_high_volume=False,
-                    )
-                    refreshed_ind=dict(
-                        boundary_refreshed.get("indicators")
-                        or boundary_refreshed.get("indicator_context")
-                        or {}
-                    ) if boundary_refreshed else {}
-                    refreshed_direction=(
-                        str(boundary_refreshed.get("direction") or "").upper()
-                        if boundary_refreshed else ""
-                    )
-                    if (
-                        boundary_refreshed
-                        and refreshed_direction==expected
-                        and bool(refreshed_ind.get("alligator_breakout_confirmed"))
-                    ):
-                        candidate.update(boundary_refreshed)
-                        ind=refreshed_ind
-                        breakout_ts=ind.get("alligator_breakout_candle_ts")
-                        breakout_age=(
-                            time.time()-(float(breakout_ts)+60.0)
-                            if breakout_ts else 9999.0
-                        )
-                        alligator_breakout_ok=(
-                            str(ind.get("alligator_breakout_direction") or "").upper()==expected
-                        )
-                        log.info(
-                            "FINAL_ALLIGATOR_BREAKOUT_BOUNDARY_RECHECKED cycle=%s pair=%s "
-                            "direction=%s candle_ts=%s age=%.3f",
-                            cycle_id,p,expected,breakout_ts,float(breakout_age)
-                        )
-                except Exception as refresh_error:
-                    log.warning(
-                        "FINAL_ALLIGATOR_BREAKOUT_RECHECK_FAILED cycle=%s pair=%s type=%s message=%s",
-                        cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
-                    )
-            if (
-                not alligator_breakout_ok
-                or breakout_age<0.0
-                or breakout_age>90.0
-            ):
-                log.info(
-                    "FINAL_ALLIGATOR_BREAKOUT_REJECTED cycle=%s pair=%s direction=%s "
-                    "reason=no_new_closed_m1_breakout breakout_candle_ts=%s age=%.3f next_asset=TRUE",
-                    cycle_id,p,expected,breakout_ts,float(breakout_age)
-                )
-                return False
-
-        else:
+            # AVWAP + Volume Profile is its own locked live strategy. The
+            # Alligator breakout detector is not a required delivery gate for it.
+            # Requiring a separate breakout event here was suppressing valid AVWAP
+            # setups at the exact 5-minute boundary.
             log.info(
                 "FINAL_ALLIGATOR_GATE_SKIPPED cycle=%s pair=%s strategy=%s direction=%s "
-                "reason=otc_strategy_uses_pro_structure_continuation",
+                "reason=avwap_volume_profile_has_native_structure_gate",
                 cycle_id,p,strategy_name,expected
             )
 
@@ -5800,131 +5790,8 @@ async def cycle_loop():
                 )
                 return False
 
-            # Re-validate the Alligator timing at the actual Telegram boundary.
-            # The terminal parameters are 13/8, 8/5 and 5/3. This is a local
-            # closed-candle integrity check; it does not create another scheduler
-            # or timer, so the 5-minute wall-clock cadence remains unchanged.
-            if ind.get("alligator_timing_ok") is not True:
-                log.info(
-                    "FINAL_LIVE_ALLIGATOR_TIMING_REJECTED cycle=%s pair=%s direction=%s "
-                    "reason=timing_flag_not_confirmed next_asset=TRUE",
-                    cycle_id,p,expected
-                )
-                return False
-            try:
-                alligator_candle_ts=int(
-                    ind.get("alligator_latest_closed_candle_ts")
-                    or candidate.get("entry_candle_ts") or 0
-                )
-            except (TypeError,ValueError):
-                alligator_candle_ts=0
-            current_closed=_closed_candles(
-                STATE.get("candles",{}).get(p,[]),time.time()
-            )
-            current_closed_ts=(
-                int(_candle_epoch(current_closed[-1]))
-                if current_closed and _candle_epoch(current_closed[-1]) is not None
-                else 0
-            )
-            alligator_age=(
-                time.time()-(float(alligator_candle_ts)+60.0)
-                if alligator_candle_ts else 9999.0
-            )
-            # A new M1 candle can close between SCAN_5 and the exact
-            # Telegram boundary. Refresh the same deterministic technical brain
-            # locally before rejecting the candidate. The refreshed result must
-            # keep the same strategy and direction; this only removes timing
-            # starvation caused by a one-candle-old prepared snapshot.
-            if (
-                alligator_candle_ts<=0
-                or current_closed_ts!=alligator_candle_ts
-                or alligator_age>90.0
-                or alligator_age<0.0
-            ):
-                try:
-                    boundary_asset=next(
-                        (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
-                        None
-                    )
-                    boundary_closed=_closed_candles(
-                        STATE.get("candles",{}).get(p,[]),time.time()
-                    )
-                    boundary_analysis=_prepare_volume_candles(p,boundary_closed)
-                    boundary_refreshed=analyze_asset(
-                        boundary_asset or {"pair":p,"display_name":p},
-                        boundary_analysis,
-                        entry,
-                        forced_strategy=ALLOWED_STRATEGY,
-                        require_high_volume=False,
-                    )
-                    if (
-                        boundary_refreshed
-                        and str(boundary_refreshed.get("strategy") or "").upper()==strategy_name
-                        and str(boundary_refreshed.get("direction") or "").upper()==expected
-                    ):
-                        candidate.update(boundary_refreshed)
-                        ind=dict(
-                            boundary_refreshed.get("indicators")
-                            or boundary_refreshed.get("indicator_context")
-                            or {}
-                        )
-                        candidate["indicators"]=ind
-                        try:
-                            alligator_candle_ts=int(
-                                ind.get("alligator_latest_closed_candle_ts")
-                                or candidate.get("entry_candle_ts") or 0
-                            )
-                        except (TypeError,ValueError):
-                            alligator_candle_ts=0
-                        current_closed=_closed_candles(
-                            STATE.get("candles",{}).get(p,[]),time.time()
-                        )
-                        current_closed_ts=(
-                            int(_candle_epoch(current_closed[-1]))
-                            if current_closed and _candle_epoch(current_closed[-1]) is not None
-                            else 0
-                        )
-                        alligator_age=(
-                            time.time()-(float(alligator_candle_ts)+60.0)
-                            if alligator_candle_ts else 9999.0
-                        )
-                        log.info(
-                            "FINAL_ALLIGATOR_BOUNDARY_RECHECKED cycle=%s pair=%s "
-                            "direction=%s candle_ts=%s current_closed_ts=%s age=%.3f",
-                            cycle_id,p,expected,alligator_candle_ts,
-                            current_closed_ts,alligator_age
-                        )
-                except Exception as refresh_error:
-                    log.warning(
-                        "FINAL_ALLIGATOR_BOUNDARY_RECHECK_FAILED cycle=%s pair=%s "
-                        "type=%s message=%s",
-                        cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
-                    )
-
-            if (
-                alligator_candle_ts<=0
-                or current_closed_ts!=alligator_candle_ts
-                or alligator_age>90.0
-                or alligator_age<0.0
-            ):
-                log.info(
-                    "FINAL_LIVE_ALLIGATOR_TIMING_REJECTED cycle=%s pair=%s direction=%s "
-                    "reason=closed_candle_changed_or_timing_stale indicator_candle_ts=%s "
-                    "current_closed_ts=%s age=%.3f next_asset=TRUE",
-                    cycle_id,p,expected,alligator_candle_ts,current_closed_ts,
-                    alligator_age
-                )
-                return False
-            ind["alligator_final_timing_verified"]=True
-            ind["alligator_final_timing_age_seconds"]=round(alligator_age,3)
-            log.info(
-                "FINAL_ALLIGATOR_TIMING_CONFIRMED cycle=%s pair=%s direction=%s "
-                "periods=13/8,8/5,5/3 candle_ts=%s age=%.3f spread_ratio=%s",
-                cycle_id,p,expected,
-                ind.get("alligator_latest_closed_candle_ts"),
-                float(ind.get("alligator_final_timing_age_seconds") or 0.0),
-                ind.get("alligator_spread_ratio")
-            )
+            # Native AVWAP + Volume Profile final checks continue below.
+            # No separate Alligator timing dependency is applied to this strategy.
 
             real_volume_ok=(ind.get("real_volume_verified") is True)
             fallback_value_position=str(ind.get("value_position") or "").upper()
