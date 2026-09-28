@@ -3325,7 +3325,14 @@ async def news_calendar_worker():
         # respect feed limits; a paid/managed calendar can use the tighter env
         # interval for near-real-time actual updates.
         interval=NEWS_REFRESH_SECONDS
-        if NEWS_STATE.get("source")=="forexfactory_weekly":
+        # A public FairEconomy/ForexFactory weekly feed must always obey the
+        # conservative polling floor, including after startup failures where
+        # NEWS_STATE has not yet received a successful source classification.
+        configured_news_url=str(getattr(NEWS_CALENDAR,"custom_url","") or "").lower()
+        if (
+            NEWS_STATE.get("source")=="forexfactory_weekly"
+            or "faireconomy.media" in configured_news_url
+        ):
             interval=max(120.0,interval)
         await asyncio.sleep(interval)
 
