@@ -1183,6 +1183,9 @@ NEWS_STATE={
     "last_log_at":0.0,
 }
 NEWS_REFRESH_SECONDS=max(15.0,min(120.0,float(os.getenv("NEXORA_NEWS_REFRESH_SECONDS","20") or 20)))
+NEWS_PUBLIC_POLL_MIN_SECONDS=120.0
+NEWS_PUBLIC_BACKOFF_MAX_SECONDS=900.0
+NEWS_PUBLIC_FAILURES=0
 NEWS_STATE_LOCK=asyncio.Lock()
 FORECAST_SENT_CYCLES=deque(maxlen=400)
 STATE["asset_integrity_blocks"]={}
@@ -3314,6 +3317,7 @@ async def refresh_news_calendar_once():
 
 async def news_calendar_worker():
     """Background-only news refresh; the 5-minute scheduler never awaits it."""
+    global NEWS_PUBLIC_FAILURES
     while True:
         try:
             await refresh_news_calendar_once()
@@ -3321,19 +3325,31 @@ async def news_calendar_worker():
             raise
         except Exception as e:
             log.info("NEWS_CALENDAR_WORKER_ERROR type=%s message=%s",type(e).__name__,str(e)[:160])
-        # The public weekly calendar is intentionally polled conservatively to
-        # respect feed limits; a paid/managed calendar can use the tighter env
-        # interval for near-real-time actual updates.
+        # The public weekly calendar is intentionally polled conservatively.
+        # On transient 429/timeouts, increase the sleep interval instead of
+        # immediately retrying at the minimum cadence. The previous valid
+        # context remains intact and the 5M scheduler is completely isolated.
         interval=NEWS_REFRESH_SECONDS
-        # A public FairEconomy/ForexFactory weekly feed must always obey the
-        # conservative polling floor, including after startup failures where
-        # NEWS_STATE has not yet received a successful source classification.
         configured_news_url=str(getattr(NEWS_CALENDAR,"custom_url","") or "").lower()
-        if (
+        is_public_feed=(
             NEWS_STATE.get("source")=="forexfactory_weekly"
             or "faireconomy.media" in configured_news_url
-        ):
-            interval=max(120.0,interval)
+        )
+        if is_public_feed:
+            last_error=str(NEWS_STATE.get("last_error") or "")
+            if last_error:
+                NEWS_PUBLIC_FAILURES=min(NEWS_PUBLIC_FAILURES+1,4)
+            else:
+                NEWS_PUBLIC_FAILURES=0
+            interval=min(
+                NEWS_PUBLIC_BACKOFF_MAX_SECONDS,
+                NEWS_PUBLIC_POLL_MIN_SECONDS * (2 ** NEWS_PUBLIC_FAILURES),
+            )
+            if NEWS_PUBLIC_FAILURES:
+                log.info(
+                    "NEWS_PUBLIC_BACKOFF failures=%s interval=%.0fs reason=preserve_previous_context",
+                    NEWS_PUBLIC_FAILURES,interval
+                )
         await asyncio.sleep(interval)
 
 
