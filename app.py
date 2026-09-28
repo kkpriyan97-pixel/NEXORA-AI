@@ -3321,7 +3321,13 @@ async def news_calendar_worker():
             raise
         except Exception as e:
             log.info("NEWS_CALENDAR_WORKER_ERROR type=%s message=%s",type(e).__name__,str(e)[:160])
-        await asyncio.sleep(NEWS_REFRESH_SECONDS)
+        # The public weekly calendar is intentionally polled conservatively to
+        # respect feed limits; a paid/managed calendar can use the tighter env
+        # interval for near-real-time actual updates.
+        interval=NEWS_REFRESH_SECONDS
+        if NEWS_STATE.get("source")=="forexfactory_weekly":
+            interval=max(120.0,interval)
+        await asyncio.sleep(interval)
 
 
 def _forecast_closed_direction(closed):
