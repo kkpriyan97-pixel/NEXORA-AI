@@ -5329,85 +5329,45 @@ async def cycle_loop():
                 return False
 
         if strategy_name==ALLOWED_STRATEGY:
-            # Exact Alligator breakout timing gate.
-            # The direction is still owned by the strategy brain. Alligator only
-            # decides whether a NEW breakout event is happening on this latest
-            # closed M1 candle, preventing old breakouts from generating late entry.
+            # Alligator is a confirmation/timing layer for AVWAP+Volume Profile.
+            # A NEW Alligator breakout is NOT required at the Telegram boundary.
+            # Pass-5 already validated the strategy; the boundary only rechecks
+            # that the Alligator state still belongs to the newest closed M1 candle.
             ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
-            alligator_breakout_ok=(
-                ind.get("alligator_breakout_confirmed") is True
-                and str(ind.get("alligator_breakout_direction") or "").upper()==expected
-            )
-            breakout_ts=ind.get("alligator_breakout_candle_ts")
-            breakout_age=(
-                time.time()-(float(breakout_ts)+60.0)
-                if breakout_ts else 9999.0
-            )
-            if not alligator_breakout_ok or breakout_age<0.0 or breakout_age>90.0:
-                # Recompute the same deterministic brain on the latest closed M1
-                # candles. This is local-only and does not alter the 5-minute
-                # scheduler timing.
-                try:
-                    boundary_asset=next(
-                        (a for a in STATE.get("assets") or [] if str(a.get("pair"))==str(p)),
-                        None
-                    )
-                    boundary_closed=_closed_candles(
-                        STATE.get("candles",{}).get(p,[]),time.time()
-                    )
-                    boundary_analysis=_prepare_volume_candles(p,boundary_closed)
-                    boundary_refreshed=analyze_asset(
-                        boundary_asset or {"pair":p,"display_name":p},
-                        boundary_analysis,
-                        entry,
-                        forced_strategy=strategy_name,
-                        require_high_volume=False,
-                    )
-                    refreshed_ind=dict(
-                        boundary_refreshed.get("indicators")
-                        or boundary_refreshed.get("indicator_context")
-                        or {}
-                    ) if boundary_refreshed else {}
-                    refreshed_direction=(
-                        str(boundary_refreshed.get("direction") or "").upper()
-                        if boundary_refreshed else ""
-                    )
-                    if (
-                        boundary_refreshed
-                        and refreshed_direction==expected
-                        and bool(refreshed_ind.get("alligator_breakout_confirmed"))
-                    ):
-                        candidate.update(boundary_refreshed)
-                        ind=refreshed_ind
-                        breakout_ts=ind.get("alligator_breakout_candle_ts")
-                        breakout_age=(
-                            time.time()-(float(breakout_ts)+60.0)
-                            if breakout_ts else 9999.0
-                        )
-                        alligator_breakout_ok=(
-                            str(ind.get("alligator_breakout_direction") or "").upper()==expected
-                        )
-                        log.info(
-                            "FINAL_ALLIGATOR_BREAKOUT_BOUNDARY_RECHECKED cycle=%s pair=%s "
-                            "direction=%s candle_ts=%s age=%.3f",
-                            cycle_id,p,expected,breakout_ts,float(breakout_age)
-                        )
-                except Exception as refresh_error:
-                    log.warning(
-                        "FINAL_ALLIGATOR_BREAKOUT_RECHECK_FAILED cycle=%s pair=%s type=%s message=%s",
-                        cycle_id,p,type(refresh_error).__name__,str(refresh_error)[:160]
-                    )
-            if (
-                not alligator_breakout_ok
-                or breakout_age<0.0
-                or breakout_age>90.0
-            ):
+            if ind.get("alligator_timing_ok") is not True:
                 log.info(
-                    "FINAL_ALLIGATOR_BREAKOUT_REJECTED cycle=%s pair=%s direction=%s "
-                    "reason=no_new_closed_m1_breakout breakout_candle_ts=%s age=%.3f next_asset=TRUE",
-                    cycle_id,p,expected,breakout_ts,float(breakout_age)
+                    "FINAL_LIVE_ALLIGATOR_TIMING_REJECTED cycle=%s pair=%s direction=%s "
+                    "reason=timing_flag_not_confirmed next_asset=TRUE",
+                    cycle_id,p,expected
                 )
                 return False
+            try:
+                alligator_candle_ts=int(
+                    ind.get("alligator_latest_closed_candle_ts")
+                    or candidate.get("entry_candle_ts") or 0
+                )
+            except (TypeError,ValueError):
+                alligator_candle_ts=0
+            current_closed=_closed_candles(
+                STATE.get("candles",{}).get(p,[]),time.time()
+            )
+            current_closed_ts=(
+                int(_candle_epoch(current_closed[-1]))
+                if current_closed and _candle_epoch(current_closed[-1]) is not None
+                else 0
+            )
+            if alligator_candle_ts<=0 or (current_closed_ts and alligator_candle_ts!=current_closed_ts):
+                log.info(
+                    "FINAL_LIVE_ALLIGATOR_FRESHNESS_REJECTED cycle=%s pair=%s direction=%s "
+                    "alligator_candle_ts=%s current_closed_ts=%s next_asset=TRUE",
+                    cycle_id,p,expected,alligator_candle_ts,current_closed_ts
+                )
+                return False
+            log.info(
+                "FINAL_ALLIGATOR_CONFIRMATION_OK cycle=%s pair=%s direction=%s "
+                "fresh_closed_m1=%s breakout_required=False next_asset=TRUE",
+                cycle_id,p,expected,current_closed_ts or alligator_candle_ts
+            )
 
         else:
             log.info(
