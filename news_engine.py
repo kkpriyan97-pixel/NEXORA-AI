@@ -272,7 +272,7 @@ class NewsCalendarClient:
             now = datetime.now(timezone.utc).timestamp()
             horizon = float(self.lookahead_hours * 3600)
             events = [e for e in events if -900.0 <= e.timestamp_utc - now <= horizon]
-            return events, ("tradingeconomics" if self.api_key and not self.custom_url else "custom")
+            return events, source_name
         except Exception:
             # Propagate transient feed failures so the isolated app-level news
             # worker preserves the last known-good calendar instead of replacing
