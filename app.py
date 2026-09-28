@@ -1456,7 +1456,7 @@ ALLOW_PROXY_LIVE_FALLBACK=os.getenv("ALLOW_PROXY_LIVE_FALLBACK","1").strip().low
 # current 1-minute candle as the live-quote activity fallback. This does not create
 # synthetic data; it only removes the false dependency on an Event-1 subscription.
 ALLOW_AUTHENTICATED_CANDLE_LIVE_FALLBACK=os.getenv("ALLOW_AUTHENTICATED_CANDLE_LIVE_FALLBACK","1").strip().lower() in {"1","true","yes","on"}
-AI_DEEP_REVIEW_TOP_N=max(1,min(8,int(os.getenv("AI_DEEP_REVIEW_TOP_N","8") or 8)))
+AI_DEEP_REVIEW_TOP_N=max(1,min(10,int(os.getenv("AI_DEEP_REVIEW_TOP_N","10") or 10)))
 # Preserve a fully reviewed candidate for the short exact-boundary window.
 # This prevents a transient provider/cache refresh from erasing a valid setup
 # after it has already passed the Brain + live-price gates.
@@ -1485,8 +1485,8 @@ ACCOUNT_TICK_SUB_DELAY=0.35
 # keep multiple independent candidates live at the exact signal boundary.
 # This does not change Brain direction/quality gates; it only preserves live
 # quote coverage for fallback candidates.
-ACCOUNT_TICK_MAX_SLOTS=2
-ACCOUNT_TICK_PIN_SLOTS=2
+ACCOUNT_TICK_MAX_SLOTS=4
+ACCOUNT_TICK_PIN_SLOTS=4
 # Hold collector subscriptions long enough to span a complete M1 bar.
 ACCOUNT_TICK_ROTATE_INTERVAL=65.0
 ACCOUNT_TICK_MIN_HOLD_SECONDS=55.0
@@ -4235,57 +4235,40 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         )
 
     volume_min_coverage=max(0.80,min(1.0,float(os.getenv("VOLUME_PRIORITY_MIN_COVERAGE","0.80") or 0.80)))
-    if focus_set:
-        # A current closed-M1 breakout is the selector. Do not let the generic
-        # volume-priority stage discard the asset that just produced the event.
-        volume_selected=[]
-        volume_enabled=[]
-        analyzed_for_brain=analyzed
-        log.info(
-            "VOLUME_PRIORITY_BYPASS focus_breakout_pairs=%s reason=current_breakout_event_is_selector",
-            ",".join(sorted(focus_set))
-        )
-    else:
-        volume_enabled=[
-            x for x in analyzed
-            if _volume_priority_key(x)[0]>0
-            and _volume_priority_key(x)[1]>=volume_min_coverage
-        ]
-        volume_enabled.sort(key=_volume_priority_key,reverse=True)
-        volume_selected=volume_enabled[:volume_priority_top_n]
 
-    if volume_selected:
-        selected_pairs={str(x.get("pair")) for x in volume_selected}
-        volume_rank_by_pair={
-            str(x.get("pair")):idx for idx,x in enumerate(volume_selected,1)
-        }
-        selected_modes={}
-        for idx,x in enumerate(volume_selected,1):
-            pair=str(x.get("pair"))
-            ind=dict(x.get("indicators") or x.get("indicator_context") or {})
-            x["volume_priority_rank"]=idx
-            x["volume_priority_selected"]=True
-            x["volume_priority_source"]=str(ind.get("volume_data_class") or ind.get("volume_mode") or "UNKNOWN")
-            selected_modes[x["volume_priority_source"]]=selected_modes.get(x["volume_priority_source"],0)+1
-        analyzed_for_brain=volume_selected
-        log.info(
-            "VOLUME_PRIORITY_SCAN account_assets=%d analyzed=%d volume_enabled=%d "
-            "selected=%d top_n=%d min_coverage=%.2f modes=%s pairs=%s",
-            len(STATE.get("assets") or []),len(analyzed),len(volume_enabled),
-            len(volume_selected),volume_priority_top_n,volume_min_coverage,selected_modes,
-            ",".join(str(x.get("pair")) for x in volume_selected),
+    # Volume is a ranking signal, not a universe gate.
+    # The authenticated account universe must remain fully eligible for the Brain.
+    # Previously, assets without >=80% volume coverage could be discarded before
+    # structural ranking, which could create an artificial empty cycle even when
+    # another account asset had a valid trade-grade setup.
+    volume_enabled=[
+        x for x in analyzed
+        if _volume_priority_key(x)[0]>0
+        and _volume_priority_key(x)[1]>=volume_min_coverage
+    ]
+    volume_enabled.sort(key=_volume_priority_key,reverse=True)
+
+    selected_modes={}
+    for idx,x in enumerate(volume_enabled[:volume_priority_top_n],1):
+        ind=dict(x.get("indicators") or x.get("indicator_context") or {})
+        x["volume_priority_rank"]=idx
+        x["volume_priority_selected"]=True
+        x["volume_priority_source"]=str(
+            ind.get("volume_data_class") or ind.get("volume_mode") or "UNKNOWN"
         )
-    else:
-        analyzed_for_brain=analyzed
-        # Volume-first selection is an optional priority layer. When the broker
-        # does not provide >= configured coverage, keep the existing Brain pool
-        # unchanged. This is an expected degraded-data state, not an application
-        # fault, so it must not be emitted as a warning or treated as a failure.
-        log.info(
-            "VOLUME_PRIORITY_FALLBACK account_assets=%d analyzed=%d min_coverage=%.2f "
-            "reason=no_high_coverage_volume_data action=preserve_existing_brain_pool",
-            len(STATE.get("assets") or []),len(analyzed),volume_min_coverage
-        )
+        selected_modes[x["volume_priority_source"]]=selected_modes.get(
+            x["volume_priority_source"],0
+        )+1
+
+    # CRITICAL: never shrink the authenticated Brain universe because of volume
+    # metadata. All analyzed account assets continue into technical ranking.
+    analyzed_for_brain=analyzed
+    log.info(
+        "VOLUME_PRIORITY_RANK_ONLY account_assets=%d analyzed=%d "
+        "volume_qualified=%d volume_top_n=%d min_coverage=%.2f modes=%s",
+        len(STATE.get("assets") or []),len(analyzed),len(volume_enabled),
+        volume_priority_top_n,volume_min_coverage,selected_modes,
+    )
 
     log.info(
         "BRAIN_INPUT_READY focus_breakout=%s analyzed_for_brain=%d",
