@@ -7837,7 +7837,10 @@ async def cycle_loop():
             )
             cycle_outcome="SKIPPED_NO_SETUP"
 
-        next_target=(int(time.time())//int(SIGNAL_INTERVAL)+1)*int(SIGNAL_INTERVAL)
+        # Advance strictly from this cycle's target. Computing from current wall-clock
+        # time can point back to the same target when the signal is emitted near
+        # its boundary, causing a duplicate/late restart alignment.
+        next_target=int(target)+int(SIGNAL_INTERVAL)
         next_cycle_id=int(next_target//SIGNAL_INTERVAL)
         next_signal=next_target-SIGNAL_LEADS[0 if (next_cycle_id%20 or 20)<=10 else 1]
         log.info(
