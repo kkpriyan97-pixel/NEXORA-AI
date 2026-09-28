@@ -7,7 +7,7 @@ from ai_engine import MarketSnapshot,build_ai_request,parse_ai_decision
 log=logging.getLogger("candice")
 PROVIDER_COOLDOWN={}
 PROVIDER_COOLDOWN_SECONDS=120.0
-TRANSIENT_COOLDOWN_SECONDS=10.0
+TRANSIENT_COOLDOWN_SECONDS=30.0
 CREDIT_EXHAUSTION_COOLDOWN_SECONDS=21600.0
 ACCESS_DENIED_COOLDOWN_SECONDS=3600.0
 # NaraRouter FREE-model access is account-gated by Telegram linking. Keep this
@@ -32,7 +32,7 @@ _ai_concurrency=max(1,min(8,_ai_concurrency))
 ANALYSIS_SEMAPHORE=asyncio.Semaphore(_ai_concurrency)
 REVIEW_SEMAPHORE=asyncio.Semaphore(1)
 REVIEW_PROVIDER_COOLDOWN={}
-REVIEW_TRANSIENT_COOLDOWN_SECONDS=15.0
+REVIEW_TRANSIENT_COOLDOWN_SECONDS=30.0
 REVIEW_429_COOLDOWN_SECONDS=900.0
 # External AI verification is enabled by default, but remains bounded and fail-open.
 # The local Candice Brain remains authoritative; timeouts/429s cannot hard-stop delivery.
@@ -244,8 +244,8 @@ async def analyze_with_fallback(snapshot:MarketSnapshot)->dict[str,Any]|None:
                 "confidence 0-100, and reason. This is DEMO read-only; never trade.\n"+
                 json.dumps(request,ensure_ascii=False,separators=(",",":")))
     last=None
-    http_timeout=min(3.0,max(0.9,float(os.getenv("AI_HTTP_TIMEOUT","1.2"))))
-    connect_timeout=min(0.8,http_timeout)
+    http_timeout=min(3.0,max(1.2,float(os.getenv("AI_HTTP_TIMEOUT","2.4"))))
+    connect_timeout=min(1.5,http_timeout)
 
     async with ANALYSIS_SEMAPHORE:
         log.info("AI_FALLBACK_CHAIN providers=%s",",".join(_providers()))
