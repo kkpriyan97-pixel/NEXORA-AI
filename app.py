@@ -3955,9 +3955,13 @@ async def final_candidate(use_cached_only=False,require_live_price=False,deep_an
         )
     else:
         analyzed_for_brain=analyzed
-        log.warning(
+        # Volume-first selection is an optional priority layer. When the broker
+        # does not provide >= configured coverage, keep the existing Brain pool
+        # unchanged. This is an expected degraded-data state, not an application
+        # fault, so it must not be emitted as a warning or treated as a failure.
+        log.info(
             "VOLUME_PRIORITY_FALLBACK account_assets=%d analyzed=%d min_coverage=%.2f "
-            "reason=no_usable_volume_data action=preserve_existing_brain_pool",
+            "reason=no_high_coverage_volume_data action=preserve_existing_brain_pool",
             len(STATE.get("assets") or []),len(analyzed),volume_min_coverage
         )
 
