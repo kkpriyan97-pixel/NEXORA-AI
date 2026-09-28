@@ -16,6 +16,7 @@ from ai_router import analyze_with_fallback,review_result_with_fallback
 from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot_async, world_learning_loop
 from strategy_knowledge import ensure_tables as ensure_strategy_knowledge_tables, refresh as refresh_strategy_knowledge, refresh_loop as strategy_knowledge_refresh_loop
 from account_asset_catalog import build_account_asset_snapshot
+from news_engine import NewsCalendarClient, compact_event_line, news_context
 import learning_lab as learning_lab_module
 from learning_lab import (
     configure as configure_learning_lab,
@@ -1170,6 +1171,20 @@ RESULT_BROKER_CLOSE_WAIT=300.0
 BROKER_PRICE_SCALE_MISMATCH_RATIO=1.75
 STATE["broker_trade_events"]=[]
 STATE["broker_trade_assignments"]={}
+
+# News is an isolated context worker. It never owns the 5-minute scheduler,
+# never rewrites Brain direction, and never blocks signal delivery.
+NEWS_CALENDAR=NewsCalendarClient()
+NEWS_STATE={
+    "events":[],
+    "updated_at":0.0,
+    "source":"disabled",
+    "last_error":"",
+    "last_log_at":0.0,
+}
+NEWS_REFRESH_SECONDS=max(15.0,min(120.0,float(os.getenv("NEXORA_NEWS_REFRESH_SECONDS","20") or 20)))
+NEWS_STATE_LOCK=asyncio.Lock()
+FORECAST_SENT_CYCLES=deque(maxlen=400)
 STATE["asset_integrity_blocks"]={}
 CANDLE_FETCH_SEM=asyncio.Semaphore(24)
 CANDLE_FETCH_LAST={}
@@ -3266,6 +3281,225 @@ async def refresh_candles(force=False):
             bridge_promoted,
             sum(1 for p in STATE.get("candles",{}) if LIVE_CANDLE_BRIDGE.get(p))
         )
+
+
+async def refresh_news_calendar_once():
+    """Refresh macro events without ever blocking the market/signal loop."""
+    if not NEWS_CALENDAR.enabled:
+        now=time.time()
+        if now-float(NEWS_STATE.get("last_log_at") or 0.0)>=300.0:
+            NEWS_STATE["last_log_at"]=now
+            NEWS_STATE["source"]="disabled"
+            NEWS_STATE["last_error"]=""
+            log.info("NEWS_CALENDAR_DISABLED reason=no_calendar_provider_configured")
+        return
+    try:
+        events,source=await NEWS_CALENDAR.fetch()
+        async with NEWS_STATE_LOCK:
+            NEWS_STATE["events"]=events
+            NEWS_STATE["updated_at"]=time.time()
+            NEWS_STATE["source"]=source
+            NEWS_STATE["last_error"]=""
+        log.info(
+            "NEWS_CALENDAR_REFRESH events=%d source=%s updated_utc=%s",
+            len(events),source,datetime.now(timezone.utc).strftime("%H:%M:%S")
+        )
+    except Exception as e:
+        async with NEWS_STATE_LOCK:
+            NEWS_STATE["last_error"]=f"{type(e).__name__}:{str(e)[:160]}"
+        log.info(
+            "NEWS_CALENDAR_REFRESH_FAILED type=%s message=%s action=preserve_previous_context",
+            type(e).__name__,str(e)[:160]
+        )
+
+async def news_calendar_worker():
+    """Background-only news refresh; the 5-minute scheduler never awaits it."""
+    while True:
+        try:
+            await refresh_news_calendar_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.info("NEWS_CALENDAR_WORKER_ERROR type=%s message=%s",type(e).__name__,str(e)[:160])
+        await asyncio.sleep(NEWS_REFRESH_SECONDS)
+
+
+def _forecast_closed_direction(closed):
+    """Small deterministic fallback: weighted M1/5M/15M direction, no network."""
+    if len(closed)<16:
+        return "",0.0,0.0,0.0
+    closes=[]
+    for x in closed:
+        try: closes.append(float(x.get("close",x.get("c"))))
+        except (TypeError,ValueError): continue
+    if len(closes)<16:
+        return "",0.0,0.0,0.0
+    d1=closes[-1]-closes[-2]
+    d5=closes[-1]-closes[-6]
+    d15=closes[-1]-closes[-16]
+    scale=max(abs(d15),abs(d5),abs(d1),1e-12)
+    score=(d15/scale)*0.45+(d5/scale)*0.35+(d1/scale)*0.20
+    direction="UP" if score>0 else "DOWN" if score<0 else ""
+    agreement=sum(1 for x in (d15,d5,d1) if (x>0 and direction=="UP") or (x<0 and direction=="DOWN"))
+    return direction,float(score),float(d15/scale),float(d5/scale)
+
+
+def _score_forecast_candidate(candidate, now_ts):
+    if not isinstance(candidate,dict) or not candidate.get("pair"):
+        return None
+    p=str(candidate.get("pair") or "")
+    direction=str(candidate.get("direction") or "").upper()
+    if direction not in {"UP","DOWN"}:
+        return None
+    ind=dict(candidate.get("indicators") or candidate.get("indicator_context") or {})
+    trend=str(candidate.get("trend_15m") or ind.get("otc_market_bias") or "").upper()
+    expected_bias="BULLISH" if direction=="UP" else "BEARISH"
+    score=0.0
+    components={}
+    components["base_confidence"]=min(25.0,max(0.0,float(candidate.get("confidence") or 0)*0.25))
+    score+=components["base_confidence"]
+    components["bias"]=20.0 if ((direction=="UP" and ("BULL" in trend or trend=="UP")) or (direction=="DOWN" and ("BEAR" in trend or trend=="DOWN"))) else 0.0
+    score+=components["bias"]
+    five_flags=("five_minute_directional_ok","five_minute_structure_ok","five_minute_momentum_ok","five_minute_entry_candle_ok")
+    five_ok=sum(1 for k in five_flags if ind.get(k) is True)
+    five_bias=str(ind.get("five_minute_primary_bias") or "").upper()
+    components["5m_regime"]=10.0*(five_ok/4.0)
+    if five_bias==expected_bias:
+        components["5m_regime"]+=5.0
+    score+=components["5m_regime"]
+    structure_flags=("otc_bos_confirmed","otc_displacement_confirmed","otc_retest_confirmed","otc_hold_confirmed","otc_confirmation_candle_confirmed","m1_continuation_ok")
+    if str(candidate.get("strategy") or "").upper()==OTC_STRATEGY:
+        structure_ok=sum(1 for k in structure_flags if ind.get(k) is True)
+        components["structure"]=20.0*(structure_ok/len(structure_flags))
+    else:
+        components["structure"]=15.0 if ind.get("m1_continuation_ok") is True else 7.0 if ind.get("exact_live_setup") is True else 0.0
+    score+=components["structure"]
+    fresh=has_fresh_live_price(p,now_ts,LIVE_TICK_MAX_AGE)
+    components["data_freshness"]=10.0 if fresh else 2.0
+    score+=components["data_freshness"]
+    stats=BRAIN.asset_stats.get(p,{}) if isinstance(BRAIN.asset_stats,dict) else {}
+    n=float(stats.get("n",0) or 0.0); w=float(stats.get("win",0) or 0.0)
+    learned=((w+1.0)/(n+2.0))*100.0 if n>=1 else 50.0
+    components["asset_learning"]=min(10.0,max(0.0,(learned-45.0)*0.18))
+    score+=components["asset_learning"]
+    ctx=news_context(p,now_ts,list(NEWS_STATE.get("events") or []))
+    # News never creates direction. During release chaos, reward only already-confirmed
+    # structure and reduce confidence when confirmation is weak. OTC news is context-only.
+    if not p.endswith("_OTC") and ctx.get("phase")=="RELEASE":
+        components["news_context"]=3.0 if components["structure"]>=12.0 and components["bias"]>=20.0 else -5.0
+    elif not p.endswith("_OTC") and ctx.get("phase")=="PRE":
+        components["news_context"]=-2.0
+    else:
+        components["news_context"]=0.0
+    score+=components["news_context"]
+    score=max(0.0,min(100.0,score))
+    calibrated=int(max(55,min(94,50.0+0.44*score)))
+    candidate=dict(candidate)
+    candidate["forecast_score"]=round(score,2)
+    candidate["forecast_confidence"]=calibrated
+    candidate["forecast_components"]=components
+    candidate["news_context"]=ctx
+    candidate["news_line"]=compact_event_line(ctx)
+    candidate["forecast_only"]=True
+    candidate["forecast_source"]="CANDICE_5M_ENSEMBLE"
+    candidate["forecast_generated_at"]=now_ts
+    candidate["forecast_horizon_minutes"]=5
+    return candidate
+
+
+async def build_always_on_forecast(cycle_id, target_ts):
+    """Produce one 5M direction from available Brain evidence; never rewrites Brain direction."""
+    now_ts=time.time()
+    pool=[x for x in (STATE.get("analyses") or {}).values() if isinstance(x,dict)]
+    if not pool:
+        assets=[a for a in (STATE.get("assets") or []) if a.get("signal_eligible",True) and a.get("pair")]
+        scored=[]
+        for a in assets:
+            p=str(a.get("pair") or "")
+            stats=BRAIN.asset_stats.get(p,{}) if isinstance(BRAIN.asset_stats,dict) else {}
+            n=float(stats.get("n",0) or 0.0); w=float(stats.get("win",0) or 0.0)
+            learned=((w+1.0)/(n+2.0))*100.0 if n else 50.0
+            try: profitability=float(a.get("profitability") or 0.0)
+            except (TypeError,ValueError): profitability=0.0
+            scored.append((profitability*0.55+learned*0.35+(10.0 if has_fresh_live_price(p,now_ts,LIVE_TICK_MAX_AGE) else 0.0),a))
+        scored.sort(key=lambda x:x[0],reverse=True)
+        # Local deterministic Brain analysis only; no network or AI calls here.
+        for _,a in scored[:18]:
+            p=str(a.get("pair") or "")
+            closed=_closed_candles(STATE.get("candles",{}).get(p,[]),now_ts)
+            if len(closed)<45:
+                continue
+            try:
+                an=analyze_asset(a,_prepare_volume_candles(p,closed),STATE.get("prices",{}).get(p,(None,None))[0],require_high_volume=False)
+            except Exception:
+                an=None
+            if an:
+                an["profitability"]=a.get("profitability",0)
+                pool.append(an)
+
+    evaluated=[]
+    for item in pool:
+        ranked=_score_forecast_candidate(item,now_ts)
+        if ranked:
+            evaluated.append(ranked)
+    if evaluated:
+        evaluated.sort(key=lambda x:(float(x.get("forecast_score") or 0),int(x.get("forecast_confidence") or 0)),reverse=True)
+        best=evaluated[0]
+        best["cycle_id"]=int(cycle_id)
+        return best
+
+    # Last-resort forecast when no Brain candidate exists. This is prediction-only,
+    # not a trade-grade signal: it uses only closed authenticated candles.
+    fallback=[]
+    for a in (STATE.get("assets") or []):
+        if not a.get("signal_eligible",True):
+            continue
+        p=str(a.get("pair") or "")
+        if not p:
+            continue
+        closed=_closed_candles(STATE.get("candles",{}).get(p,[]),now_ts)
+        direction,weighted,m15,m5=_forecast_closed_direction(closed)
+        if direction not in {"UP","DOWN"}:
+            continue
+        score=50.0+abs(weighted)*35.0
+        if abs(m15)>0.7 and abs(m5)>0.7:
+            score+=8.0
+        fresh=has_fresh_live_price(p,now_ts,LIVE_TICK_MAX_AGE)
+        if fresh: score+=5.0
+        ctx=news_context(p,now_ts,list(NEWS_STATE.get("events") or []))
+        if not p.endswith("_OTC") and ctx.get("phase")=="RELEASE":
+            score-=8.0
+        score=max(50.0,min(82.0,score))
+        fallback.append((score,a,p,direction,ctx,fresh))
+    if not fallback:
+        return None
+    fallback.sort(key=lambda x:x[0],reverse=True)
+    score,a,p,direction,ctx,fresh=fallback[0]
+    return {
+        "cycle_id":int(cycle_id),
+        "pair":p,
+        "display_name":str(a.get("display_name") or p),
+        "direction":direction,
+        "strategy":"CANDICE_5M_ENSEMBLE_FALLBACK",
+        "self_strategy":"ALWAYS_ON_5M_FORECAST",
+        "self_strategy_version":"v1",
+        "confidence":int(round(score)),
+        "forecast_confidence":int(round(score)),
+        "forecast_score":round(score,2),
+        "forecast_only":True,
+        "forecast_source":"CLOSED_M1_5M_15M_FALLBACK",
+        "forecast_generated_at":now_ts,
+        "forecast_horizon_minutes":5,
+        "live_price":STATE.get("prices",{}).get(p,(None,None))[0],
+        "news_context":ctx,
+        "news_line":compact_event_line(ctx),
+        "indicators":{
+            "forecast_m15_component":round(m15,3),
+            "forecast_m5_component":round(m5,3),
+            "forecast_live_data_fresh":bool(fresh),
+        },
+        "reason":"Weighted closed-candle M1/5M/15M forecast fallback; Brain direction is never rewritten",
+    }
 
 
 def has_fresh_live_price(pair,reference_ts=None,max_age=LIVE_TICK_MAX_AGE):
@@ -7862,6 +8096,8 @@ async def cycle_loop():
             cycle_id,len(candidate_pool),len(ranked_pool),int(signal_lead)
         )
 
+        forecast_sent=False
+
         # Do not perform broker subscription work at the exact boundary.
         # Wake 80ms early, then yield until signal_at so the final ranking is
         # already prepared without sacrificing the requested timing.
@@ -7900,6 +8136,42 @@ async def cycle_loop():
                     break
 
         if not sent:
+            # Do not turn a strict trade-grade rejection into a user-facing NO SIGNAL.
+            # Produce exactly one bounded 5-minute direction forecast from available
+            # closed-candle/Brain evidence. This path never reserves a trade, never
+            # starts a result watch, and never changes the deterministic Brain.
+            try:
+                forecast=await asyncio.wait_for(
+                    build_always_on_forecast(cycle_id,target),
+                    timeout=max(0.5,min(3.0,max(0.5,signal_at-time.time()+0.75)))
+                )
+            except asyncio.TimeoutError:
+                forecast=None
+                log.info("FIVE_MINUTE_FORECAST_TIMEOUT cycle=%s",cycle_id)
+            except Exception as forecast_error:
+                forecast=None
+                log.info(
+                    "FIVE_MINUTE_FORECAST_FAILED cycle=%s type=%s message=%s",
+                    cycle_id,type(forecast_error).__name__,str(forecast_error)[:160]
+                )
+            if forecast:
+                forecast_message=format_5m_forecast_message(forecast,target)
+                forecast_sent=await telegram(
+                    forecast_message,
+                    timeout_seconds=min(TELEGRAM_SIGNAL_TIMEOUT,5.0)
+                )
+                if forecast_sent:
+                    FORECAST_SENT_CYCLES.append(int(cycle_id))
+                log.info(
+                    "FIVE_MINUTE_FORECAST_DELIVERY cycle=%s pair=%s direction=%s confidence=%s "
+                    "score=%s sent=%s news_phase=%s forecast_source=%s",
+                    cycle_id,forecast.get("pair"),forecast.get("direction"),
+                    forecast.get("forecast_confidence") or forecast.get("confidence"),
+                    forecast.get("forecast_score"),forecast_sent,
+                    (forecast.get("news_context") or {}).get("phase"),
+                    forecast.get("forecast_source")
+                )
+
             if boundary_lag>1.00:
                 log.warning(
                     "FINAL_BOUNDARY_MISSED cycle=%s lag_seconds=%.3f candidates=%s max_lag=1.00",
@@ -7907,15 +8179,16 @@ async def cycle_loop():
                 )
             if ranked_pool:
                 log.info(
-                    "FIVE_SCAN_NO_VALID_SIGNAL cycle=%s candidates=%s "
-                    "signal_utc=%s now_utc=%s",
-                    cycle_id,len(ranked_pool),                    time.strftime("%H:%M:%S",time.gmtime(signal_at)),
+                    "FIVE_SCAN_NO_TRADE_GRADE_SIGNAL cycle=%s candidates=%s "
+                    "forecast_sent=%s signal_utc=%s now_utc=%s",
+                    cycle_id,len(ranked_pool),forecast_sent,
+                    time.strftime("%H:%M:%S",time.gmtime(signal_at)),
                     time.strftime("%H:%M:%S",time.gmtime(time.time()))
                 )
             else:
                 log.info(
-                    "FIVE_SCAN_NO_QUALIFIED_SETUP cycle=%s scans=5 analyzed=%d",
-                    cycle_id,len(STATE["analyses"])
+                    "FIVE_SCAN_NO_TRADE_GRADE_SETUP cycle=%s scans=5 analyzed=%d forecast_sent=%s",
+                    cycle_id,len(STATE["analyses"]),forecast_sent
                 )
 
         # Do not let the current cycle's durable DB status update block
@@ -7927,16 +8200,21 @@ async def cycle_loop():
                 mark_cycle_state(cycle_id,"SENT","signal_delivered")
             )
             cycle_outcome="SENT"
+        elif forecast_sent:
+            asyncio.create_task(
+                mark_cycle_state(cycle_id,"FORECAST","forecast_delivered_trade_grade_unavailable")
+            )
+            cycle_outcome="FORECAST"
         elif ranked_pool:
             asyncio.create_task(
-                mark_cycle_state(cycle_id,"SKIPPED","final_candidate_failed_delivery")
+                mark_cycle_state(cycle_id,"SKIPPED","final_candidate_failed_delivery_and_forecast_failed")
             )
             cycle_outcome="SKIPPED_DELIVERY"
         else:
             asyncio.create_task(
-                mark_cycle_state(cycle_id,"SKIPPED","no_final_pass_candidate")
+                mark_cycle_state(cycle_id,"SKIPPED","no_forecast_source_available")
             )
-            cycle_outcome="SKIPPED_NO_SETUP"
+            cycle_outcome="SKIPPED_NO_FORECAST"
 
         next_target=(int(time.time())//int(SIGNAL_INTERVAL)+1)*int(SIGNAL_INTERVAL)
         next_cycle_id=int(next_target//SIGNAL_INTERVAL)
@@ -8972,6 +9250,31 @@ def format_live_indicator_check(indicators, price_source="authenticated_broker_l
         f"✅ Value Area Acceptance → {'YES' if acceptance else 'NO'}\n"
     )
 
+def format_5m_forecast_message(candidate, target):
+    direction=str(candidate.get("direction") or "").upper()
+    direction_label="🟢 <b>UP</b>" if direction=="UP" else "🔴 <b>DOWN</b>"
+    confidence=int(candidate.get("forecast_confidence") or candidate.get("confidence") or 0)
+    score=float(candidate.get("forecast_score") or confidence)
+    ctx=candidate.get("news_context") or {}
+    news_line=str(candidate.get("news_line") or "CLEAR")
+    risk_label=(
+        "HIGH" if float(ctx.get("risk") or 0)>=80 else
+        "MEDIUM" if float(ctx.get("risk") or 0)>=50 else "LOW"
+    )
+    return (
+        "🔮 <b>CANDICE AI</b>\\n"
+        "💎 <b>5-MIN CALIBRATED FORECAST</b>\\n\\n"
+        f"📊 <b>{candidate.get('display_name') or candidate.get('pair')}</b>\\n\\n"
+        f"{direction_label}\\n"
+        "⏱️ <b>5 MIN</b>\\n"
+        f"🎯 <b>Confidence: {confidence}%</b>\\n"
+        f"📈 Forecast Score: <b>{score:.1f}/100</b>\\n\\n"
+        f"🧠 Engine: <b>{candidate.get('forecast_source') or 'CANDICE_5M_ENSEMBLE'}</b>\\n"
+        f"📰 News: <b>{risk_label}</b> • {news_line}\\n\\n"
+        "⚠️ <b>FORECAST MODE</b> — this message is produced when no trade-grade PRO signal survives the final live gate.\\n"
+        "🛡️ Auto-trade: <b>OFF</b> • DEMO / MANUAL only"
+    )
+
 def format_candice_signal_message(s, indicator_check, ts, target):
     """Canonical Telegram signal template with asset-class-specific engine labels."""
     direction=str(s.direction or "").upper()
@@ -9410,6 +9713,7 @@ async def main():
         cycle_loop_supervisor(),
         ai_review_worker(),
         result_watch_recovery_worker(),
+        news_calendar_worker(),
         world_learning_loop(),
         strategy_knowledge_refresh_loop(),
         server.serve_forever(),
