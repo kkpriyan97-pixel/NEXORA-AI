@@ -5056,17 +5056,35 @@ async def result_watch(key):
             s.broker_trade_source
         )
     else:
-        # No actual user trade matched. Preserve the distinction between the
-        # 30s pre-entry signal reference and the broker's exact entry-boundary
-        # market price. The latter is the only fair market-outcome baseline for
-        # a manual DEMO signal. Never classify the result from the stale signal
-        # snapshot when an exact broker entry quote/candle is available.
+        # No actual user trade matched. The 30s pre-entry signal quote is only a
+        # reference; a manual DEMO signal's market outcome must use the broker
+        # quote at the exact entry boundary whenever it is available.
         s.entry_price=signal_reference
-        log.info(
-            "BROKER_TRADE_NOT_MATCHED cycle=%s pair=%s signal_reference=%s "
-            "window_after=%.1fs fallback=broker_boundary_entry_then_market_candle",
-            s.cycle_id,s.pair,signal_reference,RESULT_TRADE_MATCH_AFTER
-        )
+        signal_market_entry_source=""
+        signal_market_entry_captured=False
+        boundary=boundary_entry_tick(s.pair,s.entry_ts,window_seconds=3.0)
+        if boundary is not None:
+            try:
+                boundary_price=float(boundary[0])
+                if isfinite(boundary_price) and boundary_price>0:
+                    s.entry_price=boundary_price
+                    signal_market_entry_source="broker_tick_boundary"
+                    signal_market_entry_captured=True
+                    log.info(
+                        "SIGNAL_MARKET_ENTRY_BOUNDARY_CAPTURED cycle=%s pair=%s "
+                        "signal_reference=%s broker_boundary_entry=%s "
+                        "broker_ts=%s delta_seconds=%.3f source=authenticated_event1",
+                        s.cycle_id,s.pair,signal_reference,boundary_price,
+                        boundary[1],boundary[3]
+                    )
+            except (TypeError,ValueError):
+                pass
+        if not signal_market_entry_captured:
+            log.info(
+                "BROKER_TRADE_NOT_MATCHED cycle=%s pair=%s signal_reference=%s "
+                "window_after=%.1fs fallback=exact_broker_entry_candle_open",
+                s.cycle_id,s.pair,signal_reference,RESULT_TRADE_MATCH_AFTER
+            )
 
     actual_entry_ts=float(
         s.broker_trade_open_ts
@@ -5189,6 +5207,42 @@ async def result_watch(key):
                             ))
                         except Exception:
                             pass
+
+                        # If Event-1 did not retain a boundary tick long enough,
+                        # use the broker's exact M1 opening quote for the entry
+                        # boundary. This fixes false LOSS/ WIN flips caused by
+                        # comparing the expiry close with a stale 30s pre-entry
+                        # signal snapshot.
+                        if not signal_market_entry_captured:
+                            try:
+                                entry_start=(int(float(s.entry_ts))//60)*60
+                            except (TypeError,ValueError):
+                                entry_start=None
+                            if entry_start is not None:
+                                for raw_entry in normalized:
+                                    ts_entry=_candle_epoch(raw_entry)
+                                    if ts_entry is None or int(ts_entry//60)*60!=entry_start:
+                                        continue
+                                    for open_key in ("open","o"):
+                                        try:
+                                            open_value=float(raw_entry.get(open_key))
+                                        except (TypeError,ValueError):
+                                            continue
+                                        if isfinite(open_value) and open_value>0:
+                                            s.entry_price=open_value
+                                            signal_market_entry_source="broker_candle_open"
+                                            signal_market_entry_captured=True
+                                            log.info(
+                                                "SIGNAL_MARKET_ENTRY_CANDLE_CAPTURED cycle=%s pair=%s "
+                                                "signal_reference=%s broker_candle_open=%s "
+                                                "entry_candle_ts=%s source=authenticated_event10",
+                                                s.cycle_id,s.pair,signal_reference,open_value,
+                                                int(ts_entry//60)*60
+                                            )
+                                            break
+                                    if signal_market_entry_captured:
+                                        break
+
                         exact=_exact_expiry_window_price(
                             normalized,
                             s.entry_ts,
@@ -5199,7 +5253,9 @@ async def result_watch(key):
                             _,expiry_price=exact
                             STATE["candles"][s.pair]=normalized
                             expiry_source=(
-                                f"signal-market:candle-closed:exact-entry-{expiry_minutes}m-window"
+                                f"signal-market:"
+                                f"{signal_market_entry_source or 'signal-reference'}:"
+                                f"candle-closed:exact-entry-{expiry_minutes}m-window"
                             )
                             log.info(
                                 "RESULT_EXPIRY_HORIZON_VERIFIED cycle=%s pair=%s "
@@ -5231,6 +5287,17 @@ async def result_watch(key):
                 last_error="signal_market_candle_unavailable"
             )
             return
+
+        if not signal_market_entry_captured:
+            # Last-resort compatibility path: no broker boundary tick/candle was
+            # available. Keep the original signal reference, but mark it clearly
+            # in logs rather than silently presenting it as an exact entry quote.
+            s.entry_price=signal_reference
+            log.warning(
+                "SIGNAL_MARKET_ENTRY_FALLBACK_SIGNAL_REFERENCE cycle=%s pair=%s "
+                "signal_reference=%s reason=no_authenticated_boundary_quote",
+                s.cycle_id,s.pair,signal_reference
+            )
 
         rec=BRAIN.finish_signal(
             key,expiry_price,
