@@ -5588,43 +5588,68 @@ async def cycle_loop():
             return False
 
         if not broker_tradeability_fresh(p,time.time()):
-            refreshed_tradeable=True
-            try:
-                refreshed_tradeable=await asyncio.wait_for(
-                    check_broker_asset_tradeability(
-                        p,cycle_id=cycle_id,force=True
-                    ),
-                    timeout=1.8,
-                )
-            except Exception as tradeability_error:
-                log.info(
-                    "BROKER_TRADEABILITY_BOUNDARY_REFRESH_FAILED cycle=%s pair=%s "
-                    "type=%s message=%s action=allow_unless_explicit_closed",
-                    cycle_id,p,type(tradeability_error).__name__,
-                    str(tradeability_error)[:120]
-                )
-                refreshed_tradeable=True
-
+            # At/near the exact 5M delivery boundary, never perform a network
+            # tradeability probe. Pass-5 already warms this cache; an event-80
+            # timeout here can consume the whole signal window and starve the
+            # remaining prepared candidates. Unknown/stale is allowed unless the
+            # cache explicitly says CLOSED.
+            _boundary_now=time.time()
+            _signal_at=target-float(signal_lead)
+            _boundary_phase=_boundary_now >= (_signal_at-0.75)
             tradeability_rec=ASSET_TRADEABILITY_CACHE.get(p) or {}
             tradeability_state=str(
                 tradeability_rec.get("state") or "UNKNOWN"
             ).upper()
-
-            if tradeability_state=="CLOSED" or refreshed_tradeable is False:
+            if _boundary_phase:
+                if tradeability_state=="CLOSED":
+                    log.info(
+                        "SIGNAL_DELIVERY_BLOCKED_BROKER_CLOSED_BOUNDARY cycle=%s pair=%s "
+                        "reason=cached_explicit_closed",
+                        cycle_id,p
+                    )
+                    return False
                 log.info(
-                    "SIGNAL_DELIVERY_BLOCKED_BROKER_NOT_TRADABLE cycle=%s pair=%s "
-                    "reason=explicit_broker_closed_after_boundary_probe",
-                    cycle_id,p
+                    "BROKER_TRADEABILITY_BOUNDARY_SKIP_PROBE cycle=%s pair=%s "
+                    "state=%s fresh=%s reason=zero_network_delivery_window",
+                    cycle_id,p,tradeability_state,
+                    broker_tradeability_fresh(p,_boundary_now)
                 )
-                return False
+            else:
+                refreshed_tradeable=True
+                try:
+                    refreshed_tradeable=await asyncio.wait_for(
+                        check_broker_asset_tradeability(
+                            p,cycle_id=cycle_id,force=True
+                        ),
+                        timeout=1.8,
+                    )
+                except Exception as tradeability_error:
+                    log.info(
+                        "BROKER_TRADEABILITY_BOUNDARY_REFRESH_FAILED cycle=%s pair=%s "
+                        "type=%s message=%s action=allow_unless_explicit_closed",
+                        cycle_id,p,type(tradeability_error).__name__,
+                        str(tradeability_error)[:120]
+                    )
+                    refreshed_tradeable=True
 
-            log.info(
-                "BROKER_TRADEABILITY_BOUNDARY_ALLOW cycle=%s pair=%s "
-                "state=%s fresh=%s source=%s reason=stale_or_missing_probe_is_not_close",
-                cycle_id,p,tradeability_state,
-                broker_tradeability_fresh(p,time.time()),
-                tradeability_rec.get("source") or "unavailable"
-            )
+                tradeability_rec=ASSET_TRADEABILITY_CACHE.get(p) or {}
+                tradeability_state=str(
+                    tradeability_rec.get("state") or "UNKNOWN"
+                ).upper()
+                if tradeability_state=="CLOSED" or refreshed_tradeable is False:
+                    log.info(
+                        "SIGNAL_DELIVERY_BLOCKED_BROKER_NOT_TRADABLE cycle=%s pair=%s "
+                        "reason=explicit_broker_closed_after_boundary_probe",
+                        cycle_id,p
+                    )
+                    return False
+                log.info(
+                    "BROKER_TRADEABILITY_BOUNDARY_ALLOW cycle=%s pair=%s "
+                    "state=%s fresh=%s source=%s reason=stale_or_missing_probe_is_not_close",
+                    cycle_id,p,tradeability_state,
+                    broker_tradeability_fresh(p,time.time()),
+                    tradeability_rec.get("source") or "unavailable"
+                )
 
         now=time.time()
 
@@ -5637,11 +5662,19 @@ async def cycle_loop():
         quote_now=time.time()
         quote_age=live_price_age(p,quote_now)
         if not has_fresh_live_price(p,quote_now,LIVE_TICK_MAX_AGE):
-            # Event-1 delivery ticks are preferred, but the authenticated broker
-            # current-candle endpoint is the authoritative fallback. Refresh the
-            # exact candidate at the signal boundary instead of rejecting a valid
-            # setup merely because the account-wide 2s rotation has not touched it
-            # within the last five seconds.
+            # Never make a broker network refresh after the exact signal boundary.
+            # Fresh candidates are warmed in pass-5; a stale candidate is skipped
+            # so the next prepared candidate can be tried without losing the slot.
+            _signal_at=target-float(signal_lead)
+            _boundary_phase=quote_now >= (_signal_at-0.75)
+            if _boundary_phase:
+                log.info(
+                    "FINAL_QUOTE_STALE_BOUNDARY_SKIP cycle=%s pair=%s quote_age=%s "
+                    "reason=zero_network_delivery_window next_asset=TRUE",
+                    cycle_id,p,
+                    ("NONE" if quote_age is None else f"{quote_age:.3f}")
+                )
+                return False
             refreshed=False
             try:
                 refreshed=await asyncio.wait_for(
@@ -8135,7 +8168,18 @@ async def cycle_loop():
         boundary_lag=time.time()-signal_at
         if boundary_lag<=1.00:
             attempted_final=0
+            _delivery_deadline=signal_at+0.90
             for candidate in ranked_pool:
+                # Never start another potentially expensive final validation once
+                # the bounded delivery window is consumed. This prevents one slow
+                # candidate from pushing the fallback/forecast several seconds late.
+                if time.time() >= _delivery_deadline:
+                    log.info(
+                        "FINAL_DELIVERY_WINDOW_EXPIRED cycle=%s attempted=%d "
+                        "deadline_lag=%.3f next_action=forecast",
+                        cycle_id,attempted_final,time.time()-signal_at
+                    )
+                    break
                 attempted_final+=1
                 log.info(
                     "FINAL_FALLBACK_ATTEMPT cycle=%s rank=%d/%d pair=%s fresh=%s",
@@ -8159,6 +8203,13 @@ async def cycle_loop():
                     )
                     sent=False
                 if sent:
+                    break
+                if time.time() >= _delivery_deadline:
+                    log.info(
+                        "FINAL_DELIVERY_WINDOW_EXPIRED cycle=%s attempted=%d "
+                        "deadline_lag=%.3f next_action=forecast",
+                        cycle_id,attempted_final,time.time()-signal_at
+                    )
                     break
 
         if not sent:
