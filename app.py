@@ -10,7 +10,7 @@ import httpx
 from olymptrade_ws import OlympTradeClient
 from olymptrade_ws.olympconfig import parameters
 from brain_rules import ActiveSignal,BrainState,rank_signal_candidates,COOLDOWN_SECONDS
-from candice_brain import analyze_asset,OTC_STRATEGY,ALLOWED_STRATEGY,detect_alligator_breakout
+from candice_brain import analyze_asset,OTC_STRATEGY,ALLOWED_STRATEGY,detect_alligator_breakout,_alligator_confirmation
 from ai_engine import snapshot_from_asset,ai_environment_status
 from ai_router import analyze_with_fallback,review_result_with_fallback
 from m1_world_learning import learning_status as m1_learning_status, record_market_snapshot_async, world_learning_loop
@@ -5357,12 +5357,57 @@ async def cycle_loop():
                 else 0
             )
             if alligator_candle_ts<=0 or (current_closed_ts and alligator_candle_ts!=current_closed_ts):
-                log.info(
-                    "FINAL_LIVE_ALLIGATOR_FRESHNESS_REJECTED cycle=%s pair=%s direction=%s "
-                    "alligator_candle_ts=%s current_closed_ts=%s next_asset=TRUE",
-                    cycle_id,p,expected,alligator_candle_ts,current_closed_ts
-                )
-                return False
+                # A new M1 candle can legitimately close during the 30-second
+                # pre-signal window. Re-evaluate the Alligator confirmation on
+                # the newest fully-closed candle instead of discarding the whole
+                # 5-minute slot. This is a confirmation refresh only: it cannot
+                # change the AVWAP+VP Brain direction.
+                if current_closed and current_closed_ts and alligator_candle_ts>0 and current_closed_ts-alligator_candle_ts<=60:
+                    try:
+                        refreshed_alligator=_alligator_confirmation(current_closed,expected)
+                    except Exception as refresh_error:
+                        refreshed_alligator={}
+                        log.info(
+                            "FINAL_LIVE_ALLIGATOR_REFRESH_FAILED cycle=%s pair=%s direction=%s "
+                            "type=%s message=%s next_asset=TRUE",
+                            cycle_id,p,expected,type(refresh_error).__name__,str(refresh_error)[:120]
+                        )
+                    if (
+                        bool(refreshed_alligator.get("ready"))
+                        and bool(refreshed_alligator.get("confirmed"))
+                        and bool(refreshed_alligator.get("timing_ok"))
+                    ):
+                        ind["alligator_timing_ok"]=True
+                        ind["alligator_confirmed"]=True
+                        ind["alligator_alignment_ready"]=True
+                        ind["alligator_aligned"]=bool(refreshed_alligator.get("aligned"))
+                        ind["alligator_sloping"]=bool(refreshed_alligator.get("sloping"))
+                        ind["alligator_price_position"]=bool(refreshed_alligator.get("price_position"))
+                        ind["alligator_jaw"]=refreshed_alligator.get("jaw")
+                        ind["alligator_teeth"]=refreshed_alligator.get("teeth")
+                        ind["alligator_lips"]=refreshed_alligator.get("lips")
+                        ind["alligator_latest_closed_candle_ts"]=refreshed_alligator.get("latest_closed_candle_ts")
+                        ind["alligator_closed_age_seconds"]=refreshed_alligator.get("closed_age_seconds")
+                        candidate["indicators"]=ind
+                        log.info(
+                            "FINAL_LIVE_ALLIGATOR_REFRESH_OK cycle=%s pair=%s direction=%s "
+                            "old_closed_ts=%s new_closed_ts=%s next_asset=TRUE",
+                            cycle_id,p,expected,alligator_candle_ts,current_closed_ts
+                        )
+                    else:
+                        log.info(
+                            "FINAL_LIVE_ALLIGATOR_REFRESH_REJECTED cycle=%s pair=%s direction=%s "
+                            "old_closed_ts=%s new_closed_ts=%s next_asset=TRUE",
+                            cycle_id,p,expected,alligator_candle_ts,current_closed_ts
+                        )
+                        return False
+                else:
+                    log.info(
+                        "FINAL_LIVE_ALLIGATOR_FRESHNESS_REJECTED cycle=%s pair=%s direction=%s "
+                        "alligator_candle_ts=%s current_closed_ts=%s next_asset=TRUE",
+                        cycle_id,p,expected,alligator_candle_ts,current_closed_ts
+                    )
+                    return False
             log.info(
                 "FINAL_ALLIGATOR_CONFIRMATION_OK cycle=%s pair=%s direction=%s "
                 "fresh_closed_m1=%s breakout_required=False next_asset=TRUE",
