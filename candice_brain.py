@@ -946,19 +946,44 @@ def _five_minute_cadence_setup(cs,primary_bias=None,now=None):
 
     directional_ok=(up_score>down_score) if direction=="UP" else (down_score>up_score)
     momentum_ok=momentum_up if direction=="UP" else momentum_down
-    structure_ok=(
-        (breakout_up or higher_closes or higher_lows)
-        if direction=="UP"
-        else (breakout_down or lower_closes or lower_highs)
-    )
+    breakout_ok=breakout_up if direction=="UP" else breakout_down
+    retest_ok=retest_up if direction=="UP" else retest_down
+    displacement_ok=bool(last_range>=baseline*1.15 and body_ratio>=0.55)
+    structure_ok=bool(breakout_ok and retest_ok)
     entry_ok=(
         float(last["close"])>=float(last["open"])
         if direction=="UP"
         else float(last["close"])<=float(last["open"])
     )
-    # The 5M bar is the authoritative entry confirmation for the 5M cadence path.
-    # A single opposite 1M candle must not invalidate an otherwise aligned 5M setup.
-    if not (directional_ok and momentum_ok and structure_ok and entry_ok):
+    # The newest completed M1 candle is the exact entry confirmation.
+    # It must agree with the selected 5M direction and continue beyond the
+    # prior closed M1 close; otherwise the 5M structure is not trade-grade.
+    previous_m1=cs[-2] if len(cs)>=2 else None
+    m1_entry_ok=False
+    if previous_m1 is not None:
+        if direction=="UP":
+            m1_entry_ok=(
+                float(cs[-1]["close"])>=float(cs[-1]["open"])
+                and float(cs[-1]["close"])>float(previous_m1["close"])
+            )
+        else:
+            m1_entry_ok=(
+                float(cs[-1]["close"])<=float(cs[-1]["open"])
+                and float(cs[-1]["close"])<float(previous_m1["close"])
+            )
+
+    # 5M cadence is a strict version of the user's structure:
+    # breakout -> displacement -> retest -> hold/confirmation -> latest-M1 entry.
+    # Do not manufacture "retest" or "displacement" flags when the evidence is absent.
+    if not (
+        directional_ok
+        and momentum_ok
+        and breakout_ok
+        and displacement_ok
+        and retest_ok
+        and entry_ok
+        and m1_entry_ok
+    ):
         return None
 
     evidence_score=78.0
@@ -980,20 +1005,20 @@ def _five_minute_cadence_setup(cs,primary_bias=None,now=None):
         "bos_range":float(last_range),
         "baseline_range":float(baseline),
         "bos_body_ratio":float(body_ratio),
-        "displacement_confirmed":bool(last_range>=baseline*1.05 and body_ratio>=0.35),
-        "retest_confirmed":bool(retest_up if direction=="UP" else retest_down),
-        "hold_confirmed":True,
-        "confirmation_candle_confirmed":True,
-        "entry_continuation_confirmed":True,
+        "displacement_confirmed":bool(displacement_ok),
+        "retest_confirmed":bool(retest_ok),
+        "hold_confirmed":bool(retest_ok),
+        "confirmation_candle_confirmed":bool(retest_ok and entry_ok),
+        "entry_continuation_confirmed":bool(m1_entry_ok),
         "sequence":(
             "5M_BREAKOUT_RETEST_CONTINUATION"
             if (breakout_up or breakout_down or retest_up or retest_down)
             else "5M_STRUCTURE_CONTINUATION"
         ),
-        "five_minute_directional_ok":True,
-        "five_minute_structure_ok":True,
-        "five_minute_momentum_ok":True,
-        "five_minute_entry_candle_ok":bool(entry_ok),
+        "five_minute_directional_ok":bool(directional_ok),
+        "five_minute_structure_ok":bool(structure_ok),
+        "five_minute_momentum_ok":bool(momentum_ok),
+        "five_minute_entry_candle_ok":bool(entry_ok and m1_entry_ok),
         "five_minute_trend_up":bool(trend_up),
         "five_minute_trend_down":bool(trend_down),
         "five_minute_breakout":bool(breakout_up or breakout_down),
