@@ -5056,12 +5056,15 @@ async def result_watch(key):
             s.broker_trade_source
         )
     else:
-        # No actual user trade matched. Preserve the signal reference; this path
-        # is a signal-outcome measurement, not a claim about a user's manual trade.
+        # No actual user trade matched. Preserve the distinction between the
+        # 30s pre-entry signal reference and the broker's exact entry-boundary
+        # market price. The latter is the only fair market-outcome baseline for
+        # a manual DEMO signal. Never classify the result from the stale signal
+        # snapshot when an exact broker entry quote/candle is available.
         s.entry_price=signal_reference
         log.info(
             "BROKER_TRADE_NOT_MATCHED cycle=%s pair=%s signal_reference=%s "
-            "window_after=%.1fs fallback=signal_market_outcome",
+            "window_after=%.1fs fallback=broker_boundary_entry_then_market_candle",
             s.cycle_id,s.pair,signal_reference,RESULT_TRADE_MATCH_AFTER
         )
 
