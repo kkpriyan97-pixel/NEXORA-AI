@@ -7421,18 +7421,22 @@ async def cycle_loop():
                                 _pin_items.append(_item)
                                 if len(_pin_items)>=16:
                                     break
-                            if _pin_items:
+                            _final_ready_exists=any(
+                                isinstance(_item,dict) and bool(_item.get("final_delivery_confirmed"))
+                                for _item in final_items
+                            ) or any(
+                                isinstance(_item,dict) and bool(_item.get("final_delivery_confirmed"))
+                                for _item in candidate_pool.values()
+                            )
+                            if _pin_items and not _final_ready_exists:
                                 try:
-                                    # Probe the full prepared fallback set. The tick manager
-                                    # keeps only four assets active, skips unusable broker
-                                    # subscriptions, and requires a real fresh event-1 tick.
-                                    # Keep pass-5 tick ownership short; send_cycle_signal()
-                                    # refreshes the authenticated broker quote when stale.
+                                    # Tick pinning is a fallback optimization only. Once at least
+                                    # one candidate has passed the authoritative pass-5 preparation,
+                                    # do not spend the remaining boundary window probing extra event-1
+                                    # subscriptions: the confirmed candidate can be delivered directly
+                                    # and send_cycle_signal() still performs the authoritative fresh-quote
+                                    # check at the exact signal boundary.
                                     pin_ttl=max(30.0,min(HIGH_TICK_ACTIVITY_PIN_TTL,target-time.time()-5.0))
-                                    # Broker Event-12 capability/freshness probing is bounded here.
-                                    # A stalled subscription must never hold cycle_loop past the
-                                    # exact signal boundary. Delivery still performs its authoritative
-                                    # fresh-tick checks and can fall through to the next candidate.
                                     remaining_to_boundary=max(0.0,signal_at-time.time())
                                     pin_timeout=min(
                                         FINAL_TICK_PREP_TIMEOUT,
@@ -7459,6 +7463,11 @@ async def cycle_loop():
                                         cycle_id,[x.get("pair") for x in _pin_items],
                                         pass_no,type(e).__name__,str(e)[:120]
                                     )
+                            elif _pin_items:
+                                log.info(
+                                    "FINAL_CANDIDATE_TICKS_FINAL_PREP_SKIPPED cycle=%s pass=%s reason=confirmed_candidate_already_ready seconds_to_signal=%.2f",
+                                    cycle_id,pass_no,max(0.0,signal_at-time.time())
+                                )
 
                         for item in selected:
                             log.info(
@@ -7625,16 +7634,23 @@ async def cycle_loop():
                     if item_key in prepared_keys:
                         continue
                     recovery_seeds.append(_item)
-                # Recover only when the deep pool is narrower than two candidates.
-                # This is an availability/resilience aid; the authoritative send
-                # gate below remains unchanged.
+                # Recovery is only needed when the normal pass-5 preparation
+                # produced no deliverable candidate at all. Starting a second deep
+                # AI/recheck pass when one candidate is already fully prepared can
+                # consume the final seconds and push the exact signal boundary late,
+                # which is what previously caused FORECAST fallback despite a confirmed
+                # candidate (e.g. cycle 5968655).
                 pass5_depth=len(prepared_keys)
-                # Three final candidates can all fail the exact live-state
-                # gate in the same boundary. Keep at least the configured tick-slot
-                # count in the final candidate set by rescuing unused candidates
-                # before the boundary.
+                pass5_confirmed=sum(
+                    1 for _item in candidate_pool.values()
+                    if isinstance(_item,dict) and bool(_item.get("final_delivery_confirmed"))
+                )
                 recovery_min_pool=max(2,int(ACCOUNT_TICK_PIN_SLOTS))
-                if pass5_depth < recovery_min_pool and recovery_seeds:
+                if (
+                    pass5_confirmed==0
+                    and pass5_depth < recovery_min_pool
+                    and recovery_seeds
+                ):
                     recovery_remaining=max(0,signal_at-time.time())
                     if recovery_remaining>=10.0:
                         recovery_timeout=min(8.0,max(1.0,recovery_remaining-8.0))
