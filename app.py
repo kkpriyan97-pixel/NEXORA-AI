@@ -939,22 +939,41 @@ async def revive_recent_unresolved_result_watches():
 
 
 async def restore_pending_result_watches():
+    """Restore only watches that are pending or whose recovery lease is stale."""
     if not LEARNING_DB_URL or not CLIENT or not CLIENT.connection.is_connected:
         return 0
     try:
         import psycopg
-        def read():
+        lease_seconds=20.0
+        min_age_seconds=2.0
+        def claim():
             with psycopg.connect(LEARNING_DB_URL,connect_timeout=8) as db:
                 with db.cursor() as cur:
                     cur.execute("""
-                        SELECT watch_id,record
-                        FROM candice_result_watch_queue
-                        WHERE status IN ('PENDING','PROCESSING')
-                          AND created_at > NOW() - INTERVAL '2 days'
-                        ORDER BY created_at
-                    """)
-                    return cur.fetchall()
-        rows=await asyncio.to_thread(read)
+                        UPDATE candice_result_watch_queue
+                        SET status='PROCESSING',updated_at=NOW()
+                        WHERE watch_id IN (
+                            SELECT watch_id
+                            FROM candice_result_watch_queue
+                            WHERE created_at > NOW() - INTERVAL '2 days'
+                              AND created_at < NOW() - make_interval(secs => %s)
+                              AND (
+                                status='PENDING'
+                                OR (
+                                  status='PROCESSING'
+                                  AND updated_at < NOW() - make_interval(secs => %s)
+                                )
+                              )
+                            ORDER BY created_at
+                            FOR UPDATE SKIP LOCKED
+                            LIMIT 20
+                        )
+                        RETURNING watch_id,record
+                    """,(min_age_seconds,lease_seconds))
+                    rows=cur.fetchall()
+                db.commit()
+            return rows
+        rows=await asyncio.to_thread(claim)
         restored=0
         for watch_id,record in rows:
             try:
@@ -996,7 +1015,9 @@ async def restore_pending_result_watches():
                     )
                 if start_result_watch(key):
                     restored+=1
-                log.info("RESULT_WATCH_RESTORED watch_id=%s pair=%s entry_ts=%s",watch_id,pair,entry_ts)
+                    log.info("RESULT_WATCH_RESTORED watch_id=%s pair=%s entry_ts=%s",watch_id,pair,entry_ts)
+                else:
+                    log.info("RESULT_WATCH_RECOVERY_SKIPPED watch_id=%s reason=watcher_already_running",watch_id)
             except Exception as e:
                 log.warning("RESULT_WATCH_RESTORE_FAILED watch_id=%s type=%s message=%s",
                             watch_id,type(e).__name__,str(e)[:160])
