@@ -106,10 +106,14 @@ def main():
         {"pair":"EURUSD_OTC","display_name":"EURUSD OTC","mode":"OTC"},
         otc_structure_candles(start=otc_start),
     )
+    if not otc:
+        print("OTC_DEBUG_REJECTED")
+    else:
+        print("OTC_DEBUG_OK", {k:otc.get(k) for k in ("expiry_minutes","self_strategy_version","five_minute_mode","structure_1m","confidence")})
     assert otc and otc["direction"]=="UP"
     assert otc["strategy"]==OTC_STRATEGY
     assert otc["expiry_minutes"]==5
-    assert otc["self_strategy_version"]=="OTC_STRUCTURE_V1"
+    assert otc["self_strategy_version"]=="OTC_STRUCTURE_5M_V2"
     assert otc["indicators"]["otc_strategy"] is True
     assert otc["indicators"]["otc_market_bias"]=="BULLISH"
     assert otc["indicators"]["otc_bos_confirmed"] is True
