@@ -1686,13 +1686,26 @@ def analyze_asset(
     # Only the exact point identified by the current result analysis enters the
     # live selector: ABOVE_VALUE + no level reclaim + persistent AVWAP slope.
     # This is an empirical qualification rule, not a promise of future wins.
+    # A level reclaim is not automatically a rejection. When the POC/AVWAP
+    # migration and AVWAP slope confirm the same direction, the reclaim is a
+    # directional continuation event. Treat this identically for UP and DOWN;
+    # otherwise strong bearish continuation can be rejected while bullish
+    # continuation survives the same geometry.
+    continuation_reclaim_ok=bool(
+        level_reclaim
+        and migration_aligned
+        and slope_persistent
+    )
     exact_live_setup=(
         (
             (direction=="UP" and value_position=="ABOVE_VALUE")
             or (direction=="DOWN" and value_position=="BELOW_VALUE")
         )
-        and level_reclaim is False
         and slope_persistent is True
+        and (
+            level_reclaim is False
+            or continuation_reclaim_ok
+        )
     )
     if not exact_live_setup:
         _diag(
