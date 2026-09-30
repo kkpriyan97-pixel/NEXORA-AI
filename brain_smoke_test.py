@@ -101,9 +101,10 @@ def main():
     flat=[{"time":start+i*60,"open":100,"high":100.01,"low":99.99,"close":100,"volume":100} for i in range(120)]
     assert analyze_asset({"pair":"TEST_FLAT","display_name":"TEST_FLAT"},flat) is None
 
-    # Keep the 5M OTC structure inside the live freshness window while
-    # retaining enough complete 15M history for the bias detector.
-    otc_start=(int(time.time())//900)*900-7*900
+    # End the synthetic sequence on the latest closed M1 candle. This keeps
+    # the 5M structure fresh without placing the final confirmation candle
+    # in the future or making the fixture depend on a 15M bucket boundary.
+    otc_start=(int(time.time())//60)*60-120*60
     otc=analyze_asset(
         {"pair":"EURUSD_OTC","display_name":"EURUSD OTC","mode":"OTC"},
         otc_structure_candles(start=otc_start),
