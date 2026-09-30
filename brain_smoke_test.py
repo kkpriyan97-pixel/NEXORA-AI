@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import candice_brain as cb
 from candice_brain import ALLOWED_STRATEGY, OTC_STRATEGY, analyze_asset
 
 
@@ -107,7 +108,10 @@ def main():
         otc_structure_candles(start=otc_start),
     )
     if not otc:
-        print("OTC_DEBUG_REJECTED")
+        cs=cb._closed_1m(otc_structure_candles(start=otc_start),time.time())
+        blocks=cb._complete_15m_blocks(cs,time.time())
+        bias,votes=cb._otc_15m_bias(blocks)
+        print("OTC_DEBUG_REJECTED", {"blocks":len(blocks),"bias":bias,"votes":votes,"cadence":cb._five_minute_cadence_setup(cs,bias,time.time()),"m1":cb._otc_structure_setup(cs,"UP")})
     else:
         print("OTC_DEBUG_OK", {k:otc.get(k) for k in ("expiry_minutes","self_strategy_version","five_minute_mode","structure_1m","confidence")})
     assert otc and otc["direction"]=="UP"
