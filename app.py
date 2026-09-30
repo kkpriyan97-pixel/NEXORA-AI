@@ -7460,10 +7460,18 @@ async def cycle_loop():
                                 if len(_pin_items)>=16:
                                     break
                             _final_ready_exists=any(
-                                isinstance(_item,dict) and bool(_item.get("final_delivery_confirmed"))
+                                isinstance(_item,dict)
+                                and bool(_item.get("final_delivery_confirmed"))
+                                and has_fresh_live_price(
+                                    _item.get("pair"),time.time(),LIVE_TICK_MAX_AGE
+                                )
                                 for _item in final_items
                             ) or any(
-                                isinstance(_item,dict) and bool(_item.get("final_delivery_confirmed"))
+                                isinstance(_item,dict)
+                                and bool(_item.get("final_delivery_confirmed"))
+                                and has_fresh_live_price(
+                                    _item.get("pair"),time.time(),LIVE_TICK_MAX_AGE
+                                )
                                 for _item in candidate_pool.values()
                             )
                             if _pin_items and not _final_ready_exists:
