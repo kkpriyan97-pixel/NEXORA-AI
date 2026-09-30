@@ -885,7 +885,21 @@ class BrainState:
         pair_rate=(pair_w/max(1.0,pair_w+pair_l)) if pair_n>0 else 0.5
         x["pair_expiry_samples"]=int(pair_n)
         x["pair_expiry_win_rate"]=round(pair_rate,4)
-        x["pair_expiry_quality_block"]=bool(pair_n>=8.0 and pair_rate<0.45)
+
+        # In explicit 5M mode, exact pair/strategy history is a ranking signal,
+        # never a delivery gate. A weak history must not turn a valid 5M cycle
+        # into a missing signal; it only moves that candidate below stronger
+        # evidence from other assets/contexts.
+        pair_expiry_penalty=0.0
+        if pair_n>=8.0:
+            if pair_rate<0.45:
+                pair_expiry_penalty=-3.0
+            elif pair_rate<0.50:
+                pair_expiry_penalty=-1.5
+        x["pair_expiry_quality_penalty"]=pair_expiry_penalty
+        x["pair_expiry_quality_block"]=bool(
+            (not FIVE_MINUTE_EXPIRY_MODE) and pair_n>=8.0 and pair_rate<0.45
+        )
 
         # A weak 2m history for this exact pair/strategy is redirected to 1m.
         # Strongly supported 2m contexts remain eligible.
@@ -989,9 +1003,18 @@ class BrainState:
         # is introduced outside the learning layer.
         x["ai_learning_blocked"]=False
 
+        # Keep deterministic technical evidence first, but let bounded
+        # empirical meta-learning actually influence which qualified 5M setup
+        # wins the final slot. This is ranking-only: it never lowers the
+        # technical delivery confidence or blocks the 5M cadence.
+        meta_rank_lift=max(-4.0,min(4.0,float(x.get("meta_rank_bonus") or 0.0)*0.60))
+        pair_expiry_penalty=float(x.get("pair_expiry_quality_penalty") or 0.0)
+        x["meta_rank_lift"]=round(meta_rank_lift,3)
         x["exact_setup_rank_score"]=round(
             float(x.get("calibrated_confidence") or x.get("confidence") or 0)
-            +reliability_bonus,
+            +reliability_bonus
+            +meta_rank_lift
+            +pair_expiry_penalty,
             3
         )
 
