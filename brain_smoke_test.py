@@ -112,7 +112,7 @@ def main():
     assert otc and otc["direction"]=="UP"
     assert otc["strategy"]==OTC_STRATEGY
     assert otc["expiry_minutes"]==5
-    assert otc["self_strategy_version"]=="OTC_STRUCTURE_5M_V2"
+    assert otc["self_strategy_version"]=="OTC_STRUCTURE_5M_M1_FALLBACK_V1"
     assert otc["indicators"]["otc_strategy"] is True
     assert otc["indicators"]["otc_market_bias"]=="BULLISH"
     assert otc["indicators"]["otc_bos_confirmed"] is True
