@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import candice_brain as cb
 from candice_brain import ALLOWED_STRATEGY, OTC_STRATEGY, analyze_asset
 
 
@@ -90,7 +91,13 @@ def main():
     assert up["indicators"]["alligator_periods"] == "13/8,8/5,5/3"
     assert up["indicators"]["alligator_confirmation"] == "CONFIRMED"
 
-    down=analyze_asset({"pair":"TEST_DOWN","display_name":"TEST_DOWN"},down_candles(start=start))
+    down_cs=down_candles(start=start)
+    down=analyze_asset({"pair":"TEST_DOWN","display_name":"TEST_DOWN"},down_cs)
+    if not down:
+        cs=cb._closed_1m(down_cs,time.time())
+        last=cs[-1]; prev=cs[-2]; prof=cb._volume_profile(cs); avwap=cb._anchored_vwap(cs, int(cb._complete_15m_blocks(cs)[-1]["time"]))[0]
+        mig=cb._profile_migration(cs); slopes=cb._avwap_slope_features(cs,int(cb._complete_15m_blocks(cs)[-1]["time"]))
+        print("DOWN_DEBUG", {"px":last["close"],"avwap":avwap,"poc":prof["poc"],"vah":prof["vah"],"val":prof["val"],"migration":mig,"slopes":slopes,"alligator":cb._alligator_confirmation(cs,"DOWN")})
     assert down and down["direction"]=="DOWN"
     assert down["strategy"]==ALLOWED_STRATEGY
     assert down["expiry_minutes"]==5
