@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import time
-import candice_brain as cb
 from candice_brain import ALLOWED_STRATEGY, OTC_STRATEGY, analyze_asset
 
 
@@ -102,18 +101,13 @@ def main():
     flat=[{"time":start+i*60,"open":100,"high":100.01,"low":99.99,"close":100,"volume":100} for i in range(120)]
     assert analyze_asset({"pair":"TEST_FLAT","display_name":"TEST_FLAT"},flat) is None
 
-    otc_start=(int(time.time())//900)*900-8*900
+    # Keep the 5M OTC structure inside the live freshness window while
+    # retaining enough complete 15M history for the bias detector.
+    otc_start=(int(time.time())//900)*900-7*900
     otc=analyze_asset(
         {"pair":"EURUSD_OTC","display_name":"EURUSD OTC","mode":"OTC"},
         otc_structure_candles(start=otc_start),
     )
-    if not otc:
-        cs=cb._closed_1m(otc_structure_candles(start=otc_start),time.time())
-        blocks=cb._complete_15m_blocks(cs,time.time())
-        bias,votes=cb._otc_15m_bias(blocks)
-        print("OTC_DEBUG_REJECTED", {"blocks":len(blocks),"bias":bias,"votes":votes,"cadence":cb._five_minute_cadence_setup(cs,bias,time.time()),"m1":cb._otc_structure_setup(cs,"UP")})
-    else:
-        print("OTC_DEBUG_OK", {k:otc.get(k) for k in ("expiry_minutes","self_strategy_version","five_minute_mode","structure_1m","confidence")})
     assert otc and otc["direction"]=="UP"
     assert otc["strategy"]==OTC_STRATEGY
     assert otc["expiry_minutes"]==5
