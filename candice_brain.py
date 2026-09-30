@@ -1696,11 +1696,15 @@ def analyze_asset(
         and migration_aligned
         and slope_persistent
     )
+    # Value-area boundaries are valid continuation locations too. Use the
+    # numeric boundary directly so price exactly at VAH/VAL is not discarded
+    # because the descriptive value_position labels use strict inequalities.
+    value_boundary_ok=bool(
+        (direction=="UP" and px>=vah)
+        or (direction=="DOWN" and px<=val)
+    )
     exact_live_setup=(
-        (
-            (direction=="UP" and value_position=="ABOVE_VALUE")
-            or (direction=="DOWN" and value_position=="BELOW_VALUE")
-        )
+        value_boundary_ok
         and slope_persistent is True
         and (
             level_reclaim is False
