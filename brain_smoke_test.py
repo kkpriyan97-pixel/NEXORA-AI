@@ -82,7 +82,7 @@ def main():
     up=analyze_asset({"pair":"TEST_UP","display_name":"TEST_UP"},up_candles(start=start))
     assert up and up["direction"]=="UP"
     assert up["strategy"]==ALLOWED_STRATEGY
-    assert up["expiry_minutes"]==1
+    assert up["expiry_minutes"]==5
     assert up["decision_candle_closed"] is True
     assert set(("anchored_vwap","volume_profile_poc","volume_profile_vah","volume_profile_val")) <= set(up["indicators"])
     assert up["indicators"]["alligator_confirmed"] is True
@@ -92,7 +92,7 @@ def main():
     down=analyze_asset({"pair":"TEST_DOWN","display_name":"TEST_DOWN"},down_candles(start=start))
     assert down and down["direction"]=="DOWN"
     assert down["strategy"]==ALLOWED_STRATEGY
-    assert down["expiry_minutes"]==1
+    assert down["expiry_minutes"]==5
     assert down["indicators"]["alligator_confirmed"] is True
     assert down["indicators"]["alligator_periods"] == "13/8,8/5,5/3"
     assert down["indicators"]["alligator_confirmation"] == "CONFIRMED"
@@ -107,7 +107,7 @@ def main():
     )
     assert otc and otc["direction"]=="UP"
     assert otc["strategy"]==OTC_STRATEGY
-    assert otc["expiry_minutes"]==1
+    assert otc["expiry_minutes"]==5
     assert otc["self_strategy_version"]=="OTC_STRUCTURE_V1"
     assert otc["indicators"]["otc_strategy"] is True
     assert otc["indicators"]["otc_market_bias"]=="BULLISH"
