@@ -21,19 +21,20 @@ def up_candles(n=180, start=1_000_000):
 
 
 def down_candles(n=180, start=1_000_000):
-    out=[]
-    for i in range(n):
-        t=start+i*60
-        base=110-(i-59)*0.12 if i>=60 else 110+(i%5)*0.01
-        o=base
-        c=o-0.08
-        out.append({
-            "time":t,"open":o,"high":o+0.01,"low":c,
-            "close":c,"volume":100
-        })
-    return out
-
-
+    # Exact mirror of the deterministic bullish fixture so the DOWN regression
+    # exercises the same AVWAP/VP/Alligator geometry in the opposite direction.
+    src=up_candles(n=n,start=start)
+    return [
+        {
+            "time":c["time"],
+            "open":200.0-c["open"],
+            "high":200.0-c["low"],
+            "low":200.0-c["high"],
+            "close":200.0-c["close"],
+            "volume":c["volume"],
+        }
+        for c in src
+    ]
 
 
 def otc_structure_candles(n=120,start=1_000_000):
